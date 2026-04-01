@@ -86,11 +86,12 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 		"--read-only",
 		"--cap-drop=ALL",
 		"--hostname=" + hostHostname,
-		"--tmpfs=/tmp:nosuid,size=100m",
-		"--tmpfs=/install:nosuid,size=300m",
-		"--tmpfs=/usr/local/lib/python" + SandboxPythonVersion + "/site-packages:nosuid,size=300m",
+		"--tmpfs=/tmp:nosuid,mode=1777,size=100m",
+		"--tmpfs=/install:nosuid,mode=1777,size=300m",
+		"--tmpfs=/usr/local/lib/python" + SandboxPythonVersion + "/site-packages:nosuid,mode=1777,size=300m",
 		"--tmpfs=/usr/local/bin:nosuid,exec,size=32m",
 		"--tmpfs=/run:nosuid,size=1m",
+		"--tmpfs=/home/dev:nosuid,mode=1777,size=32m",
 		"--memory=" + mem,
 		"--cpus=" + cpus,
 		"--pids-limit=256",
@@ -294,6 +295,8 @@ func (s *Sandbox) restoreLocalBin(ctx context.Context) {
 	sitePackages := "/usr/local/lib/python" + SandboxPythonVersion + "/site-packages"
 	s.dockerExecRoot(ctx, "cp", "-a", sitePackages+".bak/.", sitePackages+"/")
 	s.dockerExecRoot(ctx, "chmod", "-R", "a+rw", sitePackages)
+
+	// /home/dev is a tmpfs (writable) so npm can create ~/.npm for cache/logs.
 }
 
 // eraseFingerprints removes or masks signals that reveal the container

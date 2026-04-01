@@ -57,7 +57,6 @@
         "add_key",
         "unshare",
         "setns",
-        "clone3",
         "kcmp",
         "lookup_dcookie",
         "quotactl",
@@ -75,8 +74,7 @@
         "modify_ldt",
         "create_module",
         "get_kernel_syms",
-        "query_module",
-        "memfd_create"
+        "query_module"
       ],
       "action": "SCMP_ACT_ERRNO",
       "errnoRet": 1,
