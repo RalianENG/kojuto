@@ -40,6 +40,7 @@ var (
 	flagEcosystem   string
 	flagFile        string
 	flagPin         string
+	flagLocal       string
 	flagTimeout     time.Duration
 )
 
@@ -71,6 +72,7 @@ func init() {
 	scanCmd.Flags().StringVarP(&flagEcosystem, "ecosystem", "e", types.EcosystemPyPI, "ecosystem: pypi, npm")
 	scanCmd.Flags().StringVarP(&flagFile, "file", "f", "", "dependency file to scan (requirements.txt or package.json)")
 	scanCmd.Flags().StringVar(&flagPin, "pin", "", "output pinned dependency file after all-clean scan (requires -f)")
+	scanCmd.Flags().StringVar(&flagLocal, "local", "", "scan a local package file (.whl, .tgz) or directory instead of downloading")
 	scanCmd.Flags().StringVar(&flagProbeMethod, "probe-method", methodAuto, "probe method: auto, ebpf, strace, strace-container")
 	scanCmd.Flags().DurationVar(&flagTimeout, "timeout", 5*time.Minute, "scan timeout per package")
 
@@ -111,6 +113,11 @@ type scanResult struct {
 }
 
 func runScan(_ *cobra.Command, args []string) error {
+	// Local mode: scan a local package file or directory.
+	if flagLocal != "" {
+		return runLocalScan(args)
+	}
+
 	// Batch mode: scan all packages from a dependency file.
 	if flagFile != "" {
 		return runBatchScan(args)
@@ -318,6 +325,132 @@ func writePinnedNpm(path string, deps []pinnedDep) error {
 	jsonBytes = append(jsonBytes, '\n')
 
 	return os.WriteFile(path, jsonBytes, 0o644)
+}
+
+// runLocalScan scans a local package file (.whl, .tgz) or directory.
+// This allows scanning malware samples obtained from external datasets
+// (e.g. Datadog GuardDog) without requiring them to be on PyPI/npm.
+func runLocalScan(_ []string) error {
+	localPath, err := filepath.Abs(flagLocal)
+	if err != nil {
+		return fmt.Errorf("resolving local path: %w", err)
+	}
+
+	info, err := os.Stat(localPath)
+	if err != nil {
+		return fmt.Errorf("local path not found: %w", err)
+	}
+
+	// Determine package directory and name.
+	var dlDir, pkg string
+	if info.IsDir() {
+		dlDir = localPath
+		pkg = detectPackageFromDir(localPath)
+	} else {
+		// Single file: copy to temp directory.
+		tmpDir, tmpErr := os.MkdirTemp("", "kojuto-local-*")
+		if tmpErr != nil {
+			return fmt.Errorf("creating temp dir: %w", tmpErr)
+		}
+		defer os.RemoveAll(tmpDir)
+
+		dlDir = filepath.Join(tmpDir, "packages")
+		if mkErr := os.MkdirAll(dlDir, 0o750); mkErr != nil {
+			return fmt.Errorf("creating package dir: %w", mkErr)
+		}
+
+		src, readErr := os.ReadFile(localPath)
+		if readErr != nil {
+			return fmt.Errorf("reading local file: %w", readErr)
+		}
+		if writeErr := os.WriteFile(filepath.Join(dlDir, filepath.Base(localPath)), src, 0o644); writeErr != nil {
+			return fmt.Errorf("copying local file: %w", writeErr)
+		}
+
+		pkg = detectPackageName(filepath.Base(localPath))
+	}
+
+	// Auto-detect ecosystem from file extension if not explicitly set.
+	ecosystem := flagEcosystem
+	if !info.IsDir() {
+		name := filepath.Base(localPath)
+		if strings.HasSuffix(name, ".tgz") || strings.HasSuffix(name, ".tar.gz") {
+			ecosystem = types.EcosystemNpm
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "[*] Scanning local package: %s (%s)\n", pkg, ecosystem)
+
+	flagEcosystem = ecosystem
+	flagVersion = downloader.DetectVersion(dlDir, pkg)
+
+	ctx, cancel := context.WithTimeout(context.Background(), flagTimeout)
+	defer cancel()
+
+	method := selectProbeMethod()
+
+	sb, err := startSandbox(ctx, dlDir, pkg, method)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		if cleanupErr := sb.Cleanup(cleanupCtx); cleanupErr != nil {
+			fmt.Fprintf(os.Stderr, "[!] Cleanup warning: %v\n", cleanupErr)
+		}
+	}()
+
+	result, err := runProbeAndInstall(ctx, sb, pkg, method)
+	if err != nil {
+		return err
+	}
+
+	return outputReport(pkg, result)
+}
+
+// detectPackageFromDir looks at files inside a directory to determine the package name.
+func detectPackageFromDir(dir string) string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return filepath.Base(dir)
+	}
+
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasSuffix(name, ".whl") || strings.HasSuffix(name, ".tgz") || strings.HasSuffix(name, ".tar.gz") {
+			return detectPackageName(name)
+		}
+	}
+
+	return filepath.Base(dir)
+}
+
+// detectPackageName extracts a package name from a filename.
+// e.g. "malware-1.0.0-py3-none-any.whl" → "malware"
+// e.g. "evil-pkg-2.0.0.tgz" → "evil-pkg".
+func detectPackageName(filename string) string {
+	// Strip common extensions.
+	name := filename
+	for _, ext := range []string{".whl", ".tgz", ".tar.gz", ".zip"} {
+		name = strings.TrimSuffix(name, ext)
+	}
+
+	// Split on "-" and take parts before the version number.
+	parts := strings.Split(name, "-")
+	var nameParts []string
+	for _, p := range parts {
+		if p != "" && p[0] >= '0' && p[0] <= '9' {
+			break
+		}
+		nameParts = append(nameParts, p)
+	}
+
+	if len(nameParts) == 0 {
+		return name
+	}
+
+	return strings.Join(nameParts, "-")
 }
 
 func downloadPackage(ctx context.Context, pkg string) (string, error) {
