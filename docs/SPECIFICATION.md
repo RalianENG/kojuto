@@ -1,76 +1,137 @@
-# サプライチェーン攻撃検知ツール 設計仕様書
+# Supply Chain Attack Detection Tool — Specification
 
-## 1. 概要
+## 1. Overview
 
-### プロジェクトの目的
+### Purpose
 
-パッケージのインストール時・インポート時に発生する外部通信を検知し、サプライチェーン攻撃を実行前に発見するOSSツール。
+An OSS tool that detects suspicious syscalls during package installation and import to discover supply chain attacks before execution.
 
-### スコープ
+### Scope
 
-| 対象 | 内容 |
+| Category | Description |
 |---|---|
-| **In Scope** | インストール時の外部通信検知 |
-| **Out of Scope** | 静的解析レイヤー（GuardDogに委譲） |
+| **In Scope** | Dynamic analysis during install and import (syscall monitoring) |
+| **In Scope** | Multi-OS simulation to bypass platform-gated payloads |
+| **Out of Scope** | Static analysis layer (delegated to GuardDog) |
 
-### サポートエコシステム
+### Supported Ecosystems
 
-- PyPI（Python）
+- PyPI (Python)
+- npm (Node.js)
 
 ---
 
-## 2. 検知対象
+## 2. Detection Targets
 
-### フェーズと通信発生源
+### Phases and Attack Surfaces
 
-| フェーズ | PyPI |
-|---|---|
-| インストール時 | `setup.py` / build hooks / `cmdclass` |
-
-### 監視するsyscall
-
-| syscall | 検知対象 | 攻撃例 |
+| Phase | PyPI | npm |
 |---|---|---|
-| `connect(2)` | 外部TCP/UDP接続 | C2サーバーへのデータ送信 |
+| Install | `setup.py` / build hooks / `cmdclass` | `preinstall` / `postinstall` scripts |
+| Import | `__init__.py` / module-level code | `require()` entry point |
+
+### Monitored Syscalls
+
+| Syscall | Target | Attack Example |
+|---|---|---|
+| `connect(2)` | Outbound TCP/UDP connections | Data exfiltration to C2 server |
+| `sendto(2)` | UDP send (without connect) | DNS-based data theft |
+| `sendmsg(2)` | Message send | Bypassing connect-based detection |
+| `execve(2)` | Process creation | Malware binary execution, reverse shell |
+
+### execve Analysis Logic
+
+- Validates full binary path (directory + basename), not just basename
+- For `sh -c` / `bash -c`: inspects the first token of the command against `shellSafeCommands`
+- `python3 -c` / `node -e` flagged as suspicious (inline code execution)
+- `sed` excluded from benign list (GNU sed `e` command can execute shell)
 
 ---
 
-## 3. アーキテクチャ
+## 3. Architecture
 
 ```
 CLI (cobra)
   │
-  ├─ Downloader       パッケージのダウンロードとキャッシュ
+  ├─ Downloader       Package download (pip / npm)
   │
-  ├─ Sandbox          Dockerコンテナによる隔離実行
-  │   ├─ network=none  外部通信を完全遮断
-  │   ├─ read-only rootfs + tmpfs
-  │   └─ no-new-privileges
+  ├─ Sandbox          Docker container isolation
+  │   ├─ Isolated bridge network (internal, no external gateway)
+  │   ├─ Read-only rootfs + targeted tmpfs mounts
+  │   ├─ cap-drop=ALL + custom seccomp profile
+  │   ├─ no-new-privileges
+  │   └─ Anti-fingerprinting (host information mirroring)
   │
-  ├─ eBPF Probe       ホストカーネルからsyscallを監視
-  │   └─ プロセスツリーを追跡してパッケージ起因を判定
+  ├─ Probe            Syscall monitoring
+  │   ├─ strace-container (default, full syscall coverage)
+  │   ├─ strace (host-level, Linux only)
+  │   └─ eBPF (opt-in, connect only, fastest)
   │
-  ├─ Analyzer         イベントの分類・リスク判定
+  ├─ Analyzer         Event classification and risk assessment
+  │   ├─ Network events: filter out loopback/unspecified/link-local
+  │   ├─ execve: path validation + shell command content inspection
+  │   └─ Parse failures (empty address) treated as suspicious
   │
-  └─ Reporter         JSON 出力
+  └─ Reporter         JSON output
 ```
 
-### 実行フロー
+### Execution Flow
 
-1. パッケージをホストでダウンロード・キャッシュ（ネットワーク許可）
-2. network遮断コンテナでインストール実行 + eBPFで監視
-3. レポート生成
+1. Download package on host (network allowed)
+2. Install in isolated container + monitor with strace (Phase 1)
+3. Import in same container × 3 OS identities (Linux / Windows / macOS) + monitor with strace (Phase 2)
+4. Merge events from all phases and analyze
+5. Generate report
+
+### Multi-OS Import Probing
+
+- Python: monkey-patches `platform.system()`, `sys.platform`, `os.name` before import
+- Node.js: overrides `process.platform` via `Object.defineProperty` before require
+- Detects OS-gated malware (e.g. `if platform.system() == "Windows": attack()`) dynamically
 
 ---
 
-## 4. 技術スタック
+## 4. Sandbox Security
 
-| レイヤー | 技術 | 理由 |
+### Docker Container Configuration
+
+| Setting | Value | Purpose |
 |---|---|---|
-| 言語 | Go (統一) | 単一バイナリ配布、eBPFバインディングの充実 |
-| eBPF probe | `cilium/ebpf` + `bpf2go` | ビルド時にバイトコードを取り込み、カーネルヘッダ不要 |
-| eBPF Cコード | C (`.c` ファイル) | BPFプログラム本体はC必須。`bpf2go` で自動生成 |
-| CLI | `cobra` | Go標準的なCLIフレームワーク |
-| Sandbox | Docker | 隔離の実績、CI環境でのデフォルト利用可 |
-| 出力フォーマット | JSON | CI/CD パイプラインでの利用を想定 |
+| Network | Isolated internal bridge | Block external traffic + anti-fingerprint |
+| Filesystem | `--read-only` + tmpfs | Restrict writes |
+| Capabilities | `--cap-drop=ALL` | Minimize privileges |
+| seccomp | Custom profile | Block `mount`, `unshare`, `setns`, `bpf`, `memfd_create`, `prctl(PR_SET_NAME)`, etc. |
+| Privilege escalation | `--no-new-privileges` | Prevent |
+| Resources | Host CPU/memory mirrored (capped at 4 cores / 4GB) | Anti-fingerprint |
+| PID | `--pids-limit=256` | Prevent fork bombs |
 
+### Anti-Fingerprinting
+
+| Measure | Details |
+|---|---|
+| Hostname | Mirrors the host's actual hostname |
+| Username | Host's actual username reflected in mount path |
+| CPU / Memory | Host's actual values mirrored (with caps) |
+| `/.dockerenv` | Removed on startup |
+| Network | Internal bridge makes `/proc/net/tcp` non-empty, `connect()` returns `ETIMEDOUT` |
+| Mount path | `/home/<host-user>/projects` (resembles host layout) |
+
+### Known Unmasked Signals (Docker Structural Constraints)
+
+| Signal | Reason | Mitigation Path |
+|---|---|---|
+| `/proc/1/cgroup` contains `docker` | Written by kernel | gVisor / Firecracker |
+| `/proc/self/mountinfo` contains `overlay` | Docker storage driver | Same |
+
+---
+
+## 5. Technology Stack
+
+| Layer | Technology | Rationale |
+|---|---|---|
+| Language | Go (unified) | Single-binary distribution, rich eBPF bindings |
+| eBPF probe | `cilium/ebpf` + `bpf2go` | Embeds bytecode at build time, no kernel headers needed at runtime |
+| eBPF C code | C (`.c` file) | BPF programs require C; auto-generated via `bpf2go` |
+| CLI | `cobra` | Standard Go CLI framework |
+| Sandbox | Docker | Proven isolation, available by default in CI environments |
+| Output format | JSON | Designed for CI/CD pipeline integration |

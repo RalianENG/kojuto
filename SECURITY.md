@@ -28,10 +28,35 @@ kojuto is a security tool that intentionally runs untrusted code in an isolated 
 
 - **Sandbox escape** — any way for analyzed packages to affect the host system
 - **eBPF probe vulnerabilities** — issues in the kernel-level monitoring code
+- **Detection bypass** — attack patterns that evade both dynamic and static analysis
 - **False negatives** — attack patterns that bypass detection (please report as feature requests unless they indicate a fundamental design flaw)
 
 ## Security Design
 
-- Packages are executed in Docker containers with `--network=none`, `--read-only`, and `--no-new-privileges`
-- eBPF probes use minimal capabilities (`CAP_BPF` + `CAP_PERFMON`), never `--privileged`
-- The tool never executes package code on the host system
+### Sandbox Isolation
+
+- Packages run in Docker containers with an **isolated internal bridge network** (no external gateway)
+- Filesystem is **read-only** with targeted tmpfs mounts for writable paths
+- **`--cap-drop=ALL`** removes all Linux capabilities; only `SYS_PTRACE` is re-added when needed (for in-container strace)
+- **`--no-new-privileges`** prevents privilege escalation
+- **Custom seccomp profile** blocks dangerous syscalls including `mount`, `unshare`, `setns`, `bpf`, `memfd_create`, and `prctl(PR_SET_NAME)`
+- Resource limits: memory and CPU mirrored from host (capped at 4GB/4 cores), PID limit of 256
+
+### Detection
+
+- **Dynamic analysis**: strace monitors `connect`, `sendto`, `sendmsg`, and `execve` syscalls during install and import phases
+- **Multi-OS import probing**: packages are imported under simulated Linux, Windows, and macOS identities to trigger platform-gated payloads
+- **eBPF mode** (opt-in): attaches kprobe to `__sys_connect` with PID namespace filtering; only monitors `connect()` — narrower coverage than strace
+
+### Anti-Fingerprinting
+
+- Host hostname, username, CPU count, and memory are mirrored into the container
+- `/.dockerenv` is removed on startup
+- Package mount path mirrors host directory layout
+- Isolated bridge network provides real network interfaces (connect returns `ETIMEDOUT`, not `ENETUNREACH`)
+
+### Host Protection
+
+- Packages are never executed on the host system
+- `pip download` uses `--only-binary=:all:` to prevent source builds on the host
+- `npm pack` uses `--ignore-scripts` to prevent prepack script execution on the host

@@ -1,17 +1,18 @@
 # kojuto
 
-> Caught you. — Runtime network surveillance for PyPI packages.
+> Caught you. — Runtime syscall surveillance for package installations.
 
-A supply chain attack detection tool that monitors syscalls during package installation to detect suspicious outbound network activity.
+A supply chain attack detection tool that monitors syscalls during package installation and import to detect suspicious activity. Supports PyPI and npm ecosystems.
 
 ## How It Works
 
 1. **Download** — Fetch the target package to the host (network allowed)
-2. **Isolate** — Run `pip install` inside a Docker container with `--network=none`
-3. **Monitor** — Record `connect(2)` syscalls via eBPF (or strace fallback)
-4. **Report** — Output findings as JSON
+2. **Isolate** — Run installation inside a hardened Docker container with network isolation
+3. **Install + Monitor** — Record `connect`, `sendto`, `sendmsg`, and `execve` syscalls via strace (or eBPF)
+4. **Import + Monitor** — Import/require the package under 3 simulated OS identities (Linux, Windows, macOS) to trigger platform-gated payloads
+5. **Report** — Output findings as JSON
 
-Legitimate packages don't make network connections during install. Any connection attempt is flagged as suspicious.
+Legitimate packages don't make network connections or spawn suspicious processes during install. Any such activity is flagged as suspicious.
 
 ## Quick Start
 
@@ -22,20 +23,23 @@ make build
 # Build sandbox image
 make sandbox-image
 
-# Scan a package
-sudo ./kojuto scan <package-name>
+# Scan a PyPI package
+./kojuto scan requests
+
+# Scan an npm package
+./kojuto scan lodash -e npm
 
 # Scan a specific version
-sudo ./kojuto scan requests --version 2.31.0
+./kojuto scan requests --version 2.31.0
 
 # Output to file
-sudo ./kojuto scan requests -o report.json
+./kojuto scan requests -o report.json
 
-# Use strace fallback (no eBPF required)
-./kojuto scan requests --probe-method strace
+# Explicitly use eBPF (connect-only, requires root + kernel 5.8+)
+sudo ./kojuto scan requests --probe-method ebpf
 
 # Set scan timeout
-sudo ./kojuto scan requests --timeout 10m
+./kojuto scan requests --timeout 10m
 ```
 
 ### Flags
@@ -44,25 +48,77 @@ sudo ./kojuto scan requests --timeout 10m
 |------|-------------|
 | `-v, --version` | Package version to scan (default: latest) |
 | `-o, --output` | Output file path (default: stdout) |
+| `-e, --ecosystem` | `pypi` / `npm` (default: `pypi`) |
 | `--probe-method` | `auto` / `ebpf` / `strace` / `strace-container` (default: `auto`) |
 | `--timeout` | Scan timeout (default: `5m`) |
 
+### Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Clean — no suspicious activity |
+| 1 | Error — scan failed |
+| 2 | Suspicious or inconclusive — suspicious events detected or probe data was lost |
+
+## Report Format
+
+```json
+{
+  "package": "example-package",
+  "version": "1.0.0",
+  "ecosystem": "pypi",
+  "timestamp": "2026-04-01T12:00:00Z",
+  "verdict": "suspicious",
+  "probe_method": "strace-container",
+  "events": [
+    {
+      "timestamp": "2026-04-01T12:00:01Z",
+      "pid": 1234,
+      "syscall": "connect",
+      "comm": "python3",
+      "family": 2,
+      "dst_addr": "203.0.113.50",
+      "dst_port": 443
+    },
+    {
+      "timestamp": "2026-04-01T12:00:02Z",
+      "pid": 1235,
+      "syscall": "execve",
+      "comm": "/tmp/payload",
+      "cmdline": "/tmp/payload --exfil"
+    }
+  ]
+}
+```
+
+| Verdict | Exit Code | Meaning |
+|---------|-----------|---------|
+| `clean` | 0 | No suspicious activity detected during install or import |
+| `suspicious` | 2 | Suspicious events detected — review the `events` array |
+| `inconclusive` | 2 | Probe data was lost (buffer overflow) — treat as failure |
+
+## GitHub Actions
+
+```yaml
+- uses: RalianENG/kojuto@v0
+  with:
+    package: your-dependency
+    version: '2.31.0'        # optional
+    ecosystem: pypi           # optional: pypi, npm
+    probe-method: auto        # optional: auto, ebpf, strace, strace-container
+```
+
 ## Requirements
 
-- Linux (kernel 5.8+)
 - Docker
-- Go 1.22+ (build from source)
-- Root or CAP_BPF + CAP_PERFMON (for eBPF; strace fallback available)
+- Go 1.25+ (build from source)
+- Linux, macOS, or Windows (via Docker Desktop)
+- Root or CAP_BPF + CAP_PERFMON (only for `--probe-method=ebpf`)
 
 ## Documentation
 
-- [Quick Start](docs/QUICKSTART.md)
 - [Specification](docs/SPECIFICATION.md)
 - [日本語ドキュメント](docs/README_ja.md)
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Security
 
