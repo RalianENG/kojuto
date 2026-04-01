@@ -61,7 +61,7 @@ var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Print version information",
 	Run: func(_ *cobra.Command, _ []string) {
-		fmt.Println("kojuto v0.2.0")
+		fmt.Println("kojuto v0.3.0")
 	},
 }
 
