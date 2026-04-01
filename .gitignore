@@ -36,5 +36,9 @@ internal/probe/*_bpfel.o
 internal/probe/*_bpfeb.go
 internal/probe/*_bpfeb.o
 
+# Demo
+*.tape
+*.gif
+
 # Cache
 .cache/

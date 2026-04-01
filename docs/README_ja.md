@@ -64,6 +64,13 @@ kojuto scan requests --timeout 10m
 # スキャン後にバージョン固定ファイルを生成（全パッケージがクリーンの場合のみ）
 kojuto scan -f requirements.txt --pin requirements-locked.txt
 kojuto scan -f package.json -e npm --pin package-pinned.json
+
+# ローカルのパッケージファイルをスキャン（マルウェアサンプル分析用）
+kojuto scan --local ./malware-1.0.0.whl
+kojuto scan --local ./evil-pkg-2.0.0.tgz -e npm
+
+# ディレクトリ内のパッケージをスキャン
+kojuto scan --local ./samples/
 ```
 
 ### フラグ
@@ -75,6 +82,7 @@ kojuto scan -f package.json -e npm --pin package-pinned.json
 | `-e, --ecosystem` | `pypi` / `npm`（デフォルト: `pypi`） |
 | `-f, --file` | 依存ファイルを指定してスキャン（`requirements.txt`、`package.json`、任意の `*.txt`/`*.json`） |
 | `--pin` | 全パッケージがクリーンの場合にバージョン固定ファイルを出力（`-f` 必須） |
+| `--local` | ローカルのパッケージファイル（`.whl`、`.tgz`）またはディレクトリをスキャン |
 | `--probe-method` | `auto` / `ebpf` / `strace` / `strace-container`（デフォルト: `auto`） |
 | `--timeout` | パッケージごとのタイムアウト（デフォルト: `5m`） |
 

@@ -97,7 +97,7 @@ CLI (cobra)
 
 ### Execution Flow
 
-1. Download package on host (network allowed)
+1. Download package on host (network allowed) — or use `--local` to skip download and scan a local file/directory
 2. Install in isolated container + monitor with strace (Phase 1)
 3. Import in same container × 3 OS identities (Linux / Windows / macOS) + monitor with strace (Phase 2)
 4. Merge events from all phases and analyze

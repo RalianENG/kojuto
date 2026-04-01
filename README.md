@@ -59,6 +59,13 @@ sudo ./kojuto scan requests --probe-method ebpf
 # Scan and generate pinned dependency file (all packages must be clean)
 ./kojuto scan -f requirements.txt --pin requirements-locked.txt
 ./kojuto scan -f package.json -e npm --pin package-pinned.json
+
+# Scan a local package file (e.g. malware sample from Datadog/GuardDog)
+./kojuto scan --local ./malware-1.0.0.whl
+./kojuto scan --local ./evil-pkg-2.0.0.tgz -e npm
+
+# Scan a directory of local packages
+./kojuto scan --local ./samples/
 ```
 
 ### Flags
@@ -70,6 +77,7 @@ sudo ./kojuto scan requests --probe-method ebpf
 | `-e, --ecosystem` | `pypi` / `npm` (default: `pypi`) |
 | `-f, --file` | Dependency file to scan (`requirements.txt`, `package.json`, or any `*.txt`/`*.json`) |
 | `--pin` | Output pinned dependency file after all-clean batch scan (requires `-f`) |
+| `--local` | Scan a local package file (`.whl`, `.tgz`) or directory instead of downloading |
 | `--probe-method` | `auto` / `ebpf` / `strace` / `strace-container` (default: `auto`) |
 | `--timeout` | Scan timeout per package (default: `5m`) |
 
