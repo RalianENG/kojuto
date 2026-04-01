@@ -14,9 +14,7 @@ updates:
     labels:
       - "dependencies"
 
-  - package-ecosystem: "docker"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-    labels:
-      - "dependencies"
+  # Docker (Dockerfile.sandbox) is intentionally excluded.
+  # The Python base image version must stay in sync with
+  # SandboxPythonVersion in internal/sandbox/sandbox.go.
+  # Automated bumps break this coupling.
