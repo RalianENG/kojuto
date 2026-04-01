@@ -2,7 +2,9 @@ package sandbox
 
 import (
 	"context"
+	"crypto/rand"
 	_ "embed"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -105,6 +107,13 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 	if s.needsPtrace {
 		// Re-add SYS_PTRACE for strace, CHOWN+FOWNER for tmpfs file setup.
 		args = append(args, "--cap-add=SYS_PTRACE", "--cap-add=CHOWN", "--cap-add=FOWNER")
+	}
+
+	// Honeypot environment variables: simulate a CI/developer machine to
+	// trigger environment-gated malware (e.g. "if CI: exfiltrate()").
+	// Fake tokens provoke credential-harvesting code paths.
+	for _, env := range honeypotEnvVars() {
+		args = append(args, "--env="+env)
 	}
 
 	args = append(args,
@@ -271,6 +280,9 @@ func (s *Sandbox) StartPaused(ctx context.Context) error {
 	// Restore /usr/local/bin contents that were hidden by the tmpfs overlay.
 	s.restoreLocalBin(ctx)
 
+	// Plant fake credential files to trigger credential-harvesting malware.
+	s.plantHoneypotFiles(ctx)
+
 	if err := s.Pause(ctx); err != nil {
 		return fmt.Errorf("immediate pause after start: %w", err)
 	}
@@ -299,6 +311,9 @@ func (s *Sandbox) Start(ctx context.Context) error {
 	// Erase container fingerprints that sandbox-detection code looks for.
 	s.eraseFingerprints(ctx)
 
+	// Plant fake credential files to trigger credential-harvesting malware.
+	s.plantHoneypotFiles(ctx)
+
 	return nil
 }
 
@@ -320,6 +335,115 @@ func (s *Sandbox) restoreLocalBin(ctx context.Context) {
 		s.dockerExecRoot(ctx, "cp", "-a", s.mountPoint+"/.", "/install/")
 		s.dockerExecRoot(ctx, "chown", "-R", "1000:1000", "/install")
 	}
+}
+
+// randHex returns n random hex characters.
+func randHex(n int) string {
+	b := make([]byte, (n+1)/2)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)[:n]
+}
+
+// fakeAWSKeyID generates a realistic AWS access key ID (always starts with AKIA, 20 chars total).
+func fakeAWSKeyID() string {
+	return "AKIA" + strings.ToUpper(randHex(16))
+}
+
+// fakeAWSSecret generates a realistic AWS secret access key (40 chars, base64-like).
+func fakeAWSSecret() string {
+	return randHex(40)
+}
+
+// fakeGitHubToken generates a realistic GitHub PAT (ghp_ prefix + 36 alphanum).
+func fakeGitHubToken() string {
+	return "ghp_" + randHex(36)
+}
+
+// fakeNpmToken generates a realistic npm token (npm_ prefix + 36 hex).
+func fakeNpmToken() string {
+	return "npm_" + randHex(36)
+}
+
+// honeypotEnvVars returns environment variables that simulate a CI/developer
+// machine. Malware often gates execution on these signals (e.g. "if CI=true,
+// exfiltrate tokens"). Tokens are randomly generated per scan so that
+// static fingerprinting of known honeypot values is not possible.
+func honeypotEnvVars() []string {
+	return []string{
+		// CI / automation signals.
+		"CI=true",
+		"GITHUB_ACTIONS=true",
+		"GITLAB_CI=true",
+		"BUILD_ID=" + randHex(8),
+		// Fake cloud credentials (random per scan).
+		"AWS_ACCESS_KEY_ID=" + fakeAWSKeyID(),
+		"AWS_SECRET_ACCESS_KEY=" + fakeAWSSecret(),
+		"AWS_DEFAULT_REGION=us-east-1",
+		// Fake developer tokens (random per scan).
+		"GITHUB_TOKEN=" + fakeGitHubToken(),
+		"NPM_TOKEN=" + fakeNpmToken(),
+	}
+}
+
+// plantHoneypotFiles writes realistic-looking but fake credential files into
+// the container. All secret values are randomly generated per scan to prevent
+// static fingerprinting by malware that knows kojuto's source code.
+// When malware reads these via openat, the access is detected by the
+// sensitive-path monitor. If it then tries to exfiltrate the contents,
+// the connect/sendto monitor catches the network activity.
+func (s *Sandbox) plantHoneypotFiles(ctx context.Context) {
+	home := "/home/dev"
+
+	// Generate random credentials for this scan.
+	awsKey := fakeAWSKeyID()
+	awsSecret := fakeAWSSecret()
+	ghToken := fakeGitHubToken()
+	sshKeyBody := randHex(64)
+
+	// SSH key pair.
+	s.dockerExecRoot(ctx, "mkdir", "-p", home+"/.ssh")
+	s.dockerExecRoot(ctx, "sh", "-c", "cat > "+home+"/.ssh/id_rsa << 'KOJUTO_EOF'\n"+
+		"-----BEGIN OPENSSH PRIVATE KEY-----\n"+
+		"b3BlbnNzaC1rZXktdjEAAAAAFAAAAAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5\n"+
+		"AAAAI"+sshKeyBody+"\n"+
+		"-----END OPENSSH PRIVATE KEY-----\n"+
+		"KOJUTO_EOF")
+	s.dockerExecRoot(ctx, "chmod", "600", home+"/.ssh/id_rsa")
+
+	// AWS credentials.
+	s.dockerExecRoot(ctx, "mkdir", "-p", home+"/.aws")
+	s.dockerExecRoot(ctx, "sh", "-c", "cat > "+home+"/.aws/credentials << 'KOJUTO_EOF'\n"+
+		"[default]\n"+
+		"aws_access_key_id = "+awsKey+"\n"+
+		"aws_secret_access_key = "+awsSecret+"\n"+
+		"KOJUTO_EOF")
+
+	// Git credentials.
+	s.dockerExecRoot(ctx, "sh", "-c", "cat > "+home+"/.git-credentials << 'KOJUTO_EOF'\n"+
+		"https://dev:"+ghToken+"@github.com\n"+
+		"KOJUTO_EOF")
+	s.dockerExecRoot(ctx, "chmod", "600", home+"/.git-credentials")
+
+	// Netrc.
+	s.dockerExecRoot(ctx, "sh", "-c", "cat > "+home+"/.netrc << 'KOJUTO_EOF'\n"+
+		"machine github.com\n"+
+		"login dev\n"+
+		"password "+ghToken+"\n"+
+		"KOJUTO_EOF")
+	s.dockerExecRoot(ctx, "chmod", "600", home+"/.netrc")
+
+	// GitHub CLI config.
+	s.dockerExecRoot(ctx, "mkdir", "-p", home+"/.config/gh")
+	s.dockerExecRoot(ctx, "sh", "-c", "cat > "+home+"/.config/gh/hosts.yml << 'KOJUTO_EOF'\n"+
+		"github.com:\n"+
+		"    oauth_token: "+ghToken+"\n"+
+		"    user: dev\n"+
+		"    git_protocol: https\n"+
+		"KOJUTO_EOF")
+
+	// Fix ownership so the container user (dev) owns the files.
+	s.dockerExecRoot(ctx, "chown", "-R", "1000:1000", home+"/.ssh", home+"/.aws",
+		home+"/.git-credentials", home+"/.netrc", home+"/.config")
 }
 
 // eraseFingerprints removes or masks signals that reveal the container
@@ -442,24 +566,49 @@ func (s *Sandbox) WriteProbeScripts(ctx context.Context) {
 	}
 }
 
+// faketimeEnv returns environment variable prefix that activates libfaketime.
+// The clock is advanced +30 days and runs at 100x speed so that:
+// - Absolute date checks (e.g. "if date > May 1st: attack()") trigger immediately
+// - Relative sleeps (e.g. sleep(300)) complete in ~3 seconds
+// libfaketime intercepts gettimeofday/clock_gettime at the libc level, which
+// covers Python's datetime.now(), time.time(), and Node's Date.now().
+func faketimeEnv() []string {
+	return []string{
+		"LD_PRELOAD=/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1",
+		"FAKETIME=+30d",
+		"FAKETIME_NO_CACHE=1",
+		"FAKETIME_TIMESTAMP_FILE=",
+	}
+}
+
+// wrapWithFaketime prepends env command with faketime environment variables
+// to the given command, so the process sees a clock advanced +30 days.
+func wrapWithFaketime(cmd []string) []string {
+	envArgs := []string{"env"}
+	envArgs = append(envArgs, faketimeEnv()...)
+	return append(envArgs, cmd...)
+}
+
 // pythonImportCommands returns commands that execute pre-written probe scripts.
 // Uses `python3 /tmp/script.py` (NOT `python3 -c`) so that kojuto's own
 // import probes don't trigger the interpreterExecFlags detector.
+// Commands are wrapped with libfaketime to trigger date-gated payloads.
 func (s *Sandbox) pythonImportCommands() [][]string {
 	return [][]string{
-		{"python3", "/tmp/_kojuto_probe_linux.py"},
-		{"python3", "/tmp/_kojuto_probe_win32.py"},
-		{"python3", "/tmp/_kojuto_probe_darwin.py"},
+		wrapWithFaketime([]string{"python3", "/tmp/_kojuto_probe_linux.py"}),
+		wrapWithFaketime([]string{"python3", "/tmp/_kojuto_probe_win32.py"}),
+		wrapWithFaketime([]string{"python3", "/tmp/_kojuto_probe_darwin.py"}),
 	}
 }
 
 // nodeImportCommands returns commands that execute pre-written probe scripts.
 // Uses `node /tmp/script.js` (NOT `node -e`) to avoid self-detection.
+// Commands are wrapped with libfaketime to trigger date-gated payloads.
 func (s *Sandbox) nodeImportCommands() [][]string {
 	return [][]string{
-		{"node", "/tmp/_kojuto_probe_linux.js"},
-		{"node", "/tmp/_kojuto_probe_win32.js"},
-		{"node", "/tmp/_kojuto_probe_darwin.js"},
+		wrapWithFaketime([]string{"node", "/tmp/_kojuto_probe_linux.js"}),
+		wrapWithFaketime([]string{"node", "/tmp/_kojuto_probe_win32.js"}),
+		wrapWithFaketime([]string{"node", "/tmp/_kojuto_probe_darwin.js"}),
 	}
 }
 

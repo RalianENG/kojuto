@@ -243,6 +243,60 @@ func TestAnalyze_EmptyDstAddr(t *testing.T) {
 	}
 }
 
+func TestAnalyze_OpenatSensitive(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventOpenat, FilePath: "/home/dev/.ssh/id_rsa", OpenFlags: "O_RDONLY"},
+	}
+
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictSuspicious {
+		t.Errorf("expected suspicious for SSH key access, got %s", verdict)
+	}
+	if len(filtered) != 1 {
+		t.Errorf("expected 1 suspicious event, got %d", len(filtered))
+	}
+}
+
+func TestAnalyze_RenameTrustedBinary(t *testing.T) {
+	cases := []struct {
+		name    string
+		dstPath string
+		want    string
+	}{
+		{"python3 hijack", "/usr/local/bin/python3", types.VerdictSuspicious},
+		{"node hijack", "/usr/local/bin/node", types.VerdictSuspicious},
+		{"sh hijack", "/bin/sh", types.VerdictSuspicious},
+		{"new CLI script", "/usr/local/bin/my-tool", types.VerdictClean},
+		{"install dir", "/install/lib/module.so", types.VerdictClean},
+		{"tmp rename", "/tmp/a", types.VerdictClean},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			events := []types.SyscallEvent{
+				{Syscall: types.EventRename, SrcPath: "/tmp/payload", DstPath: tc.dstPath},
+			}
+			verdict, _ := Analyze(events)
+			if verdict != tc.want {
+				t.Errorf("expected %s for dst=%s, got %s", tc.want, tc.dstPath, verdict)
+			}
+		})
+	}
+}
+
+func TestAnalyze_BindListenAccept(t *testing.T) {
+	// Server socket operations are always suspicious.
+	for _, syscall := range []string{types.EventBind, types.EventListen, types.EventAccept} {
+		events := []types.SyscallEvent{
+			{Syscall: syscall, DstAddr: "0.0.0.0", DstPort: 4444},
+		}
+		verdict, _ := Analyze(events)
+		if verdict != types.VerdictSuspicious {
+			t.Errorf("expected suspicious for %s, got %s", syscall, verdict)
+		}
+	}
+}
+
 func TestAnalyze_SedExcluded(t *testing.T) {
 	// sed is excluded from benignPaths because GNU sed -e can execute shell commands.
 	events := []types.SyscallEvent{

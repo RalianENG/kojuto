@@ -38,6 +38,9 @@ An OSS tool that detects suspicious syscalls during package installation and imp
 | `sendto(2)` | UDP send (without connect) | DNS-based data theft |
 | `sendmsg(2)` | Message send | Bypassing connect-based detection |
 | `execve(2)` | Process creation | Malware binary execution, reverse shell |
+| `openat(2)` | File access (sensitive paths only) | Credential theft (`.ssh/`, `.aws/`, `/etc/shadow`) |
+| `rename(2)` | File rename / move | Trusted binary hijacking (`/usr/local/bin/python3`) |
+| `sendfile(2)` | Zero-copy file-to-socket transfer | Forensic trace (not parsed into events) |
 
 ### execve Analysis Logic
 
@@ -45,6 +48,21 @@ An OSS tool that detects suspicious syscalls during package installation and imp
 - For `sh -c` / `bash -c`: inspects the first token of the command against `shellSafeCommands`
 - `python3 -c` / `node -e` flagged as suspicious (inline code execution)
 - `sed` excluded from benign list (GNU sed `e` command can execute shell)
+
+### openat Analysis Logic
+
+- Only emits events for sensitive file paths (pre-filtered in parser for performance)
+- Monitored paths: `~/.ssh/`, `~/.gnupg/`, `~/.aws/`, `/etc/shadow`, `/proc/self/environ`, `~/.netrc`, `~/.git-credentials`, `~/.docker/config.json`, `~/.config/gh/`
+- `.npmrc` and `.pypirc` are excluded (npm/pip read these during normal operation)
+- Events include `open_flags` (e.g. `O_RDONLY`) to indicate read/write intent
+- Any match is treated as suspicious — legitimate packages do not access credential files during install
+
+### rename Analysis Logic
+
+- Monitors `rename(2)`, `renameat(2)`, and `renameat2(2)` syscalls
+- Events include both `src_path` and `dst_path` for full context
+- Suspicious if `dst_path` overwrites a known trusted binary (e.g. `python3`, `node`, `sh` in `/usr/bin/` or `/usr/local/bin/`)
+- Benign if the destination is not a whitelisted binary (e.g. pip installing a new CLI script)
 
 ---
 
@@ -70,6 +88,8 @@ CLI (cobra)
   ├─ Analyzer         Event classification and risk assessment
   │   ├─ Network events: filter out loopback/unspecified/link-local
   │   ├─ execve: path validation + shell command content inspection
+  │   ├─ openat: sensitive file access detection (credentials, keys)
+  │   ├─ rename: trusted binary hijacking detection
   │   └─ Parse failures (empty address) treated as suspicious
   │
   └─ Reporter         JSON output
@@ -100,7 +120,7 @@ CLI (cobra)
 | Network | Isolated internal bridge | Block external traffic + anti-fingerprint |
 | Filesystem | `--read-only` + tmpfs | Restrict writes |
 | Capabilities | `--cap-drop=ALL` | Minimize privileges |
-| seccomp | Custom profile | Block `mount`, `unshare`, `setns`, `bpf`, `memfd_create`, `prctl(PR_SET_NAME)`, etc. |
+| seccomp | Custom profile (always applied) | Block `mount`, `unshare`, `setns`, `bpf`, `memfd_create`, `prctl(PR_SET_NAME)`, etc. |
 | Privilege escalation | `--no-new-privileges` | Prevent |
 | Resources | Host CPU/memory mirrored (capped at 4 cores / 4GB) | Anti-fingerprint |
 | PID | `--pids-limit=256` | Prevent fork bombs |

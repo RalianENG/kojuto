@@ -38,6 +38,12 @@ func isBenign(evt *types.SyscallEvent) bool {
 		return false
 	case types.EventExecve:
 		return isBenignExec(evt)
+	case types.EventOpenat:
+		// Only emitted for sensitive paths (credentials, keys, etc.)
+		// by the parser's pre-filter — always suspicious in install context.
+		return false
+	case types.EventRename:
+		return isBenignRename(evt)
 	default:
 		return false
 	}
@@ -101,6 +107,7 @@ var benignPaths = map[string][]string{
 	"chown":      {"/bin/", "/usr/bin/"},
 	"cat":        {"/bin/", "/usr/bin/"},
 	"ls":         {"/bin/", "/usr/bin/"},
+	"env":        {"/bin/", "/usr/bin/"},
 	// sed is intentionally excluded: GNU sed -e with the 'e' command can
 	// execute arbitrary shell commands (e.g. sed -e '1e malicious_cmd').
 	"node": {"/usr/bin/", "/usr/local/bin/"},
@@ -313,6 +320,24 @@ var trustedDirPrefixes = []string{
 // fileOpCommands are shell commands that can place files into directories.
 var fileOpCommands = map[string]bool{
 	"cp": true, "mv": true, "ln": true, "install": true,
+}
+
+// isBenignRename checks whether a rename/renameat targets a known trusted binary.
+// Renaming over python3, node, sh, etc. in system dirs is a hijack attempt.
+// Renames to other destinations (e.g. pip installing a new CLI script) are benign.
+func isBenignRename(evt *types.SyscallEvent) bool {
+	destBase := path.Base(evt.DstPath)
+	destDir := path.Dir(evt.DstPath) + "/"
+
+	if allowedDirs, ok := benignPaths[destBase]; ok {
+		for _, d := range allowedDirs {
+			if destDir == d {
+				return false
+			}
+		}
+	}
+
+	return true
 }
 
 // isFileOpTargetingTrustedDir checks if a file operation targets a trusted

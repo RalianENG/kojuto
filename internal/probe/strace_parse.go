@@ -49,7 +49,50 @@ var (
 	straceExecveRe = regexp.MustCompile(
 		`execve\("([^"]+)",\s*\[([^\]]+)\]`,
 	)
+
+	// openat(AT_FDCWD, "/home/dev/.ssh/id_rsa", O_RDONLY|O_CLOEXEC) = 3
+	straceOpenatRe = regexp.MustCompile(
+		`openat\([^,]+,\s*"([^"]+)",\s*([A-Z_|]+)`,
+	)
+
+	// rename("/tmp/evil", "/usr/local/bin/python3") = 0
+	straceRenameRe = regexp.MustCompile(
+		`rename\("([^"]+)",\s*"([^"]+)"\)`,
+	)
+
+	// renameat(AT_FDCWD, "old", AT_FDCWD, "new") or renameat2(...)
+	straceRenameatRe = regexp.MustCompile(
+		`renameat2?\([^,]+,\s*"([^"]+)",\s*[^,]+,\s*"([^"]+)"`,
+	)
 )
+
+// sensitivePathPatterns are substrings that indicate access to credential or
+// secret files. Only openat calls matching these patterns are emitted as events
+// to avoid flooding the event channel with thousands of benign file opens
+// during package installation.
+var sensitivePathPatterns = []string{
+	"/.ssh/",
+	"/.gnupg/",
+	"/.aws/",
+	"/etc/shadow",
+	"/proc/self/environ",
+	"/.netrc",
+	"/.git-credentials",
+	"/.docker/config.json",
+	"/.config/gh/",
+	// .npmrc and .pypirc are intentionally excluded: npm and pip read these
+	// as part of their normal operation (registry config, auth tokens).
+	// Monitoring them would cause false positives on every scan.
+}
+
+func isSensitivePath(filePath string) bool {
+	for _, pattern := range sensitivePathPatterns {
+		if strings.Contains(filePath, pattern) {
+			return true
+		}
+	}
+	return false
+}
 
 func parseStraceLine(line string) (types.SyscallEvent, bool) {
 	if evt, ok := parseConnectOrSendto(line, straceConnectRe, types.EventConnect); ok {
@@ -82,6 +125,70 @@ func parseStraceLine(line string) (types.SyscallEvent, bool) {
 
 	if evt, ok := parseExecve(line); ok {
 		return evt, true
+	}
+
+	if evt, ok := parseOpenat(line); ok {
+		return evt, true
+	}
+
+	if evt, ok := parseRename(line); ok {
+		return evt, true
+	}
+
+	return types.SyscallEvent{}, false
+}
+
+// parseOpenat emits events only for sensitive file paths (credentials, keys, etc.).
+// Package installs generate thousands of openat calls; pre-filtering here avoids
+// overwhelming the event channel and analyzer.
+func parseOpenat(line string) (types.SyscallEvent, bool) {
+	matches := straceOpenatRe.FindStringSubmatch(line)
+	if matches == nil {
+		return types.SyscallEvent{}, false
+	}
+
+	filePath := matches[1]
+	if !isSensitivePath(filePath) {
+		return types.SyscallEvent{}, false
+	}
+
+	var flags string
+	if len(matches) > 2 {
+		flags = matches[2]
+	}
+
+	return types.SyscallEvent{
+		Timestamp: time.Now().UTC(),
+		PID:       extractPID(line),
+		Syscall:   types.EventOpenat,
+		FilePath:  filePath,
+		OpenFlags: flags,
+	}, true
+}
+
+// parseRename handles rename, renameat, and renameat2 syscalls.
+// SrcPath holds the source, DstPath holds the destination for analyzer inspection.
+func parseRename(line string) (types.SyscallEvent, bool) {
+	// Try rename("old", "new").
+	if matches := straceRenameRe.FindStringSubmatch(line); matches != nil {
+		return types.SyscallEvent{
+			Timestamp: time.Now().UTC(),
+			PID:       extractPID(line),
+			Syscall:   types.EventRename,
+			SrcPath:   matches[1],
+			DstPath:   matches[2],
+		}, true
+	}
+
+	// Try renameat/renameat2(dirfd, "old", dirfd, "new").
+	if matches := straceRenameatRe.FindStringSubmatch(line); matches != nil {
+		return types.SyscallEvent{
+			Timestamp: time.Now().UTC(),
+			PID:       extractPID(line),
+			Syscall:   types.EventRename,
+			SrcPath:   matches[1],
+			DstPath:   matches[2],
+		}, true
 	}
 
 	return types.SyscallEvent{}, false

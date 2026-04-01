@@ -92,8 +92,8 @@ func TestParseStraceLine_Execve(t *testing.T) {
 
 func TestParseStraceLine_Irrelevant(t *testing.T) {
 	lines := []string{
-		"openat(AT_FDCWD, \"/etc/hosts\", O_RDONLY) = 3",
-		"connect(3, {sa_family=AF_UNIX, sun_path=\"/var/run/nscd/socket\"}, 110) = -1",
+		"openat(AT_FDCWD, \"/etc/hosts\", O_RDONLY) = 3", // non-sensitive path
+		"connect(3, {sa_family=AF_UNIX, sun_path=\"/var/run/nscd/socket\"}, 110) = -1", // AF_UNIX
 		"",
 		"some random text",
 	}
@@ -131,6 +131,169 @@ func TestParseStraceLine_ExecveSuccess(t *testing.T) {
 
 	if evt.Comm != "/bin/sh" {
 		t.Errorf("expected comm /bin/sh, got %s", evt.Comm)
+	}
+}
+
+func TestParseStraceLine_OpenatSensitive(t *testing.T) {
+	cases := []struct {
+		name      string
+		line      string
+		wantPath  string
+		wantFlags string
+	}{
+		{
+			name:      "SSH key read",
+			line:      `[pid 100] openat(AT_FDCWD, "/home/dev/.ssh/id_rsa", O_RDONLY) = 3`,
+			wantPath:  "/home/dev/.ssh/id_rsa",
+			wantFlags: "O_RDONLY",
+		},
+		{
+			name:      "AWS credentials",
+			line:      `[pid 200] openat(AT_FDCWD, "/home/dev/.aws/credentials", O_RDONLY|O_CLOEXEC) = 4`,
+			wantPath:  "/home/dev/.aws/credentials",
+			wantFlags: "O_RDONLY|O_CLOEXEC",
+		},
+		{
+			name:      "proc environ",
+			line:      `[pid 300] openat(AT_FDCWD, "/proc/self/environ", O_RDONLY) = 5`,
+			wantPath:  "/proc/self/environ",
+			wantFlags: "O_RDONLY",
+		},
+		{
+			name:      "etc shadow",
+			line:      `openat(AT_FDCWD, "/etc/shadow", O_RDONLY) = -1 EACCES`,
+			wantPath:  "/etc/shadow",
+			wantFlags: "O_RDONLY",
+		},
+		{
+			name:      "git-credentials",
+			line:      `[pid 400] openat(AT_FDCWD, "/home/dev/.git-credentials", O_RDONLY) = 6`,
+			wantPath:  "/home/dev/.git-credentials",
+			wantFlags: "O_RDONLY",
+		},
+		{
+			name:      "docker config",
+			line:      `[pid 500] openat(3, "/home/dev/.docker/config.json", O_RDONLY|O_CLOEXEC) = 7`,
+			wantPath:  "/home/dev/.docker/config.json",
+			wantFlags: "O_RDONLY|O_CLOEXEC",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			evt, ok := parseStraceLine(tc.line)
+			if !ok {
+				t.Fatal("expected parse to succeed")
+			}
+			if evt.Syscall != types.EventOpenat {
+				t.Errorf("expected openat, got %s", evt.Syscall)
+			}
+			if evt.FilePath != tc.wantPath {
+				t.Errorf("expected path %s, got %s", tc.wantPath, evt.FilePath)
+			}
+			if evt.OpenFlags != tc.wantFlags {
+				t.Errorf("expected flags %s, got %s", tc.wantFlags, evt.OpenFlags)
+			}
+		})
+	}
+}
+
+func TestParseStraceLine_OpenatNonSensitive(t *testing.T) {
+	// Non-sensitive paths should NOT produce events.
+	lines := []string{
+		`[pid 100] openat(AT_FDCWD, "/usr/lib/python3.12/os.py", O_RDONLY) = 3`,
+		`[pid 200] openat(AT_FDCWD, "/etc/hosts", O_RDONLY) = 4`,
+		`openat(AT_FDCWD, "/tmp/pip-install-xyz/setup.py", O_RDONLY) = 5`,
+	}
+
+	for _, line := range lines {
+		if _, ok := parseStraceLine(line); ok {
+			t.Errorf("expected non-sensitive openat to be skipped: %s", line)
+		}
+	}
+}
+
+func TestParseStraceLine_Rename(t *testing.T) {
+	cases := []struct {
+		name    string
+		line    string
+		wantSrc string
+		wantDst string
+	}{
+		{
+			name:    "simple rename",
+			line:    `[pid 100] rename("/tmp/evil", "/usr/local/bin/python3") = 0`,
+			wantSrc: "/tmp/evil",
+			wantDst: "/usr/local/bin/python3",
+		},
+		{
+			name:    "renameat",
+			line:    `[pid 200] renameat(AT_FDCWD, "/tmp/payload", AT_FDCWD, "/usr/bin/node") = 0`,
+			wantSrc: "/tmp/payload",
+			wantDst: "/usr/bin/node",
+		},
+		{
+			name:    "renameat2",
+			line:    `[pid 300] renameat2(5, "/tmp/x", 6, "/bin/sh", 0) = 0`,
+			wantSrc: "/tmp/x",
+			wantDst: "/bin/sh",
+		},
+		{
+			name:    "rename to non-trusted dir",
+			line:    `[pid 400] rename("/tmp/a", "/install/lib/module.so") = 0`,
+			wantSrc: "/tmp/a",
+			wantDst: "/install/lib/module.so",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			evt, ok := parseStraceLine(tc.line)
+			if !ok {
+				t.Fatal("expected parse to succeed")
+			}
+			if evt.Syscall != types.EventRename {
+				t.Errorf("expected rename, got %s", evt.Syscall)
+			}
+			if evt.SrcPath != tc.wantSrc {
+				t.Errorf("expected src %s, got %s", tc.wantSrc, evt.SrcPath)
+			}
+			if evt.DstPath != tc.wantDst {
+				t.Errorf("expected dst %s, got %s", tc.wantDst, evt.DstPath)
+			}
+		})
+	}
+}
+
+func TestIsSensitivePath(t *testing.T) {
+	sensitive := []string{
+		"/home/dev/.ssh/id_rsa",
+		"/root/.gnupg/secring.gpg",
+		"/home/user/.aws/credentials",
+		"/etc/shadow",
+		"/proc/self/environ",
+		"/home/dev/.netrc",
+		"/home/dev/.git-credentials",
+		"/home/dev/.docker/config.json",
+		"/home/dev/.config/gh/hosts.yml",
+	}
+	for _, p := range sensitive {
+		if !isSensitivePath(p) {
+			t.Errorf("expected %s to be sensitive", p)
+		}
+	}
+
+	benign := []string{
+		"/etc/hosts",
+		"/usr/lib/python3.12/os.py",
+		"/tmp/pip-install-xyz/setup.py",
+		"/home/dev/.bashrc",
+		"/home/dev/.npmrc",
+	}
+	for _, p := range benign {
+		if isSensitivePath(p) {
+			t.Errorf("expected %s to NOT be sensitive", p)
+		}
 	}
 }
 

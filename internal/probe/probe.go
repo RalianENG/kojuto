@@ -2,7 +2,7 @@
 
 package probe
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -target bpfel -type connect_event probe probe.c -- -I../../headers -O2 -g
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -target bpfel -type connect_event -type file_event probe probe.c -- -I../../headers -O2 -g
 
 import (
 	"bytes"
@@ -20,14 +20,23 @@ import (
 	"github.com/RalianENG/kojuto/internal/types"
 )
 
-// EBPFProbe monitors connect(2) syscalls using eBPF kprobes.
+const (
+	evtConnect = 1
+	evtSendto  = 2
+	evtExecve  = 3
+	evtOpenat  = 4
+	evtRename  = 5
+)
+
+// EBPFProbe monitors syscalls using eBPF kprobes.
 type EBPFProbe struct {
-	objs        *probeObjects
-	link        link.Link
-	reader      *perf.Reader
-	events      chan types.SyscallEvent
-	done        chan struct{}
-	closeOnce   sync.Once
+	objs       *probeObjects
+	links      []link.Link
+	reader     *perf.Reader
+	fileReader *perf.Reader
+	events     chan types.SyscallEvent
+	done       chan struct{}
+	closeOnce  sync.Once
 	LostSamples uint64
 }
 
@@ -46,35 +55,53 @@ func (p *EBPFProbe) Start(targetPIDNS uint32) error {
 	}
 	p.objs = &objs
 
-	// Set target PID namespace inode
+	// Set target PID namespace inode.
 	key := uint32(0)
 	if err := objs.TargetPidns.Put(key, targetPIDNS); err != nil {
 		return fmt.Errorf("setting target pidns: %w", err)
 	}
 
-	// Attach kprobe to __sys_connect
-	kp, err := link.Kprobe("__sys_connect", objs.KprobeConnect, nil)
+	// Attach kprobes. Non-critical probes (sendto, execve, openat, rename)
+	// are best-effort: if the kernel symbol doesn't exist, we skip it.
+	kpConnect, err := link.Kprobe("__sys_connect", objs.KprobeConnect, nil)
 	if err != nil {
-		return fmt.Errorf("attaching kprobe: %w", err)
+		return fmt.Errorf("attaching kprobe connect: %w", err)
 	}
-	p.link = kp
+	p.links = append(p.links, kpConnect)
 
-	// Open perf event reader with 512 pages (~2MB on 4K page systems).
-	// A large buffer reduces LostSamples under high-frequency connect() floods
-	// which attackers may use to force an inconclusive verdict.
-	rd, err := perf.NewReader(objs.Events, os.Getpagesize()*512)
+	if kp, err := link.Kprobe("__sys_sendto", objs.KprobeSendto, nil); err == nil {
+		p.links = append(p.links, kp)
+	}
+	if kp, err := link.Kprobe("do_execveat_common", objs.KprobeExecve, nil); err == nil {
+		p.links = append(p.links, kp)
+	}
+	if kp, err := link.Kprobe("do_sys_openat2", objs.KprobeOpenat, nil); err == nil {
+		p.links = append(p.links, kp)
+	}
+	if kp, err := link.Kprobe("vfs_rename", objs.KprobeRename, nil); err == nil {
+		p.links = append(p.links, kp)
+	}
+
+	// Open perf event readers with large buffers.
+	pageSize := os.Getpagesize()
+	rd, err := perf.NewReader(objs.Events, pageSize*512)
 	if err != nil {
-		return fmt.Errorf("creating perf reader: %w", err)
+		return fmt.Errorf("creating network perf reader: %w", err)
 	}
 	p.reader = rd
 
-	go p.readLoop()
+	fileRd, err := perf.NewReader(objs.FileEvents, pageSize*256)
+	if err != nil {
+		return fmt.Errorf("creating file perf reader: %w", err)
+	}
+	p.fileReader = fileRd
+
+	go p.readNetworkLoop()
+	go p.readFileLoop()
 	return nil
 }
 
-func (p *EBPFProbe) readLoop() {
-	defer close(p.events)
-
+func (p *EBPFProbe) readNetworkLoop() {
 	for {
 		record, err := p.reader.Read()
 		if err != nil {
@@ -94,12 +121,16 @@ func (p *EBPFProbe) readLoop() {
 			continue
 		}
 
-		// Convert int8 comm to bytes
 		var commBytes [16]byte
 		for i, c := range raw.Comm {
 			commBytes[i] = byte(c)
 		}
 
+		// Determine syscall type: connect events come from kprobe_connect,
+		// sendto from kprobe_sendto. Both use the same struct, so we infer
+		// from context. Since we can't distinguish in the perf buffer,
+		// we label all network events as "connect" for now.
+		// The analyzer treats connect and sendto identically.
 		evt := types.SyscallEvent{
 			Timestamp: time.Now().UTC(),
 			PID:       raw.Pid,
@@ -108,6 +139,66 @@ func (p *EBPFProbe) readLoop() {
 			Family:    raw.Family,
 			DstPort:   raw.Dport,
 			DstAddr:   formatAddr(raw.Family, raw.Daddr),
+		}
+
+		select {
+		case p.events <- evt:
+		case <-p.done:
+			return
+		}
+	}
+}
+
+func (p *EBPFProbe) readFileLoop() {
+	for {
+		record, err := p.fileReader.Read()
+		if err != nil {
+			if errors.Is(err, perf.ErrClosed) {
+				return
+			}
+			continue
+		}
+
+		if record.LostSamples > 0 {
+			p.LostSamples += record.LostSamples
+			continue
+		}
+
+		var raw probeFileEvent
+		if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &raw); err != nil {
+			continue
+		}
+
+		var pathBytes [128]byte
+		for i, c := range raw.Path {
+			pathBytes[i] = byte(c)
+		}
+		path := nullTermString(pathBytes[:])
+
+		var path2Bytes [128]byte
+		for i, c := range raw.Path2 {
+			path2Bytes[i] = byte(c)
+		}
+		path2 := nullTermString(path2Bytes[:])
+
+		evt := types.SyscallEvent{
+			Timestamp: time.Now().UTC(),
+			PID:       raw.Pid,
+		}
+
+		switch raw.EventType {
+		case evtExecve:
+			evt.Syscall = types.EventExecve
+			evt.Comm = path
+		case evtOpenat:
+			evt.Syscall = types.EventOpenat
+			evt.FilePath = path
+		case evtRename:
+			evt.Syscall = types.EventRename
+			evt.SrcPath = path
+			evt.DstPath = path2
+		default:
+			continue
 		}
 
 		select {
@@ -128,8 +219,11 @@ func (p *EBPFProbe) Close() error {
 		if p.reader != nil {
 			p.reader.Close()
 		}
-		if p.link != nil {
-			p.link.Close()
+		if p.fileReader != nil {
+			p.fileReader.Close()
+		}
+		for _, l := range p.links {
+			l.Close()
 		}
 		if p.objs != nil {
 			p.objs.Close()

@@ -37,14 +37,17 @@ kojuto is a security tool that intentionally runs untrusted code in an isolated 
 
 - Packages run in Docker containers with an **isolated internal bridge network** (no external gateway)
 - Filesystem is **read-only** with targeted tmpfs mounts for writable paths
-- **`--cap-drop=ALL`** removes all Linux capabilities; only `SYS_PTRACE` is re-added when needed (for in-container strace)
+- **`--cap-drop=ALL`** removes all Linux capabilities; `SYS_PTRACE`, `CHOWN`, and `FOWNER` are re-added only when needed
 - **`--no-new-privileges`** prevents privilege escalation
-- **Custom seccomp profile** blocks dangerous syscalls including `mount`, `unshare`, `setns`, `bpf`, `memfd_create`, and `prctl(PR_SET_NAME)`
+- **Custom seccomp profile** always applied (regardless of probe method), blocking `mount`, `unshare`, `setns`, `bpf`, `memfd_create`, `prctl(PR_SET_NAME)`, and 40+ other dangerous syscalls
+- **Hostname sanitization** prevents Docker CLI argument injection via hostile hostnames
 - Resource limits: memory and CPU mirrored from host (capped at 4GB/4 cores), PID limit of 256
 
 ### Detection
 
-- **Dynamic analysis**: strace monitors `connect`, `sendto`, `sendmsg`, and `execve` syscalls during install and import phases
+- **Dynamic analysis**: strace monitors `connect`, `sendto`, `sendmsg`, `execve`, `openat`, `rename`, and `sendfile` syscalls during install and import phases
+- **Credential access detection**: `openat` monitoring flags access to sensitive paths (`~/.ssh/`, `~/.aws/`, `/etc/shadow`, `/proc/self/environ`, etc.)
+- **Binary hijacking detection**: `rename`/`renameat`/`renameat2` monitoring detects attempts to overwrite trusted binaries (`python3`, `node`, `sh`, etc.)
 - **Multi-OS import probing**: packages are imported under simulated Linux, Windows, and macOS identities to trigger platform-gated payloads
 - **eBPF mode** (opt-in): attaches kprobe to `__sys_connect` with PID namespace filtering; only monitors `connect()` — narrower coverage than strace
 
@@ -59,4 +62,5 @@ kojuto is a security tool that intentionally runs untrusted code in an isolated 
 
 - Packages are never executed on the host system
 - `pip download` uses `--only-binary=:all:` to prevent source builds on the host
-- `npm pack` uses `--ignore-scripts` to prevent prepack script execution on the host
+- `npm install` uses `--ignore-scripts` on host; lifecycle scripts re-executed inside sandbox under strace
+- npm `package.json` generation uses `json.Marshal` (not string interpolation) to prevent JSON injection

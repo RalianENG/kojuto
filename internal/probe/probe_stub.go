@@ -23,9 +23,24 @@ type probeConnectEvent struct {
 	Comm        [16]int8
 }
 
+type probeFileEvent struct {
+	TimestampNs uint64
+	Pid         uint32
+	Uid         uint32
+	EventType   uint8
+	Pad         [3]uint8
+	Path        [128]int8
+	Path2       [128]int8
+}
+
 type probeObjects struct {
 	KprobeConnect *ebpf.Program `ebpf:"kprobe_connect"`
+	KprobeSendto  *ebpf.Program `ebpf:"kprobe_sendto"`
+	KprobeExecve  *ebpf.Program `ebpf:"kprobe_execve"`
+	KprobeOpenat  *ebpf.Program `ebpf:"kprobe_openat"`
+	KprobeRename  *ebpf.Program `ebpf:"kprobe_rename"`
 	Events        *ebpf.Map     `ebpf:"events"`
+	FileEvents    *ebpf.Map     `ebpf:"file_events"`
 	TargetPidns   *ebpf.Map     `ebpf:"target_pidns"`
 }
 
@@ -34,14 +49,20 @@ func loadProbeObjects(obj *probeObjects, opts *ebpf.CollectionOptions) error {
 }
 
 func (o *probeObjects) Close() error {
-	if o.KprobeConnect != nil {
-		o.KprobeConnect.Close()
+	progs := []*ebpf.Program{
+		o.KprobeConnect, o.KprobeSendto, o.KprobeExecve,
+		o.KprobeOpenat, o.KprobeRename,
 	}
-	if o.Events != nil {
-		o.Events.Close()
+	for _, p := range progs {
+		if p != nil {
+			p.Close()
+		}
 	}
-	if o.TargetPidns != nil {
-		o.TargetPidns.Close()
+	maps := []*ebpf.Map{o.Events, o.FileEvents, o.TargetPidns}
+	for _, m := range maps {
+		if m != nil {
+			m.Close()
+		}
 	}
 	return nil
 }

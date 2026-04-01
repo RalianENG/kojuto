@@ -12,6 +12,8 @@ const (
 	EventListen   = "listen"
 	EventAccept   = "accept"
 	EventExecve   = "execve"
+	EventOpenat   = "openat"
+	EventRename   = "rename"
 )
 
 // SyscallEvent represents a suspicious syscall captured by the probe.
@@ -20,6 +22,10 @@ type SyscallEvent struct {
 	Comm      string    `json:"comm"`
 	DstAddr   string    `json:"dst_addr,omitempty"`
 	Cmdline   string    `json:"cmdline,omitempty"`
+	FilePath  string    `json:"file_path,omitempty"`
+	OpenFlags string    `json:"open_flags,omitempty"`
+	SrcPath   string    `json:"src_path,omitempty"`
+	DstPath   string    `json:"dst_path,omitempty"`
 	Syscall   string    `json:"syscall"`
 	PID       uint32    `json:"pid"`
 	Family    uint16    `json:"family,omitempty"`

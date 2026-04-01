@@ -2,17 +2,21 @@
 
 > Caught you. — Runtime syscall surveillance for package installations.
 
+[Remember Mar 30th 2026.](https://cloud.google.com/blog/topics/threat-intelligence/north-korea-threat-actor-targets-axios-npm-package)
+
 A supply chain attack detection tool that monitors syscalls during package installation and import to detect suspicious activity. Supports PyPI and npm ecosystems.
 
 ## How It Works
 
 1. **Download** — Fetch the target package to the host (network allowed)
 2. **Isolate** — Run installation inside a hardened Docker container with network isolation
-3. **Install + Monitor** — Record `connect`, `sendto`, `sendmsg`, and `execve` syscalls via strace (or eBPF)
+3. **Install + Monitor** — Record `connect`, `sendto`, `sendmsg`, `execve`, `openat`, and `rename` syscalls via strace (or eBPF)
 4. **Import + Monitor** — Import/require the package under 3 simulated OS identities (Linux, Windows, macOS) to trigger platform-gated payloads
 5. **Report** — Output findings as JSON
 
-Legitimate packages don't make network connections or spawn suspicious processes during install. Any such activity is flagged as suspicious.
+`openat` detects credential access (`.ssh/`, `.aws/`, `/etc/shadow`), `rename` detects trusted binary replacement, and `sendfile` reveals direct file-to-socket transfer paths that bypass simple command-based heuristics.
+
+Well-behaved packages typically do not make unexpected network connections, spawn unrelated processes, access credential files, or modify trusted binaries during install or import. Any such activity is treated as suspicious and surfaced for review.
 
 ## Quick Start
 
@@ -39,7 +43,7 @@ make sandbox-image
 # Output to file
 ./kojuto scan requests -o report.json
 
-# Explicitly use eBPF (connect-only, requires root + kernel 5.8+)
+# Explicitly use eBPF (currently connect-focused; requires root + kernel 5.8+)
 sudo ./kojuto scan requests --probe-method ebpf
 
 # Set scan timeout per package
@@ -91,6 +95,20 @@ sudo ./kojuto scan requests --probe-method ebpf
       "syscall": "execve",
       "comm": "/tmp/payload",
       "cmdline": "/tmp/payload --exfil"
+    },
+    {
+      "timestamp": "2026-04-01T12:00:03Z",
+      "pid": 1236,
+      "syscall": "openat",
+      "file_path": "/home/dev/.ssh/id_rsa",
+      "open_flags": "O_RDONLY"
+    },
+    {
+      "timestamp": "2026-04-01T12:00:04Z",
+      "pid": 1237,
+      "syscall": "rename",
+      "src_path": "/tmp/python3",
+      "dst_path": "/usr/local/bin/python3"
     }
   ]
 }
