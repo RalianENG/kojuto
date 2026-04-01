@@ -3,7 +3,9 @@ package probe
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 
 	"github.com/RalianENG/kojuto/internal/types"
@@ -12,9 +14,8 @@ import (
 // ContainerStrace monitors connect(2) syscalls by running strace inside the Docker container.
 // This works on all platforms where Docker is available (Linux, macOS, Windows).
 type ContainerStrace struct {
-	events    chan types.ConnectEvent
-	done      chan struct{}
-	installOk bool
+	events chan types.ConnectEvent
+	done   chan struct{}
 }
 
 // NewContainerStrace creates a new in-container strace probe.
@@ -26,13 +27,46 @@ func NewContainerStrace() *ContainerStrace {
 }
 
 // Start is not supported for ContainerStrace. Use StartAndInstall instead.
-func (c *ContainerStrace) Start(targetPIDNS uint32) error {
-	return fmt.Errorf("ContainerStrace requires StartAndInstall, not Start")
+func (c *ContainerStrace) Start(_ uint32) error {
+	return errors.New("ContainerStrace requires StartAndInstall, not Start")
 }
 
 // StartAndInstall runs strace wrapping pip install inside the container.
 // It blocks until installation completes, populating the events channel.
 func (c *ContainerStrace) StartAndInstall(ctx context.Context, containerID, pkg string) ([]byte, error) {
+	cmd := c.buildCommand(ctx, containerID, pkg)
+
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, fmt.Errorf("strace stderr pipe: %w", err)
+	}
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("pip stdout pipe: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("starting strace in container: %w", err)
+	}
+
+	straceDone := make(chan struct{})
+	go c.parseStraceOutput(stderr, straceDone)
+
+	pipOut := drainReader(stdout)
+
+	cmdErr := cmd.Wait()
+	<-straceDone
+	close(c.events)
+
+	if cmdErr != nil {
+		return pipOut, fmt.Errorf("pip install in container failed: %w", cmdErr)
+	}
+
+	return pipOut, nil
+}
+
+func (c *ContainerStrace) buildCommand(ctx context.Context, containerID, pkg string) *exec.Cmd {
 	args := []string{
 		"exec", containerID,
 		"strace", "-f",
@@ -46,88 +80,69 @@ func (c *ContainerStrace) StartAndInstall(ctx context.Context, containerID, pkg 
 		pkg,
 	}
 
-	cmd := exec.CommandContext(ctx, "docker", args...)
-
-	// strace writes to stderr, pip writes to stdout
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, fmt.Errorf("strace stderr pipe: %w", err)
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("pip stdout pipe: %w", err)
-	}
-
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("starting strace in container: %w", err)
-	}
-
-	// Parse strace output in background
-	straceDone := make(chan struct{})
-	go func() {
-		defer close(straceDone)
-		scanner := bufio.NewScanner(stderr)
-		for scanner.Scan() {
-			evt, ok := parseStraceLine(scanner.Text())
-			if ok {
-				select {
-				case c.events <- evt:
-				case <-c.done:
-					return
-				}
-			}
-		}
-	}()
-
-	// Drain pip stdout (capped at 10MB to prevent memory exhaustion)
-	const maxPipOut = 10 * 1024 * 1024
-	var pipOut []byte
-	pipDone := make(chan struct{})
-	go func() {
-		defer close(pipDone)
-		buf := make([]byte, 4096)
-		for {
-			n, err := stdout.Read(buf)
-			if n > 0 && len(pipOut) < maxPipOut {
-				remaining := maxPipOut - len(pipOut)
-				if n > remaining {
-					n = remaining
-				}
-				pipOut = append(pipOut, buf[:n]...)
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
-
-	// Wait for command to finish
-	cmdErr := cmd.Wait()
-	<-straceDone
-	<-pipDone
-
-	c.installOk = cmdErr == nil
-	close(c.events)
-
-	if cmdErr != nil {
-		return pipOut, fmt.Errorf("pip install in container failed: %w", cmdErr)
-	}
-	return pipOut, nil
+	return exec.CommandContext(ctx, "docker", args...)
 }
 
+func (c *ContainerStrace) parseStraceOutput(stderr io.ReadCloser, done chan<- struct{}) {
+	defer close(done)
+
+	scanner := bufio.NewScanner(stderr)
+	for scanner.Scan() {
+		evt, ok := parseStraceLine(scanner.Text())
+		if !ok {
+			continue
+		}
+
+		select {
+		case c.events <- evt:
+		case <-c.done:
+			return
+		}
+	}
+}
+
+// drainReader reads from r up to 10MB and returns the content.
+func drainReader(r io.ReadCloser) []byte {
+	const maxSize = 10 * 1024 * 1024
+
+	var out []byte
+
+	buf := make([]byte, 4096)
+
+	for {
+		n, err := r.Read(buf)
+		if n > 0 && len(out) < maxSize {
+			remaining := maxSize - len(out)
+			if n > remaining {
+				n = remaining
+			}
+
+			out = append(out, buf[:n]...)
+		}
+
+		if err != nil {
+			return out
+		}
+	}
+}
+
+// Events returns the channel of captured connect events.
 func (c *ContainerStrace) Events() <-chan types.ConnectEvent {
 	return c.events
 }
 
+// Close stops the probe.
 func (c *ContainerStrace) Close() error {
 	select {
 	case <-c.done:
 	default:
 		close(c.done)
 	}
+
 	return nil
 }
 
+// Method returns the probe method identifier.
 func (c *ContainerStrace) Method() string {
 	return "strace-container"
 }

@@ -9,8 +9,20 @@ permissions:
   contents: write
 
 jobs:
+  # ──────────────────────────────────────────────
+  # Gate: run full CI before releasing
+  # ──────────────────────────────────────────────
+  ci:
+    name: Pre-release CI
+    uses: ./.github/workflows/ci.yml
+
+  # ──────────────────────────────────────────────
+  # Release with GoReleaser
+  # ──────────────────────────────────────────────
   release:
+    name: Release
     runs-on: ubuntu-latest
+    needs: ci
     steps:
       - uses: actions/checkout@v4
         with:
@@ -18,7 +30,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version-file: go.mod
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6

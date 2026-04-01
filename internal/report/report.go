@@ -2,6 +2,7 @@ package report
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"time"
 
@@ -13,6 +14,7 @@ func Generate(pkg, version, verdict, probeMethod string, events []types.ConnectE
 	if events == nil {
 		events = []types.ConnectEvent{}
 	}
+
 	return types.Report{
 		Package:     pkg,
 		Version:     version,
@@ -25,8 +27,13 @@ func Generate(pkg, version, verdict, probeMethod string, events []types.ConnectE
 }
 
 // WriteJSON writes the report as indented JSON to w.
-func WriteJSON(r types.Report, w io.Writer) error {
+func WriteJSON(r *types.Report, w io.Writer) error {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
-	return enc.Encode(r)
+
+	if err := enc.Encode(r); err != nil {
+		return fmt.Errorf("encoding report: %w", err)
+	}
+
+	return nil
 }

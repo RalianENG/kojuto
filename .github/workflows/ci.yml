@@ -6,39 +6,153 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
-  test:
+  # ──────────────────────────────────────────────
+  # 1. Lint — fast feedback, runs first
+  # ──────────────────────────────────────────────
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version-file: go.mod
 
-      - name: Build
-        run: make build
-
-      - name: Test
-        run: make test
-
-      - name: Lint
+      - name: golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
           version: latest
 
-  integration:
-    runs-on: ubuntu-latest
-    needs: test
+  # ──────────────────────────────────────────────
+  # 2. Unit tests — cross-platform matrix
+  # ──────────────────────────────────────────────
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version-file: go.mod
+
+      - name: Build
+        run: go build -o kojuto${{ matrix.os == 'windows-latest' && '.exe' || '' }} .
+
+      - name: Unit tests
+        run: go test -race -coverprofile=coverage.txt -covermode=atomic ./...
+
+      - name: Upload coverage
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.txt
+
+  # ──────────────────────────────────────────────
+  # 3. Cross-compile — ensure all targets build
+  # ──────────────────────────────────────────────
+  cross-compile:
+    name: Cross-compile (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -o /dev/null .
+
+  # ──────────────────────────────────────────────
+  # 4. Security — gosec + dependency audit
+  # ──────────────────────────────────────────────
+  security:
+    name: Security scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: gosec
+        uses: securego/gosec@master
+        with:
+          args: ./...
+
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+      - name: go mod verify
+        run: go mod verify
+
+  # ──────────────────────────────────────────────
+  # 5. Integration — Docker sandbox end-to-end
+  # ──────────────────────────────────────────────
+  integration:
+    name: Integration test
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build kojuto
+        run: go build -o kojuto .
 
       - name: Build sandbox image
         run: docker build -f Dockerfile.sandbox -t kojuto-sandbox:latest .
 
-      - name: Integration test
-        run: sudo make test-integration
+      - name: Scan known-clean package
+        run: |
+          sudo ./kojuto scan six -o report-clean.json
+          VERDICT=$(jq -r '.verdict' report-clean.json)
+          echo "Verdict: $VERDICT"
+          if [ "$VERDICT" != "clean" ]; then
+            echo "::error::Expected clean verdict for 'six', got '$VERDICT'"
+            exit 1
+          fi
+
+      - name: Verify report schema
+        run: |
+          jq -e '.package and .version and .verdict and .probe_method and .events' report-clean.json
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-reports
+          path: report-*.json

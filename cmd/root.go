@@ -19,11 +19,19 @@ import (
 	"github.com/RalianENG/kojuto/internal/types"
 )
 
+const (
+	methodAuto            = "auto"
+	methodEBPF            = "ebpf"
+	methodStrace          = "strace"
+	methodStraceContainer = "strace-container"
+	eventDrainDelay       = 500 * time.Millisecond
+)
+
 var (
-	version     string
-	output      string
-	probeMethod string
-	timeout     time.Duration
+	flagVersion     string
+	flagOutput      string
+	flagProbeMethod string
+	flagTimeout     time.Duration
 )
 
 var rootCmd = &cobra.Command{
@@ -42,223 +50,312 @@ var scanCmd = &cobra.Command{
 var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Print version information",
-	Run: func(cmd *cobra.Command, args []string) {
+	Run: func(_ *cobra.Command, _ []string) {
 		fmt.Println("kojuto v0.1.0")
 	},
 }
 
 func init() {
-	scanCmd.Flags().StringVarP(&version, "version", "v", "", "package version to scan")
-	scanCmd.Flags().StringVarP(&output, "output", "o", "", "output file path (default: stdout)")
-	scanCmd.Flags().StringVar(&probeMethod, "probe-method", "auto", "probe method: auto, ebpf, strace, strace-container")
-	scanCmd.Flags().DurationVar(&timeout, "timeout", 5*time.Minute, "scan timeout")
+	scanCmd.Flags().StringVarP(&flagVersion, "version", "v", "", "package version to scan")
+	scanCmd.Flags().StringVarP(&flagOutput, "output", "o", "", "output file path (default: stdout)")
+	scanCmd.Flags().StringVar(&flagProbeMethod, "probe-method", methodAuto, "probe method: auto, ebpf, strace, strace-container")
+	scanCmd.Flags().DurationVar(&flagTimeout, "timeout", 5*time.Minute, "scan timeout")
 
 	rootCmd.AddCommand(scanCmd)
 	rootCmd.AddCommand(versionCmd)
 }
 
+// Execute runs the root command.
 func Execute() {
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
 }
 
-func runScan(cmd *cobra.Command, args []string) error {
+// scanResult holds the output of a probe+install cycle.
+type scanResult struct {
+	method      string
+	events      []types.ConnectEvent
+	lostSamples uint64
+}
+
+func runScan(_ *cobra.Command, args []string) error {
 	pkg := args[0]
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	if err := downloader.ValidatePackage(pkg, flagVersion); err != nil {
+		return fmt.Errorf("invalid input: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), flagTimeout)
 	defer cancel()
 
-	// Handle interrupt
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt)
+
 	go func() {
 		<-sigCh
 		cancel()
 	}()
 
-	// Validate input
-	if err := downloader.ValidatePackage(pkg, version); err != nil {
+	dlDir, err := downloadPackage(ctx, pkg)
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(filepath.Dir(dlDir))
+
+	method := selectProbeMethod()
+
+	sb, err := startSandbox(ctx, dlDir, pkg, method)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cleanupErr := sb.Cleanup(ctx); cleanupErr != nil {
+			fmt.Fprintf(os.Stderr, "[!] Cleanup warning: %v\n", cleanupErr)
+		}
+	}()
+
+	result, err := runProbeAndInstall(ctx, sb, pkg, method)
+	if err != nil {
 		return err
 	}
 
-	// Step 1: Create temp dir and download package
+	return outputReport(pkg, result)
+}
+
+func downloadPackage(ctx context.Context, pkg string) (string, error) {
 	fmt.Fprintf(os.Stderr, "[*] Downloading %s...\n", pkg)
+
 	tmpDir, err := os.MkdirTemp("", "kojuto-*")
 	if err != nil {
-		return fmt.Errorf("creating temp dir: %w", err)
+		return "", fmt.Errorf("creating temp dir: %w", err)
 	}
-	defer os.RemoveAll(tmpDir)
 
 	dlDir := filepath.Join(tmpDir, "packages")
-	if err := os.MkdirAll(dlDir, 0o755); err != nil {
-		return fmt.Errorf("creating download dir: %w", err)
+	if mkErr := os.MkdirAll(dlDir, 0o755); mkErr != nil {
+		return "", fmt.Errorf("creating download dir: %w", mkErr)
 	}
 
-	if _, err := downloader.Download(ctx, pkg, version, dlDir); err != nil {
-		return err
+	if _, dlErr := downloader.Download(ctx, pkg, flagVersion, dlDir); dlErr != nil {
+		return "", fmt.Errorf("downloading package: %w", dlErr)
 	}
 
-	// Detect version from downloaded files
-	if version == "" {
-		version = downloader.DetectVersion(dlDir, pkg)
+	if flagVersion == "" {
+		flagVersion = downloader.DetectVersion(dlDir, pkg)
 	}
 
-	// Step 2: Choose probe method
-	method := probeMethod
-	if method == "auto" {
-		if probe.CanUseEBPF() {
-			method = "ebpf"
-		} else if runtime.GOOS == "linux" {
-			method = "strace"
-			fmt.Fprintf(os.Stderr, "[!] eBPF unavailable, falling back to host strace\n")
-		} else {
-			method = "strace-container"
-			fmt.Fprintf(os.Stderr, "[*] Non-Linux host, using in-container strace\n")
-		}
+	return dlDir, nil
+}
+
+func selectProbeMethod() string {
+	method := flagProbeMethod
+	if method != methodAuto {
+		return method
 	}
 
-	// Step 3: Ensure sandbox image exists
+	switch {
+	case probe.CanUseEBPF():
+		return methodEBPF
+	case runtime.GOOS == "linux":
+		fmt.Fprintf(os.Stderr, "[!] eBPF unavailable, falling back to host strace\n")
+
+		return methodStrace
+	default:
+		fmt.Fprintf(os.Stderr, "[*] Non-Linux host, using in-container strace\n")
+
+		return methodStraceContainer
+	}
+}
+
+func startSandbox(ctx context.Context, dlDir, pkg, method string) (*sandbox.Sandbox, error) {
 	fmt.Fprintf(os.Stderr, "[*] Preparing sandbox...\n")
+
 	dockerfilePath := findDockerfile()
 	if err := sandbox.EnsureImage(ctx, dockerfilePath); err != nil {
-		return fmt.Errorf("ensuring sandbox image: %w", err)
+		return nil, fmt.Errorf("ensuring sandbox image: %w", err)
 	}
 
-	// Step 4: Start sandbox container (paused for probe attachment)
-	needsPtrace := method == "strace-container"
+	needsPtrace := method == methodStraceContainer
 	sb := sandbox.New(dlDir, pkg, needsPtrace)
-	if err := sb.Start(ctx); err != nil {
-		return err
-	}
-	defer sb.Cleanup(ctx)
 
-	// Pause container immediately to prevent any activity before probe is ready
-	if method == "ebpf" || method == "strace" {
+	if err := sb.Start(ctx); err != nil {
+		return nil, fmt.Errorf("starting sandbox: %w", err)
+	}
+
+	if method == methodEBPF || method == methodStrace {
 		if err := sb.Pause(ctx); err != nil {
-			return fmt.Errorf("pausing container: %w", err)
+			return nil, fmt.Errorf("pausing container: %w", err)
 		}
 	}
 
-	// Step 5+6: Probe and install (flow differs by method)
+	return sb, nil
+}
+
+func runProbeAndInstall(ctx context.Context, sb *sandbox.Sandbox, pkg, method string) (*scanResult, error) {
 	fmt.Fprintf(os.Stderr, "[*] Starting %s probe...\n", method)
 
-	var events []types.ConnectEvent
-	var probeMethodUsed string
-	var lostSamples uint64
-
 	switch method {
-	case "ebpf":
-		containerPID, err := sb.PID(ctx)
-		if err != nil {
-			return err
-		}
-		pidnsInode, err := getPIDNSInode(containerPID)
-		if err != nil {
-			return fmt.Errorf("getting pidns inode: %w", err)
-		}
-		ep := probe.NewEBPF()
-		if err := ep.Start(pidnsInode); err != nil {
-			return fmt.Errorf("starting eBPF probe: %w", err)
-		}
-		defer ep.Close()
-
-		// Probe attached — unpause container
-		if err := sb.Unpause(ctx); err != nil {
-			return fmt.Errorf("unpausing container: %w", err)
-		}
-
-		fmt.Fprintf(os.Stderr, "[*] Installing %s in sandbox...\n", pkg)
-		installOut, err := sb.InstallPackage(ctx)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[!] Install output:\n%s\n", string(installOut))
-			return fmt.Errorf("pip install failed: %w", err)
-		}
-
-		time.Sleep(500 * time.Millisecond)
-		ep.Close()
-		for evt := range ep.Events() {
-			events = append(events, evt)
-		}
-		lostSamples = ep.LostSamples
-		probeMethodUsed = ep.Method()
-
-	case "strace":
-		containerPID, err := sb.PID(ctx)
-		if err != nil {
-			return err
-		}
-		sp := probe.NewStrace()
-		if err := sp.StartWithPID(containerPID); err != nil {
-			return fmt.Errorf("starting strace probe: %w", err)
-		}
-		defer sp.Close()
-
-		// Probe attached — unpause container
-		if err := sb.Unpause(ctx); err != nil {
-			return fmt.Errorf("unpausing container: %w", err)
-		}
-
-		fmt.Fprintf(os.Stderr, "[*] Installing %s in sandbox...\n", pkg)
-		installOut, err := sb.InstallPackage(ctx)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[!] Install output:\n%s\n", string(installOut))
-			return fmt.Errorf("pip install failed: %w", err)
-		}
-
-		time.Sleep(500 * time.Millisecond)
-		sp.Close()
-		for evt := range sp.Events() {
-			events = append(events, evt)
-		}
-		probeMethodUsed = sp.Method()
-
-	case "strace-container":
-		cp := probe.NewContainerStrace()
-		fmt.Fprintf(os.Stderr, "[*] Installing %s in sandbox (with strace)...\n", pkg)
-		installOut, err := cp.StartAndInstall(ctx, sb.ContainerID(), pkg)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[!] Install output:\n%s\n", string(installOut))
-			return fmt.Errorf("pip install failed: %w", err)
-		}
-
-		for evt := range cp.Events() {
-			events = append(events, evt)
-		}
-		probeMethodUsed = cp.Method()
-
+	case methodEBPF:
+		return runEBPFProbe(ctx, sb, pkg)
+	case methodStrace:
+		return runStraceProbe(ctx, sb, pkg)
+	case methodStraceContainer:
+		return runContainerStraceProbe(ctx, sb, pkg)
 	default:
-		return fmt.Errorf("unknown probe method: %s", method)
+		return nil, fmt.Errorf("unknown probe method: %s", method)
+	}
+}
+
+func runEBPFProbe(ctx context.Context, sb *sandbox.Sandbox, pkg string) (*scanResult, error) {
+	containerPID, err := sb.PID(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("getting container PID: %w", err)
 	}
 
-	// Step 7: Analyze and report
-	verdict := analyzer.Analyze(events)
-	if lostSamples > 0 {
+	pidnsInode, err := getPIDNSInode(containerPID)
+	if err != nil {
+		return nil, fmt.Errorf("getting pidns inode: %w", err)
+	}
+
+	ep := probe.NewEBPF()
+	if startErr := ep.Start(pidnsInode); startErr != nil {
+		return nil, fmt.Errorf("starting eBPF probe: %w", startErr)
+	}
+	defer func() { _ = ep.Close() }()
+
+	if unpauseErr := sb.Unpause(ctx); unpauseErr != nil {
+		return nil, fmt.Errorf("unpausing container: %w", unpauseErr)
+	}
+
+	events, err := installAndCollect(ctx, sb, pkg, ep)
+	if err != nil {
+		return nil, err
+	}
+
+	return &scanResult{
+		events:      events,
+		method:      ep.Method(),
+		lostSamples: ep.LostSamples,
+	}, nil
+}
+
+func runStraceProbe(ctx context.Context, sb *sandbox.Sandbox, pkg string) (*scanResult, error) {
+	containerPID, err := sb.PID(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("getting container PID: %w", err)
+	}
+
+	sp := probe.NewStrace()
+	if startErr := sp.StartWithPID(containerPID); startErr != nil {
+		return nil, fmt.Errorf("starting strace probe: %w", startErr)
+	}
+	defer func() { _ = sp.Close() }()
+
+	if unpauseErr := sb.Unpause(ctx); unpauseErr != nil {
+		return nil, fmt.Errorf("unpausing container: %w", unpauseErr)
+	}
+
+	events, err := installAndCollect(ctx, sb, pkg, sp)
+	if err != nil {
+		return nil, err
+	}
+
+	return &scanResult{
+		events: events,
+		method: sp.Method(),
+	}, nil
+}
+
+func runContainerStraceProbe(ctx context.Context, sb *sandbox.Sandbox, pkg string) (*scanResult, error) {
+	cp := probe.NewContainerStrace()
+	fmt.Fprintf(os.Stderr, "[*] Installing %s in sandbox (with strace)...\n", pkg)
+
+	installOut, err := cp.StartAndInstall(ctx, sb.ContainerID(), pkg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[!] Install output:\n%s\n", string(installOut))
+
+		return nil, fmt.Errorf("pip install failed: %w", err)
+	}
+
+	var events []types.ConnectEvent
+	for evt := range cp.Events() {
+		events = append(events, evt)
+	}
+
+	return &scanResult{
+		events: events,
+		method: cp.Method(),
+	}, nil
+}
+
+func installAndCollect(ctx context.Context, sb *sandbox.Sandbox, pkg string, p probe.Probe) ([]types.ConnectEvent, error) {
+	fmt.Fprintf(os.Stderr, "[*] Installing %s in sandbox...\n", pkg)
+
+	installOut, err := sb.InstallPackage(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[!] Install output:\n%s\n", string(installOut))
+
+		return nil, fmt.Errorf("pip install failed: %w", err)
+	}
+
+	time.Sleep(eventDrainDelay)
+	_ = p.Close()
+
+	var events []types.ConnectEvent
+	for evt := range p.Events() {
+		events = append(events, evt)
+	}
+
+	return events, nil
+}
+
+func outputReport(pkg string, result *scanResult) error {
+	verdict := analyzer.Analyze(result.events)
+	if result.lostSamples > 0 {
 		verdict = types.VerdictInconclusive
 	}
-	r := report.Generate(pkg, version, verdict, probeMethodUsed, events, lostSamples)
 
+	r := report.Generate(pkg, flagVersion, verdict, result.method, result.events, result.lostSamples)
+	printVerdict(verdict, len(result.events), result.lostSamples)
+
+	w, err := openOutput()
+	if err != nil {
+		return err
+	}
+
+	if w != os.Stdout {
+		defer w.Close()
+	}
+
+	if err := report.WriteJSON(&r, w); err != nil {
+		return fmt.Errorf("writing report: %w", err)
+	}
+
+	return nil
+}
+
+func printVerdict(verdict string, eventCount int, lostSamples uint64) {
 	switch verdict {
 	case types.VerdictSuspicious:
-		fmt.Fprintf(os.Stderr, "[!] SUSPICIOUS: %d connection attempt(s) detected\n", len(events))
+		fmt.Fprintf(os.Stderr, "[!] SUSPICIOUS: %d connection attempt(s) detected\n", eventCount)
 	case types.VerdictInconclusive:
 		fmt.Fprintf(os.Stderr, "[!] INCONCLUSIVE: %d event(s) lost, results may be incomplete\n", lostSamples)
 	default:
 		fmt.Fprintf(os.Stderr, "[+] CLEAN: No connection attempts detected\n")
 	}
+}
 
-	var w *os.File
-	if output != "" {
-		w, err = os.Create(output)
-		if err != nil {
-			return fmt.Errorf("creating output file: %w", err)
-		}
-		defer w.Close()
-	} else {
-		w = os.Stdout
+func openOutput() (*os.File, error) {
+	if flagOutput == "" {
+		return os.Stdout, nil
 	}
 
-	return report.WriteJSON(r, w)
+	f, err := os.Create(flagOutput)
+	if err != nil {
+		return nil, fmt.Errorf("creating output file: %w", err)
+	}
+
+	return f, nil
 }
 
 func findDockerfile() string {
@@ -266,10 +363,12 @@ func findDockerfile() string {
 		"Dockerfile.sandbox",
 		filepath.Join("..", "Dockerfile.sandbox"),
 	}
+
 	for _, c := range candidates {
 		if _, err := os.Stat(c); err == nil {
 			return c
 		}
 	}
+
 	return "Dockerfile.sandbox"
 }

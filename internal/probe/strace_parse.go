@@ -19,7 +19,10 @@ func parseStraceLine(line string) (types.ConnectEvent, bool) {
 		return types.ConnectEvent{}, false
 	}
 
-	port, _ := strconv.ParseUint(matches[1], 10, 16)
+	port, err := strconv.ParseUint(matches[1], 10, 16)
+	if err != nil {
+		return types.ConnectEvent{}, false
+	}
 	addr := matches[2]
 
 	var family uint16 = 2 // AF_INET
