@@ -11,10 +11,17 @@ A supply chain attack detection tool that monitors syscalls during package insta
 1. **Download** — Fetch the target package to the host (network allowed)
 2. **Isolate** — Run installation inside a hardened Docker container with network isolation
 3. **Install + Monitor** — Record `connect`, `sendto`, `sendmsg`, `execve`, `openat`, and `rename` syscalls via strace (or eBPF)
-4. **Import + Monitor** — Import/require the package under 3 simulated OS identities (Linux, Windows, macOS) to trigger platform-gated payloads
+4. **Import + Monitor** — Import/require the package under 3 simulated OS identities (Linux, Windows, macOS) with time shifted +30 days via `libfaketime` to trigger platform-gated and date-gated payloads
 5. **Report** — Output findings as JSON
 
-`openat` detects credential access (`.ssh/`, `.aws/`, `/etc/shadow`), `rename` detects trusted binary replacement, and `sendfile` reveals direct file-to-socket transfer paths that bypass simple command-based heuristics.
+The sandbox is intentionally seeded with realistic artifacts to provoke malicious behavior:
+
+- Fake credential files (`~/.ssh/id_rsa`, `~/.aws/credentials`, `~/.git-credentials`, etc.)
+- CI and developer environment variables (`CI=true`, `GITHUB_TOKEN`, `AWS_ACCESS_KEY_ID`, etc.)
+
+All values are randomly generated per scan to prevent signature-based evasion and ensure unique execution environments.
+
+`openat` detects credential access (`.ssh/`, `.aws/`, `/etc/shadow`) and `rename` detects trusted binary replacement. Additionally, `sendfile` is traced for forensic purposes but not parsed into structured events.
 
 Well-behaved packages typically do not make unexpected network connections, spawn unrelated processes, access credential files, or modify trusted binaries during install or import. Any such activity is treated as suspicious and surfaced for review.
 
@@ -43,7 +50,7 @@ make sandbox-image
 # Output to file
 ./kojuto scan requests -o report.json
 
-# Explicitly use eBPF (currently connect-focused; requires root + kernel 5.8+)
+# Explicitly use eBPF (connect, sendto, execve, openat, rename; requires root + kernel 5.8+)
 sudo ./kojuto scan requests --probe-method ebpf
 
 # Set scan timeout per package
@@ -142,6 +149,17 @@ sudo ./kojuto scan requests --probe-method ebpf
 
 - [Specification](docs/SPECIFICATION.md)
 - [日本語ドキュメント](docs/README_ja.md)
+
+## Design Philosophy
+
+kojuto does not rely solely on passive syscall observation. It actively creates conditions that encourage malicious behavior to surface:
+
+- **Honeypot credentials** — fake but realistic files and tokens that trigger harvesting logic
+- **CI environment signals** — environment variables that activate CI-gated payloads
+- **Time-shifted execution** — `libfaketime` advances the clock to trigger date-gated bombs
+- **Multi-OS identity** — simulated platform identities to defeat OS-gated payloads
+
+This approach detects environment-aware and delayed-execution supply chain attacks that would remain dormant in a sterile sandbox.
 
 ## Security
 

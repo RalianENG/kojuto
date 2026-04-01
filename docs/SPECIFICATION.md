@@ -83,7 +83,7 @@ CLI (cobra)
   ├─ Probe            Syscall monitoring
   │   ├─ strace-container (default, full syscall coverage)
   │   ├─ strace (host-level, Linux only)
-  │   └─ eBPF (opt-in, connect only, fastest)
+  │   └─ eBPF (opt-in, connect+sendto+execve+openat+rename, fastest)
   │
   ├─ Analyzer         Event classification and risk assessment
   │   ├─ Network events: filter out loopback/unspecified/link-local
@@ -108,6 +108,20 @@ CLI (cobra)
 - Python: monkey-patches `platform.system()`, `sys.platform`, `os.name` before import
 - Node.js: overrides `process.platform` via `Object.defineProperty` before require
 - Detects OS-gated malware (e.g. `if platform.system() == "Windows": attack()`) dynamically
+
+### Time-Shifted Import (libfaketime)
+
+- Import probes run with `LD_PRELOAD=libfaketime.so` and `FAKETIME=+30d`
+- Triggers date-gated payloads (e.g. `if datetime.now() > datetime(2026, 5, 1): attack()`)
+- Intercepts `gettimeofday`/`clock_gettime` at libc level — covers Python `datetime.now()`, Node `Date.now()`
+- Install phase uses real time to avoid breaking pip/npm
+
+### Honeypot Environment Simulation
+
+- Fake credential files planted in container: `~/.ssh/id_rsa`, `~/.aws/credentials`, `~/.git-credentials`, `~/.netrc`, `~/.config/gh/hosts.yml`
+- CI/cloud environment variables injected: `CI=true`, `GITHUB_ACTIONS=true`, `AWS_ACCESS_KEY_ID`, `GITHUB_TOKEN`, `NPM_TOKEN`
+- All tokens and secret values randomly generated per scan via `crypto/rand` to prevent static fingerprinting by malware aware of kojuto source
+- Triggers credential-harvesting logic that checks for file/env presence before exfiltrating
 
 ---
 

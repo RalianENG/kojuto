@@ -49,7 +49,9 @@ kojuto is a security tool that intentionally runs untrusted code in an isolated 
 - **Credential access detection**: `openat` monitoring flags access to sensitive paths (`~/.ssh/`, `~/.aws/`, `/etc/shadow`, `/proc/self/environ`, etc.)
 - **Binary hijacking detection**: `rename`/`renameat`/`renameat2` monitoring detects attempts to overwrite trusted binaries (`python3`, `node`, `sh`, etc.)
 - **Multi-OS import probing**: packages are imported under simulated Linux, Windows, and macOS identities to trigger platform-gated payloads
-- **eBPF mode** (opt-in): attaches kprobe to `__sys_connect` with PID namespace filtering; only monitors `connect()` — narrower coverage than strace
+- **Time-shifted import**: `libfaketime` advances the clock +30 days during import probes to trigger date-gated payloads
+- **Honeypot simulation**: fake credential files and CI environment variables (randomly generated per scan) provoke credential-harvesting malware into observable behavior
+- **eBPF mode** (opt-in): kprobes for `connect`, `sendto`, `execve`, `openat`, and `rename` with PID namespace filtering; best-effort attachment for non-critical probes
 
 ### Anti-Fingerprinting
 

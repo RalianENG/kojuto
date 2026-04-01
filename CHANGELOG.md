@@ -11,14 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `openat` syscall monitoring for sensitive file access detection (`.ssh/`, `.aws/`, `/etc/shadow`, `/proc/self/environ`, `.netrc`, `.git-credentials`, `.docker/config.json`, `.config/gh/`)
 - `rename`/`renameat`/`renameat2` syscall monitoring to detect trusted binary hijacking
 - `sendfile` added to strace trace list for forensic completeness
-- `FilePath` field in `SyscallEvent` for file-related events
+- `SrcPath`/`DstPath` fields for rename events; `OpenFlags` field for openat events
+- Honeypot environment simulation: fake credential files (SSH, AWS, Git, netrc, GitHub CLI) and CI/cloud environment variables planted in sandbox to trigger harvesting malware
+- All honeypot tokens randomly generated per scan via `crypto/rand` to prevent static fingerprinting
+- `libfaketime` integration: import probes run with `FAKETIME=+30d` to trigger date-gated payloads
+- eBPF probe expanded with 4 new kprobes: `__sys_sendto`, `do_execveat_common`, `do_sys_openat2`, `vfs_rename`
+- Separate perf buffer for file events in eBPF mode; best-effort probe attachment for non-critical kprobes
 - Hostname sanitization to prevent Docker CLI argument injection
+- Test coverage for new parsers (openat, rename), analyzer (rename trusted binary, openat, bind/listen/accept), and sandbox (honeypot token generation, sanitizeDockerArg)
 
 ### Changed
 - Custom seccomp profile is now always applied regardless of `--probe-method` (previously only applied when strace needed SYS_PTRACE)
 - `seccompDir` moved from global variable to per-`Sandbox` struct field (fixes race condition in concurrent scans)
 - `/usr/local/bin` tmpfs permissions tightened from `mode=1777` to `mode=0755`
 - npm `package.json` generation now uses `json.Marshal` instead of `fmt.Sprintf` (prevents JSON injection)
+- eBPF probe description updated from "connect-only" to multi-syscall coverage
+- Import phase commands wrapped with `libfaketime` (install phase uses real time)
 
 ### Security
 - `memfd_create` added to seccomp blocklist (prevents fileless ELF execution bypassing noexec tmpfs)
