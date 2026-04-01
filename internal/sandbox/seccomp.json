@@ -6,7 +6,7 @@
         "ptrace"
       ],
       "action": "SCMP_ACT_ALLOW",
-      "comment": "Allow ptrace only for strace (PTRACE_ATTACH, PTRACE_SEIZE, PTRACE_SYSCALL, PTRACE_CONT, PTRACE_DETACH, PTRACE_PEEKDATA, PTRACE_GETREGSET)"
+      "comment": "Allow ptrace for strace operation only"
     },
     {
       "names": [
@@ -15,13 +15,29 @@
       ],
       "action": "SCMP_ACT_ERRNO",
       "errnoRet": 1,
-      "comment": "Block cross-process memory access to prevent abuse of SYS_PTRACE capability"
+      "comment": "Block cross-process memory access to prevent SYS_PTRACE abuse"
+    },
+    {
+      "names": [
+        "prctl"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
+      "args": [
+        {
+          "index": 0,
+          "value": 15,
+          "op": "SCMP_CMP_EQ"
+        }
+      ],
+      "comment": "Block prctl(PR_SET_NAME) to prevent process name spoofing for probe evasion"
     },
     {
       "names": [
         "mount",
         "umount2",
         "pivot_root",
+        "chroot",
         "swapon",
         "swapoff",
         "reboot",
@@ -38,11 +54,33 @@
         "open_by_handle_at",
         "keyctl",
         "request_key",
-        "add_key"
+        "add_key",
+        "unshare",
+        "setns",
+        "clone3",
+        "kcmp",
+        "lookup_dcookie",
+        "quotactl",
+        "acct",
+        "settimeofday",
+        "clock_settime",
+        "clock_adjtime",
+        "adjtimex",
+        "nfsservctl",
+        "personality",
+        "ioperm",
+        "iopl",
+        "vm86",
+        "vm86old",
+        "modify_ldt",
+        "create_module",
+        "get_kernel_syms",
+        "query_module",
+        "memfd_create"
       ],
       "action": "SCMP_ACT_ERRNO",
       "errnoRet": 1,
-      "comment": "Block dangerous syscalls that could be leveraged with SYS_PTRACE for container escape"
+      "comment": "Block dangerous syscalls: namespace escape, kernel module loading, time manipulation, hardware access, fileless execution, and container breakout vectors"
     }
   ]
 }

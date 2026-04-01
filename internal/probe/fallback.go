@@ -38,7 +38,7 @@ func (s *StraceFallback) Start(targetPIDNS uint32) error {
 func (s *StraceFallback) StartWithPID(pid uint32) error {
 	s.cmd = exec.Command("strace",
 		"-f",
-		"-e", "trace=connect,sendto,execve",
+		"-e", "trace=connect,sendto,sendmsg,execve",
 		"-e", "signal=none",
 		"-p", strconv.FormatUint(uint64(pid), 10),
 	)

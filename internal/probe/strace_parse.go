@@ -20,6 +20,11 @@ var (
 		`sendto\(\d+,.*\{sa_family=AF_INET6?,\s*sin6?_port=htons\((\d+)\),\s*sin6?_addr=inet6?_addr\("([^"]+)"\)`,
 	)
 
+	// sendmsg(3, {msg_name={sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("1.2.3.4")}, ...}, 0).
+	straceSendmsgRe = regexp.MustCompile(
+		`sendmsg\(\d+,.*\{sa_family=AF_INET6?,\s*sin6?_port=htons\((\d+)\),\s*sin6?_addr=inet6?_addr\("([^"]+)"\)`,
+	)
+
 	// execve("/usr/bin/curl", ["curl", "http://evil.com"], ...)
 	straceExecveRe = regexp.MustCompile(
 		`execve\("([^"]+)",\s*\[([^\]]+)\]`,
@@ -32,6 +37,10 @@ func parseStraceLine(line string) (types.SyscallEvent, bool) {
 	}
 
 	if evt, ok := parseConnectOrSendto(line, straceSendtoRe, types.EventSendto); ok {
+		return evt, true
+	}
+
+	if evt, ok := parseConnectOrSendto(line, straceSendmsgRe, types.EventSendmsg); ok {
 		return evt, true
 	}
 

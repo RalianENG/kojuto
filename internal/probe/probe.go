@@ -59,8 +59,10 @@ func (p *EBPFProbe) Start(targetPIDNS uint32) error {
 	}
 	p.link = kp
 
-	// Open perf event reader
-	rd, err := perf.NewReader(objs.Events, os.Getpagesize()*16)
+	// Open perf event reader with 512 pages (~2MB on 4K page systems).
+	// A large buffer reduces LostSamples under high-frequency connect() floods
+	// which attackers may use to force an inconclusive verdict.
+	rd, err := perf.NewReader(objs.Events, os.Getpagesize()*512)
 	if err != nil {
 		return fmt.Errorf("creating perf reader: %w", err)
 	}

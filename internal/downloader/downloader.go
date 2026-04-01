@@ -73,7 +73,8 @@ func downloadNpm(ctx context.Context, pkg, version, destDir string) (string, err
 	}
 
 	// npm pack downloads a tarball to the current directory.
-	args := []string{"pack", "--pack-destination", destDir, target}
+	// --ignore-scripts prevents prepack/postpack scripts from executing on the host.
+	args := []string{"pack", "--ignore-scripts", "--pack-destination", destDir, target}
 	cmd := exec.CommandContext(ctx, "npm", args...)
 	cmd.Dir = destDir
 	cmd.Stdout = os.Stderr

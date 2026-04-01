@@ -6,6 +6,7 @@ import "time"
 const (
 	EventConnect = "connect"
 	EventSendto  = "sendto"
+	EventSendmsg = "sendmsg"
 	EventExecve  = "execve"
 )
 

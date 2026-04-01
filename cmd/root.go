@@ -27,8 +27,7 @@ const (
 	methodStraceContainer = "strace-container"
 	eventDrainDelay       = 500 * time.Millisecond
 
-	exitCodeSuspicious   = 2
-	exitCodeInconclusive = 3
+	exitCodeSuspicious = 2
 )
 
 var (
@@ -184,13 +183,14 @@ func selectProbeMethod() string {
 		return method
 	}
 
+	// Prefer strace-container for broadest syscall coverage (connect, sendto,
+	// sendmsg, execve). eBPF only hooks connect — it is faster but has blind
+	// spots for sendto/sendmsg/execve. Only use eBPF when explicitly requested.
 	switch {
-	case probe.CanUseEBPF():
-		return methodEBPF
 	case runtime.GOOS == "linux":
-		fmt.Fprintf(os.Stderr, "[!] eBPF unavailable, falling back to host strace\n")
+		fmt.Fprintf(os.Stderr, "[*] Using in-container strace for full syscall coverage\n")
 
-		return methodStrace
+		return methodStraceContainer
 	default:
 		fmt.Fprintf(os.Stderr, "[*] Non-Linux host, using in-container strace\n")
 
@@ -258,6 +258,7 @@ func runEBPFProbe(ctx context.Context, sb *sandbox.Sandbox, pkg string) (*scanRe
 	if startErr := ep.Start(pidnsInode); startErr != nil {
 		return nil, fmt.Errorf("starting eBPF probe: %w", startErr)
 	}
+	fmt.Fprintf(os.Stderr, "[!] eBPF probe monitors connect() only — sendto/sendmsg/execve are not covered. Consider --probe-method=strace-container for full coverage.\n")
 	defer func() { _ = ep.Close() }()
 
 	if unpauseErr := sb.Unpause(ctx); unpauseErr != nil {
@@ -372,7 +373,9 @@ func outputReport(pkg string, result *scanResult) error {
 	case types.VerdictSuspicious:
 		return &VerdictError{Verdict: verdict, ExitCode: exitCodeSuspicious}
 	case types.VerdictInconclusive:
-		return &VerdictError{Verdict: verdict, ExitCode: exitCodeInconclusive}
+		// Treat inconclusive as failure — lost events may hide real attacks.
+		// CI pipelines should block on this just like suspicious.
+		return &VerdictError{Verdict: verdict, ExitCode: exitCodeSuspicious}
 	default:
 		return nil
 	}
@@ -383,7 +386,7 @@ func printVerdict(verdict string, eventCount int, lostSamples uint64) {
 	case types.VerdictSuspicious:
 		fmt.Fprintf(os.Stderr, "[!] SUSPICIOUS: %d suspicious event(s) detected\n", eventCount)
 	case types.VerdictInconclusive:
-		fmt.Fprintf(os.Stderr, "[!] INCONCLUSIVE: %d event(s) lost, results may be incomplete\n", lostSamples)
+		fmt.Fprintf(os.Stderr, "[!] INCONCLUSIVE: %d event(s) lost — probe buffer overflow, possible evasion attempt. Treating as failure.\n", lostSamples)
 	default:
 		fmt.Fprintf(os.Stderr, "[+] CLEAN: No suspicious activity detected\n")
 	}

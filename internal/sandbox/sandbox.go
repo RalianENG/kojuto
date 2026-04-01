@@ -20,6 +20,9 @@ var seccompProfile []byte
 // SandboxImage is the Docker image used for the sandbox container.
 const SandboxImage = "kojuto-sandbox:latest"
 
+// SandboxPythonVersion must match the Python version in Dockerfile.sandbox.
+const SandboxPythonVersion = "3.12"
+
 // Sandbox manages a Docker container for isolated package installation.
 type Sandbox struct {
 	containerID string
@@ -60,21 +63,27 @@ func writeSeccompProfile() (string, error) {
 	return "seccomp=" + path, nil
 }
 
+// packagesMountPoint is the in-container path where packages are mounted.
+// Uses a generic name to reduce sandbox fingerprinting.
+const packagesMountPoint = "/mnt/src"
+
 // containerArgs builds the common Docker flags for both Create and Start.
 func (s *Sandbox) containerArgs() ([]string, error) {
 	args := []string{
 		"--network=none",
 		"--security-opt=no-new-privileges",
 		"--read-only",
-		"--tmpfs=/tmp:nosuid,size=64m",
-		"--tmpfs=/install:nosuid,size=256m",
-		"--tmpfs=/usr/local/lib/python3.12/site-packages:nosuid,size=256m",
-		"--tmpfs=/usr/local/bin:nosuid,size=16m",
+		"--cap-drop=ALL",
+		"--tmpfs=/tmp:nosuid,size=100m",
+		"--tmpfs=/install:nosuid,size=300m",
+		"--tmpfs=/usr/local/lib/python" + SandboxPythonVersion + "/site-packages:nosuid,size=300m",
+		"--tmpfs=/usr/local/bin:nosuid,size=32m",
 		"--memory=512m",
 		"--cpus=1",
 		"--pids-limit=256",
 	}
 	if s.needsPtrace {
+		// Re-add only SYS_PTRACE (all others remain dropped).
 		args = append(args, "--cap-add=SYS_PTRACE")
 
 		seccompOpt, err := writeSeccompProfile()
@@ -85,7 +94,7 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 	}
 
 	args = append(args,
-		"-v", s.packageDir+":/packages:ro",
+		"-v", s.packageDir+":"+packagesMountPoint+":ro",
 		SandboxImage,
 		"sleep", "3600",
 	)
@@ -180,7 +189,7 @@ func (s *Sandbox) InstallCommand() []string {
 			"--offline",
 			"--ignore-scripts=false",
 			"--prefix=/install",
-			"/packages/" + s.findTarball(),
+			packagesMountPoint + "/" + s.findTarball(),
 		}
 	}
 
@@ -188,7 +197,7 @@ func (s *Sandbox) InstallCommand() []string {
 		"pip", "install",
 		"--no-deps",
 		"--no-index",
-		"--find-links=/packages",
+		"--find-links=" + packagesMountPoint,
 		"--", s.pkg,
 	}
 }
