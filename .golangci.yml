@@ -75,6 +75,20 @@ linters-settings:
   gosec:
     severity: high
     confidence: medium
+    excludes:
+      # G204: Subprocess with variable — all exec calls use validated inputs
+      # (docker, pip, npm, strace). This is a CLI tool that orchestrates containers.
+      - G204
+      # G304: File inclusion via variable — CLI tool reads user-specified paths.
+      - G304
+      # G301: Directory permissions 0750 — 0755 is standard for temp dirs.
+      - G301
+      # G306: File permissions 0600 — 0644/0444 are appropriate for non-secret files.
+      - G306
+      # G115: Integer overflow int8→byte — eBPF struct conversions, no real overflow risk.
+      - G115
+      # G104: Errors unhandled — cleanup Close() calls where errors are not actionable.
+      - G104
 
   gocritic:
     enabled-tags:

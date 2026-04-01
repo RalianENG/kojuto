@@ -146,7 +146,7 @@ sudo ./kojuto scan requests --probe-method ebpf
 ## Requirements
 
 - Docker
-- Go 1.25+ (build from source)
+- Go 1.25+ (build from source; required by dependencies)
 - Linux, macOS, or Windows (via Docker Desktop)
 - Root or CAP_BPF + CAP_PERFMON (only for `--probe-method=ebpf`)
 

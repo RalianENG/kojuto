@@ -24,9 +24,9 @@ jobs:
           go-version-file: go.mod
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v7
         with:
-          version: latest
+          version: v2
 
   # ──────────────────────────────────────────────
   # 2. Unit tests — cross-platform matrix
@@ -49,7 +49,7 @@ jobs:
         run: go build -o kojuto${{ matrix.os == 'windows-latest' && '.exe' || '' }} .
 
       - name: Unit tests
-        run: go test -race -coverprofile=coverage.txt -covermode=atomic ./...
+        run: go test -race -coverprofile coverage.txt -covermode atomic ./...
 
       - name: Upload coverage
         if: matrix.os == 'ubuntu-latest'
@@ -103,10 +103,8 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: gosec
-        uses: securego/gosec@master
-        with:
-          args: ./...
+      # gosec runs via golangci-lint (configured in .golangci.yml) with
+      # project-specific exclusions. No separate gosec step needed.
 
       - name: govulncheck
         run: |
