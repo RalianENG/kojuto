@@ -7,7 +7,7 @@ package probe
 // to use the real implementation instead.
 
 import (
-	"fmt"
+	"errors"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/perf"
@@ -16,7 +16,7 @@ import (
 type probeConnectEvent struct {
 	TimestampNs uint64
 	Pid         uint32
-	Uid         uint32
+	UID         uint32
 	Family      uint16
 	Dport       uint16
 	Daddr       [16]uint8
@@ -26,7 +26,7 @@ type probeConnectEvent struct {
 type probeFileEvent struct {
 	TimestampNs uint64
 	Pid         uint32
-	Uid         uint32
+	UID         uint32
 	EventType   uint8
 	Pad         [3]uint8
 	Path        [128]int8
@@ -44,8 +44,8 @@ type probeObjects struct {
 	TargetPidns   *ebpf.Map     `ebpf:"target_pidns"`
 }
 
-func loadProbeObjects(obj *probeObjects, opts *ebpf.CollectionOptions) error {
-	return fmt.Errorf("eBPF objects not generated: run 'make generate' on Linux with clang")
+func loadProbeObjects(_ *probeObjects, _ *ebpf.CollectionOptions) error {
+	return errors.New("eBPF objects not generated: run 'make generate' on Linux with clang")
 }
 
 func (o *probeObjects) Close() error {
@@ -67,5 +67,5 @@ func (o *probeObjects) Close() error {
 	return nil
 }
 
-// Ensure perf import is used (referenced in probe.go)
+// Ensure perf import is used (referenced in probe.go).
 var _ *perf.Reader

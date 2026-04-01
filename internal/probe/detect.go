@@ -76,7 +76,7 @@ func hasMinKernel(major, minor int) bool {
 	}
 
 	maj := 0
-	min := 0
+	mnr := 0
 	for _, c := range parts[0] {
 		if c >= '0' && c <= '9' {
 			maj = maj*10 + int(c-'0')
@@ -84,14 +84,14 @@ func hasMinKernel(major, minor int) bool {
 	}
 	for _, c := range parts[1] {
 		if c >= '0' && c <= '9' {
-			min = min*10 + int(c-'0')
+			mnr = mnr*10 + int(c-'0')
 		}
 	}
 
 	if maj > major {
 		return true
 	}
-	if maj == major && min >= minor {
+	if maj == major && mnr >= minor {
 		return true
 	}
 	return false

@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/perf"
 
@@ -69,17 +70,18 @@ func (p *EBPFProbe) Start(targetPIDNS uint32) error {
 	}
 	p.links = append(p.links, kpConnect)
 
-	if kp, err := link.Kprobe("__sys_sendto", objs.KprobeSendto, nil); err == nil {
-		p.links = append(p.links, kp)
-	}
-	if kp, err := link.Kprobe("do_execveat_common", objs.KprobeExecve, nil); err == nil {
-		p.links = append(p.links, kp)
-	}
-	if kp, err := link.Kprobe("do_sys_openat2", objs.KprobeOpenat, nil); err == nil {
-		p.links = append(p.links, kp)
-	}
-	if kp, err := link.Kprobe("vfs_rename", objs.KprobeRename, nil); err == nil {
-		p.links = append(p.links, kp)
+	for _, attach := range []struct {
+		sym  string
+		prog *ebpf.Program
+	}{
+		{"__sys_sendto", objs.KprobeSendto},
+		{"do_execveat_common", objs.KprobeExecve},
+		{"do_sys_openat2", objs.KprobeOpenat},
+		{"vfs_rename", objs.KprobeRename},
+	} {
+		if kp, kpErr := link.Kprobe(attach.sym, attach.prog, nil); kpErr == nil {
+			p.links = append(p.links, kp)
+		}
 	}
 
 	// Open perf event readers with large buffers.

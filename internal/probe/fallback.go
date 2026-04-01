@@ -4,6 +4,7 @@ package probe
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strconv"
@@ -30,8 +31,8 @@ func NewStrace() *StraceFallback {
 
 // Start attaches strace to the target PID and begins parsing output.
 // targetPIDNS is ignored; instead use StartWithPID.
-func (s *StraceFallback) Start(targetPIDNS uint32) error {
-	return fmt.Errorf("StraceFallback requires StartWithPID, not Start")
+func (s *StraceFallback) Start(_ uint32) error {
+	return errors.New("StraceFallback requires StartWithPID, not Start")
 }
 
 // StartWithPID attaches strace to the given host PID.
@@ -78,8 +79,8 @@ func (s *StraceFallback) Close() error {
 	s.closeOnce.Do(func() {
 		close(s.done)
 		if s.cmd != nil && s.cmd.Process != nil {
-			s.cmd.Process.Kill()
-			s.cmd.Wait()
+			_ = s.cmd.Process.Kill()
+			_ = s.cmd.Wait()
 		}
 	})
 	return nil
