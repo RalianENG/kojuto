@@ -1,0 +1,56 @@
+name: 'Kojuto Supply Chain Scanner'
+description: 'Detect suspicious network activity during package installation'
+branding:
+  icon: 'shield'
+  color: 'red'
+
+inputs:
+  package:
+    description: 'Package name to scan'
+    required: true
+  version:
+    description: 'Package version (default: latest)'
+    required: false
+    default: ''
+  probe-method:
+    description: 'Probe method: auto, ebpf, strace'
+    required: false
+    default: 'auto'
+
+outputs:
+  verdict:
+    description: 'Scan verdict: clean or suspicious'
+  report:
+    description: 'Path to JSON report'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Build kojuto
+      shell: bash
+      run: |
+        cd ${{ github.action_path }}
+        make build
+
+    - name: Build sandbox image
+      shell: bash
+      run: |
+        cd ${{ github.action_path }}
+        docker build -f Dockerfile.sandbox -t kojuto-sandbox:latest .
+
+    - name: Run scan
+      shell: bash
+      id: scan
+      run: |
+        VERSION_FLAG=""
+        if [ -n "${{ inputs.version }}" ]; then
+          VERSION_FLAG="--version ${{ inputs.version }}"
+        fi
+        sudo ${{ github.action_path }}/kojuto scan \
+          "${{ inputs.package }}" \
+          $VERSION_FLAG \
+          --probe-method "${{ inputs.probe-method }}" \
+          -o /tmp/kojuto-report.json
+        echo "report=/tmp/kojuto-report.json" >> $GITHUB_OUTPUT
+        VERDICT=$(jq -r '.verdict' /tmp/kojuto-report.json)
+        echo "verdict=$VERDICT" >> $GITHUB_OUTPUT
