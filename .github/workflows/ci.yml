@@ -21,12 +21,13 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: stable
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v7
         with:
           version: v2.1.6
+          install-mode: goinstall
 
   # ──────────────────────────────────────────────
   # 2. Unit tests — cross-platform matrix
