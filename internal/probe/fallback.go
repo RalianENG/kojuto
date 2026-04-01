@@ -15,7 +15,7 @@ import (
 // StraceFallback monitors connect(2) syscalls by running strace on the container PID.
 type StraceFallback struct {
 	cmd       *exec.Cmd
-	events    chan types.ConnectEvent
+	events    chan types.SyscallEvent
 	done      chan struct{}
 	closeOnce sync.Once
 }
@@ -23,7 +23,7 @@ type StraceFallback struct {
 // NewStrace creates a strace-based fallback probe.
 func NewStrace() *StraceFallback {
 	return &StraceFallback{
-		events: make(chan types.ConnectEvent, 256),
+		events: make(chan types.SyscallEvent, 256),
 		done:   make(chan struct{}),
 	}
 }
@@ -38,7 +38,7 @@ func (s *StraceFallback) Start(targetPIDNS uint32) error {
 func (s *StraceFallback) StartWithPID(pid uint32) error {
 	s.cmd = exec.Command("strace",
 		"-f",
-		"-e", "trace=connect",
+		"-e", "trace=connect,sendto,execve",
 		"-e", "signal=none",
 		"-p", strconv.FormatUint(uint64(pid), 10),
 	)
@@ -70,7 +70,7 @@ func (s *StraceFallback) StartWithPID(pid uint32) error {
 	return nil
 }
 
-func (s *StraceFallback) Events() <-chan types.ConnectEvent {
+func (s *StraceFallback) Events() <-chan types.SyscallEvent {
 	return s.events
 }
 

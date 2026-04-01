@@ -38,7 +38,7 @@ func (p *unsupportedProbe) StartWithPID(_ uint32) error {
 }
 
 // Events returns nil on non-Linux platforms.
-func (p *unsupportedProbe) Events() <-chan types.ConnectEvent {
+func (p *unsupportedProbe) Events() <-chan types.SyscallEvent {
 	return nil
 }
 

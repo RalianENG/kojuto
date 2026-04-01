@@ -14,14 +14,14 @@ import (
 // ContainerStrace monitors connect(2) syscalls by running strace inside the Docker container.
 // This works on all platforms where Docker is available (Linux, macOS, Windows).
 type ContainerStrace struct {
-	events chan types.ConnectEvent
+	events chan types.SyscallEvent
 	done   chan struct{}
 }
 
 // NewContainerStrace creates a new in-container strace probe.
 func NewContainerStrace() *ContainerStrace {
 	return &ContainerStrace{
-		events: make(chan types.ConnectEvent, 256),
+		events: make(chan types.SyscallEvent, 256),
 		done:   make(chan struct{}),
 	}
 }
@@ -33,8 +33,8 @@ func (c *ContainerStrace) Start(_ uint32) error {
 
 // StartAndInstall runs strace wrapping pip install inside the container.
 // It blocks until installation completes, populating the events channel.
-func (c *ContainerStrace) StartAndInstall(ctx context.Context, containerID, pkg string) ([]byte, error) {
-	cmd := c.buildCommand(ctx, containerID, pkg)
+func (c *ContainerStrace) StartAndInstall(ctx context.Context, containerID string, installCmd []string) ([]byte, error) {
+	cmd := c.buildCommand(ctx, containerID, installCmd)
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
@@ -66,19 +66,15 @@ func (c *ContainerStrace) StartAndInstall(ctx context.Context, containerID, pkg 
 	return pipOut, nil
 }
 
-func (c *ContainerStrace) buildCommand(ctx context.Context, containerID, pkg string) *exec.Cmd {
+func (c *ContainerStrace) buildCommand(ctx context.Context, containerID string, installCmd []string) *exec.Cmd {
 	args := []string{
 		"exec", containerID,
 		"strace", "-f",
-		"-e", "trace=connect",
+		"-e", "trace=connect,sendto,execve",
 		"-e", "signal=none",
 		"--",
-		"pip", "install",
-		"--no-deps",
-		"--no-index",
-		"--find-links=/packages",
-		pkg,
 	}
+	args = append(args, installCmd...)
 
 	return exec.CommandContext(ctx, "docker", args...)
 }
@@ -127,7 +123,7 @@ func drainReader(r io.ReadCloser) []byte {
 }
 
 // Events returns the channel of captured connect events.
-func (c *ContainerStrace) Events() <-chan types.ConnectEvent {
+func (c *ContainerStrace) Events() <-chan types.SyscallEvent {
 	return c.events
 }
 

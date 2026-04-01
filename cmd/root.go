@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -25,12 +26,16 @@ const (
 	methodStrace          = "strace"
 	methodStraceContainer = "strace-container"
 	eventDrainDelay       = 500 * time.Millisecond
+
+	exitCodeSuspicious   = 2
+	exitCodeInconclusive = 3
 )
 
 var (
 	flagVersion     string
 	flagOutput      string
 	flagProbeMethod string
+	flagEcosystem   string
 	flagTimeout     time.Duration
 )
 
@@ -41,23 +46,25 @@ var rootCmd = &cobra.Command{
 }
 
 var scanCmd = &cobra.Command{
-	Use:   "scan <package>",
-	Short: "Scan a PyPI package for suspicious network activity",
-	Args:  cobra.ExactArgs(1),
-	RunE:  runScan,
+	Use:          "scan <package>",
+	Short:        "Scan a package for suspicious syscall activity during installation",
+	Args:         cobra.ExactArgs(1),
+	RunE:         runScan,
+	SilenceUsage: true,
 }
 
 var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Print version information",
 	Run: func(_ *cobra.Command, _ []string) {
-		fmt.Println("kojuto v0.1.0")
+		fmt.Println("kojuto v0.2.0")
 	},
 }
 
 func init() {
 	scanCmd.Flags().StringVarP(&flagVersion, "version", "v", "", "package version to scan")
 	scanCmd.Flags().StringVarP(&flagOutput, "output", "o", "", "output file path (default: stdout)")
+	scanCmd.Flags().StringVarP(&flagEcosystem, "ecosystem", "e", types.EcosystemPyPI, "ecosystem: pypi, npm")
 	scanCmd.Flags().StringVar(&flagProbeMethod, "probe-method", methodAuto, "probe method: auto, ebpf, strace, strace-container")
 	scanCmd.Flags().DurationVar(&flagTimeout, "timeout", 5*time.Minute, "scan timeout")
 
@@ -65,17 +72,35 @@ func init() {
 	rootCmd.AddCommand(versionCmd)
 }
 
-// Execute runs the root command.
-func Execute() {
-	if err := rootCmd.Execute(); err != nil {
-		os.Exit(1)
-	}
+// VerdictError is returned when the scan verdict is not clean.
+type VerdictError struct {
+	Verdict  string
+	ExitCode int
 }
 
-// scanResult holds the output of a probe+install cycle.
+func (e *VerdictError) Error() string {
+	return "verdict: " + e.Verdict
+}
+
+// Execute runs the root command.
+func Execute() {
+	err := rootCmd.Execute()
+	if err == nil {
+		return
+	}
+
+	var ve *VerdictError
+	if errors.As(err, &ve) {
+		os.Exit(ve.ExitCode)
+	}
+
+	fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+	os.Exit(1)
+}
+
 type scanResult struct {
 	method      string
-	events      []types.ConnectEvent
+	events      []types.SyscallEvent
 	lostSamples uint64
 }
 
@@ -84,6 +109,10 @@ func runScan(_ *cobra.Command, args []string) error {
 
 	if err := downloader.ValidatePackage(pkg, flagVersion); err != nil {
 		return fmt.Errorf("invalid input: %w", err)
+	}
+
+	if flagEcosystem != types.EcosystemPyPI && flagEcosystem != types.EcosystemNpm {
+		return fmt.Errorf("unsupported ecosystem: %s (use pypi or npm)", flagEcosystem)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), flagTimeout)
@@ -124,7 +153,7 @@ func runScan(_ *cobra.Command, args []string) error {
 }
 
 func downloadPackage(ctx context.Context, pkg string) (string, error) {
-	fmt.Fprintf(os.Stderr, "[*] Downloading %s...\n", pkg)
+	fmt.Fprintf(os.Stderr, "[*] Downloading %s (%s)...\n", pkg, flagEcosystem)
 
 	tmpDir, err := os.MkdirTemp("", "kojuto-*")
 	if err != nil {
@@ -136,7 +165,7 @@ func downloadPackage(ctx context.Context, pkg string) (string, error) {
 		return "", fmt.Errorf("creating download dir: %w", mkErr)
 	}
 
-	if _, dlErr := downloader.Download(ctx, pkg, flagVersion, dlDir); dlErr != nil {
+	if _, dlErr := downloader.Download(ctx, pkg, flagVersion, dlDir, flagEcosystem); dlErr != nil {
 		return "", fmt.Errorf("downloading package: %w", dlErr)
 	}
 
@@ -176,7 +205,7 @@ func startSandbox(ctx context.Context, dlDir, pkg, method string) (*sandbox.Sand
 	}
 
 	needsPtrace := method == methodStraceContainer
-	sb := sandbox.New(dlDir, pkg, needsPtrace)
+	sb := sandbox.New(dlDir, pkg, needsPtrace, flagEcosystem)
 
 	if err := sb.Start(ctx); err != nil {
 		return nil, fmt.Errorf("starting sandbox: %w", err)
@@ -270,14 +299,14 @@ func runContainerStraceProbe(ctx context.Context, sb *sandbox.Sandbox, pkg strin
 	cp := probe.NewContainerStrace()
 	fmt.Fprintf(os.Stderr, "[*] Installing %s in sandbox (with strace)...\n", pkg)
 
-	installOut, err := cp.StartAndInstall(ctx, sb.ContainerID(), pkg)
+	installOut, err := cp.StartAndInstall(ctx, sb.ContainerID(), sb.InstallCommand())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[!] Install output:\n%s\n", string(installOut))
 
-		return nil, fmt.Errorf("pip install failed: %w", err)
+		return nil, fmt.Errorf("install failed: %w", err)
 	}
 
-	var events []types.ConnectEvent
+	var events []types.SyscallEvent
 	for evt := range cp.Events() {
 		events = append(events, evt)
 	}
@@ -288,20 +317,20 @@ func runContainerStraceProbe(ctx context.Context, sb *sandbox.Sandbox, pkg strin
 	}, nil
 }
 
-func installAndCollect(ctx context.Context, sb *sandbox.Sandbox, pkg string, p probe.Probe) ([]types.ConnectEvent, error) {
+func installAndCollect(ctx context.Context, sb *sandbox.Sandbox, pkg string, p probe.Probe) ([]types.SyscallEvent, error) {
 	fmt.Fprintf(os.Stderr, "[*] Installing %s in sandbox...\n", pkg)
 
 	installOut, err := sb.InstallPackage(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[!] Install output:\n%s\n", string(installOut))
 
-		return nil, fmt.Errorf("pip install failed: %w", err)
+		return nil, fmt.Errorf("install failed: %w", err)
 	}
 
 	time.Sleep(eventDrainDelay)
 	_ = p.Close()
 
-	var events []types.ConnectEvent
+	var events []types.SyscallEvent
 	for evt := range p.Events() {
 		events = append(events, evt)
 	}
@@ -310,13 +339,13 @@ func installAndCollect(ctx context.Context, sb *sandbox.Sandbox, pkg string, p p
 }
 
 func outputReport(pkg string, result *scanResult) error {
-	verdict := analyzer.Analyze(result.events)
+	verdict, filtered := analyzer.Analyze(result.events)
 	if result.lostSamples > 0 {
 		verdict = types.VerdictInconclusive
 	}
 
-	r := report.Generate(pkg, flagVersion, verdict, result.method, result.events, result.lostSamples)
-	printVerdict(verdict, len(result.events), result.lostSamples)
+	r := report.Generate(pkg, flagVersion, flagEcosystem, verdict, result.method, filtered, result.lostSamples)
+	printVerdict(verdict, len(filtered), result.lostSamples)
 
 	w, err := openOutput()
 	if err != nil {
@@ -327,21 +356,28 @@ func outputReport(pkg string, result *scanResult) error {
 		defer w.Close()
 	}
 
-	if err := report.WriteJSON(&r, w); err != nil {
-		return fmt.Errorf("writing report: %w", err)
+	if writeErr := report.WriteJSON(&r, w); writeErr != nil {
+		return fmt.Errorf("writing report: %w", writeErr)
 	}
 
-	return nil
+	switch verdict {
+	case types.VerdictSuspicious:
+		return &VerdictError{Verdict: verdict, ExitCode: exitCodeSuspicious}
+	case types.VerdictInconclusive:
+		return &VerdictError{Verdict: verdict, ExitCode: exitCodeInconclusive}
+	default:
+		return nil
+	}
 }
 
 func printVerdict(verdict string, eventCount int, lostSamples uint64) {
 	switch verdict {
 	case types.VerdictSuspicious:
-		fmt.Fprintf(os.Stderr, "[!] SUSPICIOUS: %d connection attempt(s) detected\n", eventCount)
+		fmt.Fprintf(os.Stderr, "[!] SUSPICIOUS: %d suspicious event(s) detected\n", eventCount)
 	case types.VerdictInconclusive:
 		fmt.Fprintf(os.Stderr, "[!] INCONCLUSIVE: %d event(s) lost, results may be incomplete\n", lostSamples)
 	default:
-		fmt.Fprintf(os.Stderr, "[+] CLEAN: No connection attempts detected\n")
+		fmt.Fprintf(os.Stderr, "[+] CLEAN: No suspicious activity detected\n")
 	}
 }
 

@@ -4,9 +4,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+
+	"github.com/RalianENG/kojuto/internal/types"
 )
 
 // SandboxImage is the Docker image used for the sandbox container.
@@ -17,17 +20,17 @@ type Sandbox struct {
 	containerID string
 	packageDir  string
 	pkg         string
+	ecosystem   string
 	needsPtrace bool
 }
 
 // New creates a new Sandbox instance.
-// If needsPtrace is true, the container is started with --cap-add=SYS_PTRACE
-// (required for in-container strace on macOS/Windows).
-func New(packageDir, pkg string, needsPtrace bool) *Sandbox {
+func New(packageDir, pkg string, needsPtrace bool, ecosystem string) *Sandbox {
 	return &Sandbox{
 		packageDir:  packageDir,
 		pkg:         pkg,
 		needsPtrace: needsPtrace,
+		ecosystem:   ecosystem,
 	}
 }
 
@@ -79,15 +82,46 @@ func (s *Sandbox) Exec(ctx context.Context, command []string) ([]byte, error) {
 	return out, nil
 }
 
-// InstallPackage runs pip install inside the sandbox.
+// InstallPackage runs the install command inside the sandbox.
 func (s *Sandbox) InstallPackage(ctx context.Context) ([]byte, error) {
-	return s.Exec(ctx, []string{
+	return s.Exec(ctx, s.InstallCommand())
+}
+
+// InstallCommand returns the install command for the ecosystem.
+func (s *Sandbox) InstallCommand() []string {
+	if s.ecosystem == types.EcosystemNpm {
+		return []string{
+			"npm", "install",
+			"--offline",
+			"--ignore-scripts=false",
+			"--prefix=/install",
+			"/packages/" + s.findTarball(),
+		}
+	}
+
+	return []string{
 		"pip", "install",
 		"--no-deps",
 		"--no-index",
 		"--find-links=/packages",
 		s.pkg,
-	})
+	}
+}
+
+func (s *Sandbox) findTarball() string {
+	// Best-effort: find .tgz file in package dir.
+	entries, err := os.ReadDir(s.packageDir)
+	if err != nil {
+		return s.pkg + ".tgz"
+	}
+
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".tgz") {
+			return e.Name()
+		}
+	}
+
+	return s.pkg + ".tgz"
 }
 
 // PID returns the init PID of the sandbox container on the host.

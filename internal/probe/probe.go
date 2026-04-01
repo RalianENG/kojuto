@@ -25,7 +25,7 @@ type EBPFProbe struct {
 	objs        *probeObjects
 	link        link.Link
 	reader      *perf.Reader
-	events      chan types.ConnectEvent
+	events      chan types.SyscallEvent
 	done        chan struct{}
 	closeOnce   sync.Once
 	LostSamples uint64
@@ -34,7 +34,7 @@ type EBPFProbe struct {
 // NewEBPF creates a new eBPF-based probe.
 func NewEBPF() *EBPFProbe {
 	return &EBPFProbe{
-		events: make(chan types.ConnectEvent, 256),
+		events: make(chan types.SyscallEvent, 256),
 		done:   make(chan struct{}),
 	}
 }
@@ -98,10 +98,11 @@ func (p *EBPFProbe) readLoop() {
 			commBytes[i] = byte(c)
 		}
 
-		evt := types.ConnectEvent{
+		evt := types.SyscallEvent{
 			Timestamp: time.Now().UTC(),
 			PID:       raw.Pid,
 			Comm:      nullTermString(commBytes[:]),
+			Syscall:   types.EventConnect,
 			Family:    raw.Family,
 			DstPort:   raw.Dport,
 			DstAddr:   formatAddr(raw.Family, raw.Daddr),
@@ -115,7 +116,7 @@ func (p *EBPFProbe) readLoop() {
 	}
 }
 
-func (p *EBPFProbe) Events() <-chan types.ConnectEvent {
+func (p *EBPFProbe) Events() <-chan types.SyscallEvent {
 	return p.events
 }
 
