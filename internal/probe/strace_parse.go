@@ -25,6 +25,26 @@ var (
 		`sendmsg\(\d+,.*\{sa_family=AF_INET6?,\s*sin6?_port=htons\((\d+)\),\s*sin6?_addr=inet6?_addr\("([^"]+)"\)`,
 	)
 
+	// sendmmsg(3, [{msg_hdr={msg_name={sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, ...}, ...}], ...).
+	straceSendmmsgRe = regexp.MustCompile(
+		`sendmmsg\(\d+,.*\{sa_family=AF_INET6?,\s*sin6?_port=htons\((\d+)\),\s*sin6?_addr=inet6?_addr\("([^"]+)"\)`,
+	)
+
+	// bind(3, {sa_family=AF_INET, sin_port=htons(4444), sin_addr=inet_addr("0.0.0.0")}, 16).
+	straceBindRe = regexp.MustCompile(
+		`bind\(\d+,\s*\{sa_family=AF_INET6?,\s*sin6?_port=htons\((\d+)\),\s*sin6?_addr=inet6?_addr\("([^"]+)"\)`,
+	)
+
+	// listen(3, 5)
+	straceListenRe = regexp.MustCompile(
+		`listen\((\d+),\s*(\d+)\)`,
+	)
+
+	// accept(3, {sa_family=AF_INET, ...}, ...) or accept4(...)
+	straceAcceptRe = regexp.MustCompile(
+		`accept4?\(\d+,\s*\{sa_family=AF_INET6?,\s*sin6?_port=htons\((\d+)\),\s*sin6?_addr=inet6?_addr\("([^"]+)"\)`,
+	)
+
 	// execve("/usr/bin/curl", ["curl", "http://evil.com"], ...)
 	straceExecveRe = regexp.MustCompile(
 		`execve\("([^"]+)",\s*\[([^\]]+)\]`,
@@ -41,6 +61,22 @@ func parseStraceLine(line string) (types.SyscallEvent, bool) {
 	}
 
 	if evt, ok := parseConnectOrSendto(line, straceSendmsgRe, types.EventSendmsg); ok {
+		return evt, true
+	}
+
+	if evt, ok := parseConnectOrSendto(line, straceSendmmsgRe, types.EventSendmmsg); ok {
+		return evt, true
+	}
+
+	if evt, ok := parseConnectOrSendto(line, straceBindRe, types.EventBind); ok {
+		return evt, true
+	}
+
+	if evt, ok := parseListen(line); ok {
+		return evt, true
+	}
+
+	if evt, ok := parseConnectOrSendto(line, straceAcceptRe, types.EventAccept); ok {
 		return evt, true
 	}
 
@@ -77,9 +113,19 @@ func parseConnectOrSendto(line string, re *regexp.Regexp, syscall string) (types
 	}, true
 }
 
+// execveFailedRe matches strace lines where execve returned an error
+// (e.g. "= -1 ENOENT", "= -1 EACCES"). These are harmless PATH lookups.
+var execveFailedRe = regexp.MustCompile(`=\s*-1\s+E[A-Z]+`)
+
 func parseExecve(line string) (types.SyscallEvent, bool) {
 	matches := straceExecveRe.FindStringSubmatch(line)
 	if matches == nil {
+		return types.SyscallEvent{}, false
+	}
+
+	// Skip failed execve calls (ENOENT, EACCES, etc.) — they are normal
+	// PATH search attempts and produce false positives.
+	if execveFailedRe.MatchString(line) {
 		return types.SyscallEvent{}, false
 	}
 
@@ -93,6 +139,20 @@ func parseExecve(line string) (types.SyscallEvent, bool) {
 		Syscall:   types.EventExecve,
 		Comm:      matches[1],
 		Cmdline:   cmdline,
+	}, true
+}
+
+// parseListen handles listen(fd, backlog) which has no sockaddr.
+// Any listen call in a package install is suspicious (backdoor indicator).
+func parseListen(line string) (types.SyscallEvent, bool) {
+	if !straceListenRe.MatchString(line) {
+		return types.SyscallEvent{}, false
+	}
+
+	return types.SyscallEvent{
+		Timestamp: time.Now().UTC(),
+		PID:       extractPID(line),
+		Syscall:   types.EventListen,
 	}, true
 }
 

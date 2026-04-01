@@ -4,10 +4,14 @@ import "time"
 
 // Syscall event types.
 const (
-	EventConnect = "connect"
-	EventSendto  = "sendto"
-	EventSendmsg = "sendmsg"
-	EventExecve  = "execve"
+	EventConnect  = "connect"
+	EventSendto   = "sendto"
+	EventSendmsg  = "sendmsg"
+	EventSendmmsg = "sendmmsg"
+	EventBind     = "bind"
+	EventListen   = "listen"
+	EventAccept   = "accept"
+	EventExecve   = "execve"
 )
 
 // SyscallEvent represents a suspicious syscall captured by the probe.

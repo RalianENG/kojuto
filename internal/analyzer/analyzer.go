@@ -30,8 +30,12 @@ func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
 
 func isBenign(evt *types.SyscallEvent) bool {
 	switch evt.Syscall {
-	case types.EventConnect, types.EventSendto, types.EventSendmsg:
+	case types.EventConnect, types.EventSendto, types.EventSendmsg, types.EventSendmmsg:
 		return isBenignNetwork(evt)
+	case types.EventBind, types.EventListen, types.EventAccept:
+		// Server socket operations during install are never benign —
+		// they indicate a backdoor listener or reverse shell.
+		return false
 	case types.EventExecve:
 		return isBenignExec(evt)
 	default:
@@ -137,8 +141,10 @@ var shellSafeCommands = map[string]bool{
 	"uname": true, "arch": true, "which": true, "command": true,
 	"id": true, "whoami": true, "basename": true, "dirname": true,
 	"lsb_release": true, "dpkg-query": true, "ldconfig": true,
-	"grep": true, "find": true, "sort": true, "tr": true, "cut": true,
-	"expr": true, "env": true,
+	"grep": true, "sort": true, "tr": true, "cut": true,
+	"expr": true,
+	// env is excluded: it can execute arbitrary commands (e.g. env curl ...).
+	// find is excluded: -exec can run arbitrary binaries (e.g. find /tmp -exec payload).
 }
 
 // isBenignExec filters out expected subprocess calls during pip/npm install.
@@ -178,7 +184,8 @@ func isBenignExec(evt *types.SyscallEvent) bool {
 }
 
 // isShellCmdBenign extracts the command from "sh -c <cmd>" and checks whether
-// the first invoked binary is in shellSafeCommands.
+// every command in the pipeline/chain invokes only shellSafeCommands.
+// Chains using ;, |, ||, &&, and subshells are split and each segment validated.
 func isShellCmdBenign(cmdline string) bool {
 	// Find "-c " and extract everything after it.
 	idx := strings.Index(cmdline, "-c ")
@@ -201,19 +208,134 @@ func isShellCmdBenign(cmdline string) bool {
 		return false
 	}
 
-	// Extract the first token (the binary being invoked).
-	firstToken := cmd
-	for i, c := range cmd {
-		if c == ' ' || c == '\t' || c == ';' || c == '|' || c == '&' || c == '>' || c == '<' || c == '(' {
-			firstToken = cmd[:i]
-			break
+	// Split on shell command separators to get each segment.
+	segments := splitShellCommands(cmd)
+	if len(segments) == 0 {
+		return false
+	}
+
+	for _, seg := range segments {
+		seg = strings.TrimSpace(seg)
+		if seg == "" {
+			continue
+		}
+
+		firstToken := extractFirstToken(seg)
+		firstBase := path.Base(firstToken)
+
+		if !shellSafeCommands[firstBase] {
+			return false
+		}
+
+		// Block file operations that target whitelisted directories.
+		// e.g. "cp /tmp/payload /usr/local/bin/python3" would hijack a trusted binary.
+		if isFileOpTargetingTrustedDir(firstBase, seg) {
+			return false
 		}
 	}
 
-	// Get basename in case the command uses a full path.
-	firstBase := path.Base(firstToken)
+	return true
+}
 
-	return shellSafeCommands[firstBase]
+// splitShellCommands splits a shell command string on ;, |, ||, &&, and
+// parentheses to extract individual command segments.
+func splitShellCommands(cmd string) []string {
+	var segments []string
+	var current strings.Builder
+
+	for i := 0; i < len(cmd); i++ {
+		c := cmd[i]
+		switch c {
+		case ';', '(', ')':
+			if current.Len() > 0 {
+				segments = append(segments, current.String())
+				current.Reset()
+			}
+		case '|':
+			if current.Len() > 0 {
+				segments = append(segments, current.String())
+				current.Reset()
+			}
+			// Skip || (treat the second | as part of separator).
+			if i+1 < len(cmd) && cmd[i+1] == '|' {
+				i++
+			}
+		case '&':
+			if current.Len() > 0 {
+				segments = append(segments, current.String())
+				current.Reset()
+			}
+			// Skip && (treat the second & as part of separator).
+			if i+1 < len(cmd) && cmd[i+1] == '&' {
+				i++
+			}
+		case '`':
+			// Backtick command substitution — always suspicious.
+			return nil
+		case '$':
+			// $(...) command substitution — always suspicious.
+			if i+1 < len(cmd) && cmd[i+1] == '(' {
+				return nil
+			}
+			current.WriteByte(c)
+		default:
+			current.WriteByte(c)
+		}
+	}
+
+	if current.Len() > 0 {
+		segments = append(segments, current.String())
+	}
+
+	return segments
+}
+
+// extractFirstToken returns the first whitespace-delimited token from a
+// command segment, ignoring leading redirections like ">" or "<".
+func extractFirstToken(seg string) string {
+	seg = strings.TrimSpace(seg)
+
+	for i, c := range seg {
+		if c == ' ' || c == '\t' || c == '>' || c == '<' {
+			return seg[:i]
+		}
+	}
+
+	return seg
+}
+
+// trustedDirPrefixes are directories where whitelisted binaries live.
+// Shell commands that copy/move/link files into these directories could hijack trusted binaries.
+var trustedDirPrefixes = []string{
+	"/usr/bin/", "/usr/local/bin/", "/bin/", "/usr/sbin/", "/sbin/",
+}
+
+// fileOpCommands are shell commands that can place files into directories.
+var fileOpCommands = map[string]bool{
+	"cp": true, "mv": true, "ln": true, "install": true,
+}
+
+// isFileOpTargetingTrustedDir checks if a file operation targets a trusted
+// binary directory, which could be used to hijack whitelisted executables.
+func isFileOpTargetingTrustedDir(base, segment string) bool {
+	if !fileOpCommands[base] {
+		return false
+	}
+
+	// Check if any argument references a trusted directory.
+	fields := strings.Fields(segment)
+	for _, f := range fields[1:] { // skip the command itself
+		if strings.HasPrefix(f, "-") {
+			continue // skip flags
+		}
+		for _, prefix := range trustedDirPrefixes {
+			if strings.HasPrefix(f, prefix) {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 func hasInlineExecFlag(cmdline string, flags []string) bool {

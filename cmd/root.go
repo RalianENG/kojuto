@@ -322,8 +322,9 @@ func runContainerStraceProbe(ctx context.Context, sb *sandbox.Sandbox, pkg strin
 	}
 
 	// Phase 2: Import under each simulated OS to defeat platform-gated payloads.
-	// Malware that checks platform.system() == "Windows" will only fire on
-	// Windows — by patching the return value, we exercise all OS code paths.
+	// Write probe scripts to /tmp first (outside strace), then execute them.
+	sb.WriteProbeScripts(ctx)
+
 	importCmds := sb.ImportCommands()
 	osNames := []string{"Linux", "Windows", "macOS"}
 

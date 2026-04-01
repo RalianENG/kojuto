@@ -89,7 +89,7 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 		"--tmpfs=/tmp:nosuid,size=100m",
 		"--tmpfs=/install:nosuid,size=300m",
 		"--tmpfs=/usr/local/lib/python" + SandboxPythonVersion + "/site-packages:nosuid,size=300m",
-		"--tmpfs=/usr/local/bin:nosuid,size=32m",
+		"--tmpfs=/usr/local/bin:nosuid,exec,size=32m",
 		"--tmpfs=/run:nosuid,size=1m",
 		"--memory=" + mem,
 		"--cpus=" + cpus,
@@ -251,6 +251,9 @@ func (s *Sandbox) StartPaused(ctx context.Context) error {
 		return fmt.Errorf("docker start failed: %w", err)
 	}
 
+	// Restore /usr/local/bin contents that were hidden by the tmpfs overlay.
+	s.restoreLocalBin(ctx)
+
 	if err := s.Pause(ctx); err != nil {
 		return fmt.Errorf("immediate pause after start: %w", err)
 	}
@@ -273,10 +276,24 @@ func (s *Sandbox) Start(ctx context.Context) error {
 		return fmt.Errorf("docker start failed: %w", err)
 	}
 
+	// Restore /usr/local/bin contents that were hidden by the tmpfs overlay.
+	s.restoreLocalBin(ctx)
+
 	// Erase container fingerprints that sandbox-detection code looks for.
 	s.eraseFingerprints(ctx)
 
 	return nil
+}
+
+// restoreTmpfsOverlays copies backed-up contents into tmpfs-mounted directories
+// so that pip, python3, setuptools, etc. are available after the overlay hides them.
+// Also fixes permissions so the container user (dev) can write to site-packages.
+func (s *Sandbox) restoreLocalBin(ctx context.Context) {
+	s.dockerExecRoot(ctx, "cp", "-a", "/usr/local/bin.bak/.", "/usr/local/bin/")
+
+	sitePackages := "/usr/local/lib/python" + SandboxPythonVersion + "/site-packages"
+	s.dockerExecRoot(ctx, "cp", "-a", sitePackages+".bak/.", sitePackages+"/")
+	s.dockerExecRoot(ctx, "chmod", "-R", "a+rw", sitePackages)
 }
 
 // eraseFingerprints removes or masks signals that reveal the container
@@ -361,44 +378,60 @@ func (s *Sandbox) ImportCommands() [][]string {
 	return s.pythonImportCommands()
 }
 
-func (s *Sandbox) pythonImportCommands() [][]string {
+// WriteProbeScripts writes the OS-simulation import scripts into the container's
+// /tmp directory. Must be called before ImportCommands.
+func (s *Sandbox) WriteProbeScripts(ctx context.Context) {
 	importName := strings.ReplaceAll(s.pkg, "-", "_")
 
-	// Each entry: (platform.system(), sys.platform, os.name)
-	platforms := [][3]string{
+	pyPlatforms := [][3]string{
 		{"Linux", "linux", "posix"},
 		{"Windows", "win32", "nt"},
 		{"Darwin", "darwin", "posix"},
 	}
-
-	var cmds [][]string
-	for _, p := range platforms {
+	for _, p := range pyPlatforms {
 		script := fmt.Sprintf(
 			"import platform,sys,os\n"+
 				"platform.system=lambda:'%s'\n"+
 				"sys.platform='%s'\n"+
 				"os.name='%s'\n"+
-				"try:\n import %s\nexcept Exception:\n pass",
+				"try:\n import %s\nexcept Exception:\n pass\n",
 			p[0], p[1], p[2], importName,
 		)
-		cmds = append(cmds, []string{"python3", "-c", script})
+		filename := "/tmp/_kojuto_probe_" + p[1] + ".py"
+		s.dockerExecRoot(ctx, "sh", "-c", "cat > "+filename+" << 'KOJUTO_EOF'\n"+script+"KOJUTO_EOF")
 	}
-	return cmds
-}
 
-func (s *Sandbox) nodeImportCommands() [][]string {
-	platforms := []string{"linux", "win32", "darwin"}
-
-	var cmds [][]string
-	for _, p := range platforms {
+	jsPlatforms := []string{"linux", "win32", "darwin"}
+	for _, p := range jsPlatforms {
 		script := fmt.Sprintf(
-			"Object.defineProperty(process,'platform',{value:'%s'});"+
-				"try{require('%s')}catch(e){}",
+			"Object.defineProperty(process,'platform',{value:'%s'});\n"+
+				"try{require('%s')}catch(e){}\n",
 			p, s.pkg,
 		)
-		cmds = append(cmds, []string{"node", "-e", script})
+		filename := "/tmp/_kojuto_probe_" + p + ".js"
+		s.dockerExecRoot(ctx, "sh", "-c", "cat > "+filename+" << 'KOJUTO_EOF'\n"+script+"KOJUTO_EOF")
 	}
-	return cmds
+}
+
+// pythonImportCommands returns commands that execute pre-written probe scripts.
+// Uses `python3 /tmp/script.py` (NOT `python3 -c`) so that kojuto's own
+// import probes don't trigger the interpreterExecFlags detector.
+func (s *Sandbox) pythonImportCommands() [][]string {
+	return [][]string{
+		{"python3", "/tmp/_kojuto_probe_linux.py"},
+		{"python3", "/tmp/_kojuto_probe_win32.py"},
+		{"python3", "/tmp/_kojuto_probe_darwin.py"},
+	}
+}
+
+// nodeImportCommands returns commands that execute pre-written probe scripts.
+// Uses `node /tmp/script.js` (NOT `node -e`) to avoid self-detection.
+func (s *Sandbox) nodeImportCommands() [][]string {
+	return [][]string{
+		{"node", "/tmp/_kojuto_probe_linux.js"},
+		{"node", "/tmp/_kojuto_probe_win32.js"},
+		{"node", "/tmp/_kojuto_probe_darwin.js"},
+	}
 }
 
 func (s *Sandbox) findTarball() string {

