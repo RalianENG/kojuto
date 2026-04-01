@@ -24,7 +24,9 @@ func NewStrace() *unsupportedProbe {
 	return &unsupportedProbe{}
 }
 
-type unsupportedProbe struct{}
+type unsupportedProbe struct {
+	LostSamples uint64
+}
 
 func (p *unsupportedProbe) Start(targetPIDNS uint32) error {
 	return fmt.Errorf("host-level probe requires Linux, current OS: %s", runtime.GOOS)

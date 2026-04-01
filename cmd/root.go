@@ -77,6 +77,11 @@ func runScan(cmd *cobra.Command, args []string) error {
 		cancel()
 	}()
 
+	// Validate input
+	if err := downloader.ValidatePackage(pkg, version); err != nil {
+		return err
+	}
+
 	// Step 1: Create temp dir and download package
 	fmt.Fprintf(os.Stderr, "[*] Downloading %s...\n", pkg)
 	tmpDir, err := os.MkdirTemp("", "kojuto-*")
@@ -120,7 +125,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("ensuring sandbox image: %w", err)
 	}
 
-	// Step 4: Start sandbox container
+	// Step 4: Start sandbox container (paused for probe attachment)
 	needsPtrace := method == "strace-container"
 	sb := sandbox.New(dlDir, pkg, needsPtrace)
 	if err := sb.Start(ctx); err != nil {
@@ -128,11 +133,19 @@ func runScan(cmd *cobra.Command, args []string) error {
 	}
 	defer sb.Cleanup(ctx)
 
+	// Pause container immediately to prevent any activity before probe is ready
+	if method == "ebpf" || method == "strace" {
+		if err := sb.Pause(ctx); err != nil {
+			return fmt.Errorf("pausing container: %w", err)
+		}
+	}
+
 	// Step 5+6: Probe and install (flow differs by method)
 	fmt.Fprintf(os.Stderr, "[*] Starting %s probe...\n", method)
 
 	var events []types.ConnectEvent
 	var probeMethodUsed string
+	var lostSamples uint64
 
 	switch method {
 	case "ebpf":
@@ -150,6 +163,11 @@ func runScan(cmd *cobra.Command, args []string) error {
 		}
 		defer ep.Close()
 
+		// Probe attached — unpause container
+		if err := sb.Unpause(ctx); err != nil {
+			return fmt.Errorf("unpausing container: %w", err)
+		}
+
 		fmt.Fprintf(os.Stderr, "[*] Installing %s in sandbox...\n", pkg)
 		installOut, err := sb.InstallPackage(ctx)
 		if err != nil {
@@ -162,6 +180,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 		for evt := range ep.Events() {
 			events = append(events, evt)
 		}
+		lostSamples = ep.LostSamples
 		probeMethodUsed = ep.Method()
 
 	case "strace":
@@ -174,6 +193,11 @@ func runScan(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("starting strace probe: %w", err)
 		}
 		defer sp.Close()
+
+		// Probe attached — unpause container
+		if err := sb.Unpause(ctx); err != nil {
+			return fmt.Errorf("unpausing container: %w", err)
+		}
 
 		fmt.Fprintf(os.Stderr, "[*] Installing %s in sandbox...\n", pkg)
 		installOut, err := sb.InstallPackage(ctx)
@@ -209,11 +233,17 @@ func runScan(cmd *cobra.Command, args []string) error {
 
 	// Step 7: Analyze and report
 	verdict := analyzer.Analyze(events)
-	r := report.Generate(pkg, version, verdict, probeMethodUsed, events)
+	if lostSamples > 0 {
+		verdict = types.VerdictInconclusive
+	}
+	r := report.Generate(pkg, version, verdict, probeMethodUsed, events, lostSamples)
 
-	if verdict == types.VerdictSuspicious {
+	switch verdict {
+	case types.VerdictSuspicious:
 		fmt.Fprintf(os.Stderr, "[!] SUSPICIOUS: %d connection attempt(s) detected\n", len(events))
-	} else {
+	case types.VerdictInconclusive:
+		fmt.Fprintf(os.Stderr, "[!] INCONCLUSIVE: %d event(s) lost, results may be incomplete\n", lostSamples)
+	default:
 		fmt.Fprintf(os.Stderr, "[+] CLEAN: No connection attempts detected\n")
 	}
 

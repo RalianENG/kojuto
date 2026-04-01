@@ -33,13 +33,17 @@ func New(packageDir, pkg string, needsPtrace bool) *Sandbox {
 }
 
 // Start creates and starts the sandbox container.
-// The container runs with --network=none, --read-only, and --no-new-privileges.
+// The container runs with --network=none and --no-new-privileges.
+// The filesystem is writable within the ephemeral container layer only;
+// the host filesystem is protected by Docker's copy-on-write isolation.
 func (s *Sandbox) Start(ctx context.Context) error {
 	args := []string{
 		"run", "-d",
 		"--network=none",
-		"--tmpfs", "/tmp",
 		"--security-opt=no-new-privileges",
+		"--memory=512m",
+		"--cpus=1",
+		"--pids-limit=256",
 	}
 	if s.needsPtrace {
 		args = append(args, "--cap-add=SYS_PTRACE")
@@ -104,6 +108,28 @@ func (s *Sandbox) Logs(ctx context.Context) (string, error) {
 	cmd := exec.CommandContext(ctx, "docker", "logs", s.containerID)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
+}
+
+// Pause freezes all processes in the container.
+func (s *Sandbox) Pause(ctx context.Context) error {
+	cmd := exec.CommandContext(ctx, "docker", "pause", s.containerID)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("docker pause failed: %w", err)
+	}
+	return nil
+}
+
+// Unpause resumes all processes in the container.
+func (s *Sandbox) Unpause(ctx context.Context) error {
+	cmd := exec.CommandContext(ctx, "docker", "unpause", s.containerID)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("docker unpause failed: %w", err)
+	}
+	return nil
 }
 
 // Cleanup stops and removes the container.

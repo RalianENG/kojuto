@@ -9,7 +9,7 @@ import (
 )
 
 // Generate creates a Report from scan results.
-func Generate(pkg, version, verdict, probeMethod string, events []types.ConnectEvent) types.Report {
+func Generate(pkg, version, verdict, probeMethod string, events []types.ConnectEvent, lostSamples uint64) types.Report {
 	if events == nil {
 		events = []types.ConnectEvent{}
 	}
@@ -20,6 +20,7 @@ func Generate(pkg, version, verdict, probeMethod string, events []types.ConnectE
 		Verdict:     verdict,
 		Events:      events,
 		ProbeMethod: probeMethod,
+		LostSamples: lostSamples,
 	}
 }
 

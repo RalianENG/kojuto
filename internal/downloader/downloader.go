@@ -6,18 +6,39 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
+
+var (
+	validPkgName = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$`)
+	validVersion = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9.*!+_-]*$`)
+)
+
+// ValidatePackage checks that the package name and version are safe.
+func ValidatePackage(pkg, version string) error {
+	if !validPkgName.MatchString(pkg) {
+		return fmt.Errorf("invalid package name: %q", pkg)
+	}
+	if version != "" && !validVersion.MatchString(version) {
+		return fmt.Errorf("invalid version: %q", version)
+	}
+	return nil
+}
 
 // Download fetches a PyPI package to destDir using pip download.
 // Returns the directory containing downloaded files.
 func Download(ctx context.Context, pkg, version, destDir string) (string, error) {
+	if err := ValidatePackage(pkg, version); err != nil {
+		return "", err
+	}
+
 	target := pkg
 	if version != "" {
 		target = fmt.Sprintf("%s==%s", pkg, version)
 	}
 
-	args := []string{"download", "--no-deps", "-d", destDir, target}
+	args := []string{"download", "--no-deps", "--only-binary=:all:", "-d", destDir, target}
 	cmd := exec.CommandContext(ctx, "pip", args...)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr

@@ -79,7 +79,8 @@ func (c *ContainerStrace) StartAndInstall(ctx context.Context, containerID, pkg 
 		}
 	}()
 
-	// Drain pip stdout
+	// Drain pip stdout (capped at 10MB to prevent memory exhaustion)
+	const maxPipOut = 10 * 1024 * 1024
 	var pipOut []byte
 	pipDone := make(chan struct{})
 	go func() {
@@ -87,7 +88,11 @@ func (c *ContainerStrace) StartAndInstall(ctx context.Context, containerID, pkg 
 		buf := make([]byte, 4096)
 		for {
 			n, err := stdout.Read(buf)
-			if n > 0 {
+			if n > 0 && len(pipOut) < maxPipOut {
+				remaining := maxPipOut - len(pipOut)
+				if n > remaining {
+					n = remaining
+				}
 				pipOut = append(pipOut, buf[:n]...)
 			}
 			if err != nil {

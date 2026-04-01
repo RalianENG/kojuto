@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/cilium/ebpf/link"
@@ -21,11 +22,13 @@ import (
 
 // EBPFProbe monitors connect(2) syscalls using eBPF kprobes.
 type EBPFProbe struct {
-	objs   *probeObjects
-	link   link.Link
-	reader *perf.Reader
-	events chan types.ConnectEvent
-	done   chan struct{}
+	objs        *probeObjects
+	link        link.Link
+	reader      *perf.Reader
+	events      chan types.ConnectEvent
+	done        chan struct{}
+	closeOnce   sync.Once
+	LostSamples uint64
 }
 
 // NewEBPF creates a new eBPF-based probe.
@@ -80,6 +83,7 @@ func (p *EBPFProbe) readLoop() {
 		}
 
 		if record.LostSamples > 0 {
+			p.LostSamples += record.LostSamples
 			continue
 		}
 
@@ -116,16 +120,18 @@ func (p *EBPFProbe) Events() <-chan types.ConnectEvent {
 }
 
 func (p *EBPFProbe) Close() error {
-	close(p.done)
-	if p.reader != nil {
-		p.reader.Close()
-	}
-	if p.link != nil {
-		p.link.Close()
-	}
-	if p.objs != nil {
-		p.objs.Close()
-	}
+	p.closeOnce.Do(func() {
+		close(p.done)
+		if p.reader != nil {
+			p.reader.Close()
+		}
+		if p.link != nil {
+			p.link.Close()
+		}
+		if p.objs != nil {
+			p.objs.Close()
+		}
+	})
 	return nil
 }
 

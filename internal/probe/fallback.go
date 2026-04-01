@@ -7,15 +7,17 @@ import (
 	"fmt"
 	"os/exec"
 	"strconv"
+	"sync"
 
 	"github.com/RalianENG/kojuto/internal/types"
 )
 
 // StraceFallback monitors connect(2) syscalls by running strace on the container PID.
 type StraceFallback struct {
-	cmd    *exec.Cmd
-	events chan types.ConnectEvent
-	done   chan struct{}
+	cmd       *exec.Cmd
+	events    chan types.ConnectEvent
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 // NewStrace creates a strace-based fallback probe.
@@ -73,11 +75,13 @@ func (s *StraceFallback) Events() <-chan types.ConnectEvent {
 }
 
 func (s *StraceFallback) Close() error {
-	close(s.done)
-	if s.cmd != nil && s.cmd.Process != nil {
-		s.cmd.Process.Kill()
-		s.cmd.Wait()
-	}
+	s.closeOnce.Do(func() {
+		close(s.done)
+		if s.cmd != nil && s.cmd.Process != nil {
+			s.cmd.Process.Kill()
+			s.cmd.Wait()
+		}
+	})
 	return nil
 }
 

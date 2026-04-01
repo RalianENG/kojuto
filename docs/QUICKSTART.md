@@ -12,7 +12,7 @@
 ### From source
 
 ```bash
-git clone https://github.com/kojuto/kojuto.git
+git clone https://github.com/RalianENG/kojuto.git
 cd kojuto
 make build
 sudo mv kojuto /usr/local/bin/
@@ -50,6 +50,27 @@ sudo kojuto scan requests -o report.json
 kojuto scan requests --probe-method strace
 ```
 
+### Use in-container strace (all platforms with Docker, including macOS/Windows)
+
+```bash
+kojuto scan requests --probe-method strace-container
+```
+
+### Set scan timeout
+
+```bash
+sudo kojuto scan requests --timeout 10m
+```
+
+### Flags
+
+| Flag | Description |
+|------|-------------|
+| `-v, --version` | Package version to scan (default: latest) |
+| `-o, --output` | Output file path (default: stdout) |
+| `--probe-method` | `auto` / `ebpf` / `strace` / `strace-container` (default: `auto`) |
+| `--timeout` | Scan timeout (default: `5m`) |
+
 ## Understanding the Report
 
 ```json
@@ -78,7 +99,9 @@ kojuto scan requests --probe-method strace
 ## GitHub Actions
 
 ```yaml
-- uses: kojuto/kojuto@v0
+- uses: RalianENG/kojuto@v0
   with:
     package: your-dependency
+    version: '2.31.0'        # optional
+    probe-method: auto       # optional: auto, ebpf, strace, strace-container
 ```

@@ -5,13 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0]
 
 ### Added
 - Project scaffolding
 - CLI framework with cobra
 - eBPF probe for connect(2) detection
 - strace fallback for non-eBPF environments
+- In-container strace for cross-platform support (macOS/Windows)
 - Docker sandbox with network isolation
 - PyPI package downloader
 - JSON report output

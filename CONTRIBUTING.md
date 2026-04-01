@@ -17,11 +17,29 @@ Thank you for your interest in contributing!
 make build
 ```
 
+### Build the sandbox image
+
+```bash
+make sandbox-image
+```
+
 ### Test
 
 ```bash
 make test                # unit tests
 sudo make test-integration  # integration tests (requires Docker + root)
+```
+
+### Lint
+
+```bash
+make lint
+```
+
+### Clean
+
+```bash
+make clean
 ```
 
 ### Code Generation

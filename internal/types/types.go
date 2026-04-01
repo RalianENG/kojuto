@@ -20,9 +20,11 @@ type Report struct {
 	Verdict     string         `json:"verdict"`
 	Events      []ConnectEvent `json:"events"`
 	ProbeMethod string         `json:"probe_method"`
+	LostSamples uint64         `json:"lost_samples,omitempty"`
 }
 
 const (
-	VerdictClean      = "clean"
-	VerdictSuspicious = "suspicious"
+	VerdictClean        = "clean"
+	VerdictSuspicious   = "suspicious"
+	VerdictInconclusive = "inconclusive"
 )

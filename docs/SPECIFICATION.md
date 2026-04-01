@@ -10,14 +10,12 @@
 
 | 対象 | 内容 |
 |---|---|
-| **In Scope** | インストール時・インポート時の外部通信検知 |
+| **In Scope** | インストール時の外部通信検知 |
 | **Out of Scope** | 静的解析レイヤー（GuardDogに委譲） |
-| **Out of Scope (v1)** | 任意の関数実行時の検知 |
 
 ### サポートエコシステム
 
 - PyPI（Python）
-- npm（Node.js）
 
 ---
 
@@ -25,19 +23,15 @@
 
 ### フェーズと通信発生源
 
-| フェーズ | PyPI | npm |
-|---|---|---|
-| インストール時 | `setup.py` / build hooks / `cmdclass` | `package.json` の `postinstall` スクリプト |
-| インポート時 | `__init__.py` のモジュールロード | `require()` / `import` 時の `index.js` |
+| フェーズ | PyPI |
+|---|---|
+| インストール時 | `setup.py` / build hooks / `cmdclass` |
 
 ### 監視するsyscall
 
 | syscall | 検知対象 | 攻撃例 |
 |---|---|---|
 | `connect(2)` | 外部TCP/UDP接続 | C2サーバーへのデータ送信 |
-| `sendto(2)` | DNSクエリ | DNSトンネリング、ドメイン名へのデータ埋め込み |
-| `execve(2)` | 外部コマンド起動 | `curl` / `wget` をシェル経由で呼ぶパターン |
-| `openat(2)` | 機密ファイルアクセス | `~/.ssh`、`.env`、kubeconfig の読み取り後に外伝 |
 
 ---
 
@@ -57,17 +51,15 @@ CLI (cobra)
   │   └─ プロセスツリーを追跡してパッケージ起因を判定
   │
   ├─ Analyzer         イベントの分類・リスク判定
-  │   └─ 既知パターンDBとの秤量（アノテーション付与）
   │
-  └─ Reporter         JSON / SARIF 出力
+  └─ Reporter         JSON 出力
 ```
 
 ### 実行フロー
 
 1. パッケージをホストでダウンロード・キャッシュ（ネットワーク許可）
 2. network遮断コンテナでインストール実行 + eBPFで監視
-3. network遮断コンテナでインポート実行 + 同上で記録
-4. レポート生成
+3. レポート生成
 
 ---
 
@@ -80,24 +72,5 @@ CLI (cobra)
 | eBPF Cコード | C (`.c` ファイル) | BPFプログラム本体はC必須。`bpf2go` で自動生成 |
 | CLI | `cobra` | Go標準的なCLIフレームワーク |
 | Sandbox | Docker | 隔離の実績、CI環境でのデフォルト利用可 |
-| 出力フォーマット | JSON / SARIF | SARIF は GitHub Code Scanning 互換 |
+| 出力フォーマット | JSON | CI/CD パイプラインでの利用を想定 |
 
----
-
-## 5. マイルストーン
-
-```
-v0.1  PyPI インストール時のみ、Linux のみ
-      └─ connect(2) の試みをレポート出力
-
-v0.2  インポート時フェーズを追加
-      └─ execve(2) 監視でサブプロセスを追跡
-
-v0.3  npm サポート追加
-
-v0.4  既知パターンDB + アノテーション出力
-      └─ SARIF 出力 → GitHub Actions でそのまま使えるアクション化
-
-v0.5  関数ロードフェーズ追加
-      └─ エクスポート関数をゼロ引数で呼び出し、実行時通信を検知
-```

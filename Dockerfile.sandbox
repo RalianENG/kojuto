@@ -3,4 +3,8 @@ FROM python:3.12-slim
 RUN apt-get update && apt-get install -y --no-install-recommends strace && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir pip setuptools wheel
 
+RUN useradd -m -s /bin/bash scanner && \
+    chmod -R a+rw /usr/local/lib/python3.12/site-packages /usr/local/bin
+
 WORKDIR /install
+USER scanner

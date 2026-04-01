@@ -13,7 +13,7 @@ inputs:
     required: false
     default: ''
   probe-method:
-    description: 'Probe method: auto, ebpf, strace'
+    description: 'Probe method: auto, ebpf, strace, strace-container'
     required: false
     default: 'auto'
 
@@ -41,16 +41,20 @@ runs:
     - name: Run scan
       shell: bash
       id: scan
+      env:
+        KOJUTO_PACKAGE: ${{ inputs.package }}
+        KOJUTO_VERSION: ${{ inputs.version }}
+        KOJUTO_PROBE_METHOD: ${{ inputs.probe-method }}
       run: |
         VERSION_FLAG=""
-        if [ -n "${{ inputs.version }}" ]; then
-          VERSION_FLAG="--version ${{ inputs.version }}"
+        if [ -n "$KOJUTO_VERSION" ]; then
+          VERSION_FLAG="--version $KOJUTO_VERSION"
         fi
-        sudo ${{ github.action_path }}/kojuto scan \
-          "${{ inputs.package }}" \
+        sudo "${{ github.action_path }}/kojuto" scan \
+          "$KOJUTO_PACKAGE" \
           $VERSION_FLAG \
-          --probe-method "${{ inputs.probe-method }}" \
+          --probe-method "$KOJUTO_PROBE_METHOD" \
           -o /tmp/kojuto-report.json
-        echo "report=/tmp/kojuto-report.json" >> $GITHUB_OUTPUT
+        echo "report=/tmp/kojuto-report.json" >> "$GITHUB_OUTPUT"
         VERDICT=$(jq -r '.verdict' /tmp/kojuto-report.json)
-        echo "verdict=$VERDICT" >> $GITHUB_OUTPUT
+        echo "verdict=$VERDICT" >> "$GITHUB_OUTPUT"
