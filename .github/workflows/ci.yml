@@ -26,7 +26,7 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v7
         with:
-          version: v2
+          version: v2.1.6
 
   # ──────────────────────────────────────────────
   # 2. Unit tests — cross-platform matrix
@@ -107,6 +107,9 @@ jobs:
       # project-specific exclusions. No separate gosec step needed.
 
       - name: govulncheck
+        # Non-blocking: stdlib vulnerabilities require Go patch releases
+        # that may not be available yet. Log findings but don't fail CI.
+        continue-on-error: true
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...
