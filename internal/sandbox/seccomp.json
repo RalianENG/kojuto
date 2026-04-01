@@ -51,6 +51,7 @@
         "bpf",
         "userfaultfd",
         "perf_event_open",
+        "memfd_create",
         "open_by_handle_at",
         "keyctl",
         "request_key",
@@ -78,7 +79,7 @@
       ],
       "action": "SCMP_ACT_ERRNO",
       "errnoRet": 1,
-      "comment": "Block dangerous syscalls: namespace escape, kernel module loading, time manipulation, hardware access, fileless execution, and container breakout vectors"
+      "comment": "Block dangerous syscalls: namespace escape, kernel module loading, time manipulation, hardware access, fileless execution (memfd_create), and container breakout vectors"
     }
   ]
 }

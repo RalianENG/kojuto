@@ -54,7 +54,29 @@ func downloadPyPI(ctx context.Context, pkg, version, destDir string) (string, er
 		target = pkg + "==" + version
 	}
 
-	args := []string{"download", "--no-deps", "--only-binary=:all:", "-d", destDir, target}
+	// Always request Linux-compatible wheels so the sandbox container (Linux)
+	// can install them, even when the host is Windows or macOS.
+	// This does NOT introduce a new fingerprint inside the container — the
+	// container always runs Linux, so Linux wheels are the expected norm.
+	// The --platform flags are only visible in the host-side pip process,
+	// which is outside the strace monitoring scope.
+	// Download with dependencies — supply chain attacks like the axios
+	// incident show that compromised deps must be monitored too.
+	// All downloaded packages will be installed under strace in the sandbox.
+	args := []string{
+		"download", "--only-binary=:all:",
+		"--platform", "manylinux2014_x86_64",
+		"--platform", "manylinux_2_17_x86_64",
+		"--platform", "linux_x86_64",
+		"--platform", "any",
+		"--implementation", "cp",
+		"--python-version", "312",
+		"--abi", "cp312",
+		"--abi", "abi3",
+		"--abi", "none",
+		"-d", destDir,
+		target,
+	}
 	cmd := exec.CommandContext(ctx, "pip", args...)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
@@ -67,24 +89,48 @@ func downloadPyPI(ctx context.Context, pkg, version, destDir string) (string, er
 }
 
 func downloadNpm(ctx context.Context, pkg, version, destDir string) (string, error) {
-	target := pkg
-	if version != "" {
-		target = pkg + "@" + version
+	// Create a staging project with the target as a dependency.
+	// npm install --ignore-scripts resolves the full dep tree on the host
+	// without running any lifecycle scripts. The resulting node_modules is
+	// then mounted into the sandbox container, where lifecycle scripts
+	// (preinstall, postinstall, etc.) are re-executed under strace.
+	pkgData := map[string]interface{}{
+		"name":         "kojuto-staging",
+		"private":      true,
+		"dependencies": map[string]string{pkg: versionOrLatest(version)},
+	}
+	pkgJSON, err := json.Marshal(pkgData)
+	if err != nil {
+		return "", fmt.Errorf("marshalling staging package.json: %w", err)
 	}
 
-	// npm pack downloads a tarball to the current directory.
-	// --ignore-scripts prevents prepack/postpack scripts from executing on the host.
-	args := []string{"pack", "--ignore-scripts", "--pack-destination", destDir, target}
-	cmd := exec.CommandContext(ctx, "npm", args...)
+	if err := os.WriteFile(filepath.Join(destDir, "package.json"), pkgJSON, 0o644); err != nil {
+		return "", fmt.Errorf("writing staging package.json: %w", err)
+	}
+
+	cmd := exec.CommandContext(ctx, "npm", "install", "--ignore-scripts")
 	cmd.Dir = destDir
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("npm pack failed: %w", err)
+		return "", fmt.Errorf("npm install (host staging) failed: %w", err)
 	}
 
-	return verifyDownload(destDir, pkg)
+	// Verify node_modules was created.
+	nmDir := filepath.Join(destDir, "node_modules")
+	if _, err := os.Stat(nmDir); err != nil {
+		return "", fmt.Errorf("node_modules not created for %s", pkg)
+	}
+
+	return destDir, nil
+}
+
+func versionOrLatest(version string) string {
+	if version != "" {
+		return version
+	}
+	return "*"
 }
 
 func verifyDownload(destDir, pkg string) (string, error) {

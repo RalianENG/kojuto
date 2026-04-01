@@ -33,6 +33,7 @@ type Sandbox struct {
 	ecosystem   string
 	mountPoint  string // set by containerArgs(), mirrors host layout
 	needsPtrace bool
+	seccompDir  string // per-instance temp dir for seccomp profile
 }
 
 // New creates a new Sandbox instance.
@@ -45,18 +46,14 @@ func New(packageDir, pkg string, needsPtrace bool, ecosystem string) *Sandbox {
 	}
 }
 
-// seccompDir holds the path to a temporary directory containing the seccomp profile.
-// It is set by writeSeccompProfile and cleaned up by Cleanup.
-var seccompDir string
-
 // writeSeccompProfile writes the embedded seccomp profile to a temp file
 // and returns the --security-opt flag value to pass to docker.
-func writeSeccompProfile() (string, error) {
+func (s *Sandbox) writeSeccompProfile() (string, error) {
 	dir, err := os.MkdirTemp("", "kojuto-seccomp-*")
 	if err != nil {
 		return "", fmt.Errorf("creating seccomp temp dir: %w", err)
 	}
-	seccompDir = dir
+	s.seccompDir = dir
 
 	path := filepath.Join(dir, "seccomp.json")
 	if err := os.WriteFile(path, seccompProfile, 0o444); err != nil {
@@ -89,22 +86,25 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 		"--tmpfs=/tmp:nosuid,mode=1777,size=100m",
 		"--tmpfs=/install:nosuid,mode=1777,size=300m",
 		"--tmpfs=/usr/local/lib/python" + SandboxPythonVersion + "/site-packages:nosuid,mode=1777,size=300m",
-		"--tmpfs=/usr/local/bin:nosuid,exec,size=32m",
+		"--tmpfs=/usr/local/bin:nosuid,exec,mode=0755,size=32m",
 		"--tmpfs=/run:nosuid,size=1m",
 		"--tmpfs=/home/dev:nosuid,mode=1777,size=32m",
 		"--memory=" + mem,
 		"--cpus=" + cpus,
 		"--pids-limit=256",
 	}
-	if s.needsPtrace {
-		// Re-add only SYS_PTRACE (all others remain dropped).
-		args = append(args, "--cap-add=SYS_PTRACE")
+	// Always apply the restrictive seccomp profile regardless of ptrace needs.
+	// Without it, Docker's default seccomp allows memfd_create, userfaultfd,
+	// open_by_handle_at, and other container-escape vectors.
+	seccompOpt, err := s.writeSeccompProfile()
+	if err != nil {
+		return nil, err
+	}
+	args = append(args, "--security-opt="+seccompOpt)
 
-		seccompOpt, err := writeSeccompProfile()
-		if err != nil {
-			return nil, err
-		}
-		args = append(args, "--security-opt="+seccompOpt)
+	if s.needsPtrace {
+		// Re-add SYS_PTRACE for strace, CHOWN+FOWNER for tmpfs file setup.
+		args = append(args, "--cap-add=SYS_PTRACE", "--cap-add=CHOWN", "--cap-add=FOWNER")
 	}
 
 	args = append(args,
@@ -117,11 +117,27 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 }
 
 // getHostHostname returns the real hostname of the machine running kojuto.
+// The result is sanitized to prevent Docker flag injection via hostile hostnames.
 func getHostHostname() string {
 	if h, err := os.Hostname(); err == nil && h != "" {
-		return h
+		return sanitizeDockerArg(h)
 	}
 	return "localhost"
+}
+
+// sanitizeDockerArg strips characters that could break Docker CLI arguments.
+// Docker hostnames must match [a-zA-Z0-9][a-zA-Z0-9_.-].
+func sanitizeDockerArg(s string) string {
+	var b strings.Builder
+	for _, c := range s {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' {
+			b.WriteRune(c)
+		}
+	}
+	if b.Len() == 0 {
+		return "localhost"
+	}
+	return b.String()
 }
 
 // getHostResources returns the host's CPU count and memory size as Docker
@@ -291,12 +307,19 @@ func (s *Sandbox) Start(ctx context.Context) error {
 // Also fixes permissions so the container user (dev) can write to site-packages.
 func (s *Sandbox) restoreLocalBin(ctx context.Context) {
 	s.dockerExecRoot(ctx, "cp", "-a", "/usr/local/bin.bak/.", "/usr/local/bin/")
+	s.dockerExecRoot(ctx, "chmod", "-R", "a+rw", "/usr/local/bin")
 
 	sitePackages := "/usr/local/lib/python" + SandboxPythonVersion + "/site-packages"
 	s.dockerExecRoot(ctx, "cp", "-a", sitePackages+".bak/.", sitePackages+"/")
 	s.dockerExecRoot(ctx, "chmod", "-R", "a+rw", sitePackages)
 
-	// /home/dev is a tmpfs (writable) so npm can create ~/.npm for cache/logs.
+	// For npm: copy the read-only mounted node_modules into the writable
+	// /install tmpfs so npm rebuild can chmod/symlink as needed.
+	// Requires CAP_CHOWN + CAP_FOWNER to fix ownership for the dev user.
+	if s.ecosystem == types.EcosystemNpm {
+		s.dockerExecRoot(ctx, "cp", "-a", s.mountPoint+"/.", "/install/")
+		s.dockerExecRoot(ctx, "chown", "-R", "1000:1000", "/install")
+	}
 }
 
 // eraseFingerprints removes or masks signals that reveal the container
@@ -347,18 +370,20 @@ func (s *Sandbox) InstallPackage(ctx context.Context) ([]byte, error) {
 // InstallCommand returns the install command for the ecosystem.
 func (s *Sandbox) InstallCommand() []string {
 	if s.ecosystem == types.EcosystemNpm {
+		// The host has already resolved deps into node_modules (with
+		// --ignore-scripts). restoreLocalBin copied them to /install (writable).
+		// npm rebuild executes lifecycle scripts under strace monitoring.
 		return []string{
-			"npm", "install",
-			"--offline",
-			"--ignore-scripts=false",
+			"npm", "rebuild",
 			"--prefix=/install",
-			s.mountPoint + "/" + s.findTarball(),
 		}
 	}
 
+	// Install with dependencies — all wheels in the mount point are installed
+	// together under strace monitoring. This catches compromised transitive
+	// dependencies (e.g. supply chain attacks via trusted dep packages).
 	return []string{
 		"pip", "install",
-		"--no-deps",
 		"--no-index",
 		"--find-links=" + s.mountPoint,
 		"--", s.pkg,
@@ -407,7 +432,8 @@ func (s *Sandbox) WriteProbeScripts(ctx context.Context) {
 	jsPlatforms := []string{"linux", "win32", "darwin"}
 	for _, p := range jsPlatforms {
 		script := fmt.Sprintf(
-			"Object.defineProperty(process,'platform',{value:'%s'});\n"+
+			"module.paths.unshift('/install/node_modules');\n"+
+				"Object.defineProperty(process,'platform',{value:'%s'});\n"+
 				"try{require('%s')}catch(e){}\n",
 			p, s.pkg,
 		)
@@ -515,9 +541,9 @@ func (s *Sandbox) Unpause(ctx context.Context) error {
 
 // Cleanup stops and removes the container, and cleans up temporary files.
 func (s *Sandbox) Cleanup(ctx context.Context) error {
-	if seccompDir != "" {
-		os.RemoveAll(seccompDir)
-		seccompDir = ""
+	if s.seccompDir != "" {
+		os.RemoveAll(s.seccompDir)
+		s.seccompDir = ""
 	}
 
 	cmd := exec.CommandContext(ctx, "docker", "rm", "-f", s.containerID)

@@ -8,11 +8,13 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/RalianENG/kojuto/internal/analyzer"
+	"github.com/RalianENG/kojuto/internal/depfile"
 	"github.com/RalianENG/kojuto/internal/downloader"
 	"github.com/RalianENG/kojuto/internal/probe"
 	"github.com/RalianENG/kojuto/internal/report"
@@ -35,6 +37,7 @@ var (
 	flagOutput      string
 	flagProbeMethod string
 	flagEcosystem   string
+	flagFile        string
 	flagTimeout     time.Duration
 )
 
@@ -45,9 +48,9 @@ var rootCmd = &cobra.Command{
 }
 
 var scanCmd = &cobra.Command{
-	Use:          "scan <package>",
-	Short:        "Scan a package for suspicious syscall activity during installation",
-	Args:         cobra.ExactArgs(1),
+	Use:          "scan [package]",
+	Short:        "Scan a package or dependency file for suspicious syscall activity",
+	Args:         cobra.MaximumNArgs(1),
 	RunE:         runScan,
 	SilenceUsage: true,
 }
@@ -64,8 +67,9 @@ func init() {
 	scanCmd.Flags().StringVarP(&flagVersion, "version", "v", "", "package version to scan")
 	scanCmd.Flags().StringVarP(&flagOutput, "output", "o", "", "output file path (default: stdout)")
 	scanCmd.Flags().StringVarP(&flagEcosystem, "ecosystem", "e", types.EcosystemPyPI, "ecosystem: pypi, npm")
+	scanCmd.Flags().StringVarP(&flagFile, "file", "f", "", "dependency file to scan (requirements.txt or package.json)")
 	scanCmd.Flags().StringVar(&flagProbeMethod, "probe-method", methodAuto, "probe method: auto, ebpf, strace, strace-container")
-	scanCmd.Flags().DurationVar(&flagTimeout, "timeout", 5*time.Minute, "scan timeout")
+	scanCmd.Flags().DurationVar(&flagTimeout, "timeout", 5*time.Minute, "scan timeout per package")
 
 	rootCmd.AddCommand(scanCmd)
 	rootCmd.AddCommand(versionCmd)
@@ -104,14 +108,26 @@ type scanResult struct {
 }
 
 func runScan(_ *cobra.Command, args []string) error {
-	pkg := args[0]
+	// Batch mode: scan all packages from a dependency file.
+	if flagFile != "" {
+		return runBatchScan(args)
+	}
 
-	if err := downloader.ValidatePackage(pkg, flagVersion); err != nil {
+	// Single package mode.
+	if len(args) == 0 {
+		return fmt.Errorf("either provide a package name or use -f <file>")
+	}
+
+	return scanSinglePackage(args[0], flagVersion, flagEcosystem)
+}
+
+func scanSinglePackage(pkg, version, ecosystem string) error {
+	if err := downloader.ValidatePackage(pkg, version); err != nil {
 		return fmt.Errorf("invalid input: %w", err)
 	}
 
-	if flagEcosystem != types.EcosystemPyPI && flagEcosystem != types.EcosystemNpm {
-		return fmt.Errorf("unsupported ecosystem: %s (use pypi or npm)", flagEcosystem)
+	if ecosystem != types.EcosystemPyPI && ecosystem != types.EcosystemNpm {
+		return fmt.Errorf("unsupported ecosystem: %s (use pypi or npm)", ecosystem)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), flagTimeout)
@@ -124,6 +140,9 @@ func runScan(_ *cobra.Command, args []string) error {
 		<-sigCh
 		cancel()
 	}()
+
+	flagVersion = version
+	flagEcosystem = ecosystem
 
 	dlDir, err := downloadPackage(ctx, pkg)
 	if err != nil {
@@ -151,6 +170,64 @@ func runScan(_ *cobra.Command, args []string) error {
 	}
 
 	return outputReport(pkg, result)
+}
+
+func runBatchScan(args []string) error {
+	deps, ecosystem, err := depfile.Parse(flagFile)
+	if err != nil {
+		return err
+	}
+
+	if len(deps) == 0 {
+		return fmt.Errorf("no dependencies found in %s", flagFile)
+	}
+
+	// Allow ecosystem override from -e flag if explicitly set.
+	if flagEcosystem != types.EcosystemPyPI {
+		ecosystem = flagEcosystem
+	}
+
+	fmt.Fprintf(os.Stderr, "[*] Scanning %d packages from %s (%s)...\n", len(deps), flagFile, ecosystem)
+
+	var suspicious []string
+	var scanErrors []string
+
+	for i, dep := range deps {
+		fmt.Fprintf(os.Stderr, "\n[%d/%d] Scanning %s", i+1, len(deps), dep.Name)
+		if dep.Version != "" {
+			fmt.Fprintf(os.Stderr, " (%s)", dep.Version)
+		}
+		fmt.Fprintln(os.Stderr)
+
+		scanErr := scanSinglePackage(dep.Name, dep.Version, ecosystem)
+		if scanErr != nil {
+			var ve *VerdictError
+			if errors.As(scanErr, &ve) {
+				suspicious = append(suspicious, dep.Name)
+			} else {
+				fmt.Fprintf(os.Stderr, "[!] Error scanning %s: %v\n", dep.Name, scanErr)
+				scanErrors = append(scanErrors, dep.Name)
+			}
+		}
+	}
+
+	// Summary.
+	fmt.Fprintf(os.Stderr, "\n=== Batch scan complete ===\n")
+	fmt.Fprintf(os.Stderr, "  Total:      %d\n", len(deps))
+	fmt.Fprintf(os.Stderr, "  Clean:      %d\n", len(deps)-len(suspicious)-len(scanErrors))
+	fmt.Fprintf(os.Stderr, "  Suspicious: %d\n", len(suspicious))
+	fmt.Fprintf(os.Stderr, "  Errors:     %d\n", len(scanErrors))
+
+	if len(suspicious) > 0 {
+		fmt.Fprintf(os.Stderr, "  Flagged:    %s\n", strings.Join(suspicious, ", "))
+		return &VerdictError{Verdict: types.VerdictSuspicious, ExitCode: exitCodeSuspicious}
+	}
+
+	if len(scanErrors) > 0 {
+		return fmt.Errorf("scan failed for: %s", strings.Join(scanErrors, ", "))
+	}
+
+	return nil
 }
 
 func downloadPackage(ctx context.Context, pkg string) (string, error) {
