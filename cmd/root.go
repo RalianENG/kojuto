@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -38,6 +39,7 @@ var (
 	flagProbeMethod string
 	flagEcosystem   string
 	flagFile        string
+	flagPin         string
 	flagTimeout     time.Duration
 )
 
@@ -68,6 +70,7 @@ func init() {
 	scanCmd.Flags().StringVarP(&flagOutput, "output", "o", "", "output file path (default: stdout)")
 	scanCmd.Flags().StringVarP(&flagEcosystem, "ecosystem", "e", types.EcosystemPyPI, "ecosystem: pypi, npm")
 	scanCmd.Flags().StringVarP(&flagFile, "file", "f", "", "dependency file to scan (requirements.txt or package.json)")
+	scanCmd.Flags().StringVar(&flagPin, "pin", "", "output pinned dependency file after all-clean scan (requires -f)")
 	scanCmd.Flags().StringVar(&flagProbeMethod, "probe-method", methodAuto, "probe method: auto, ebpf, strace, strace-container")
 	scanCmd.Flags().DurationVar(&flagTimeout, "timeout", 5*time.Minute, "scan timeout per package")
 
@@ -118,16 +121,23 @@ func runScan(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("either provide a package name or use -f <file>")
 	}
 
-	return scanSinglePackage(args[0], flagVersion, flagEcosystem)
+	_, err := scanSinglePackage(args[0], flagVersion, flagEcosystem)
+	return err
 }
 
-func scanSinglePackage(pkg, version, ecosystem string) error {
+// pinnedDep holds a resolved package name and version after a clean scan.
+type pinnedDep struct {
+	Name    string
+	Version string
+}
+
+func scanSinglePackage(pkg, version, ecosystem string) (*pinnedDep, error) {
 	if err := downloader.ValidatePackage(pkg, version); err != nil {
-		return fmt.Errorf("invalid input: %w", err)
+		return nil, fmt.Errorf("invalid input: %w", err)
 	}
 
 	if ecosystem != types.EcosystemPyPI && ecosystem != types.EcosystemNpm {
-		return fmt.Errorf("unsupported ecosystem: %s (use pypi or npm)", ecosystem)
+		return nil, fmt.Errorf("unsupported ecosystem: %s (use pypi or npm)", ecosystem)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), flagTimeout)
@@ -146,15 +156,18 @@ func scanSinglePackage(pkg, version, ecosystem string) error {
 
 	dlDir, err := downloadPackage(ctx, pkg)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer os.RemoveAll(filepath.Dir(dlDir))
+
+	// Capture resolved version after download (may have been detected from filename).
+	resolvedVersion := flagVersion
 
 	method := selectProbeMethod()
 
 	sb, err := startSandbox(ctx, dlDir, pkg, method)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -166,10 +179,14 @@ func scanSinglePackage(pkg, version, ecosystem string) error {
 
 	result, err := runProbeAndInstall(ctx, sb, pkg, method)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return outputReport(pkg, result)
+	if err := outputReport(pkg, result); err != nil {
+		return nil, err
+	}
+
+	return &pinnedDep{Name: pkg, Version: resolvedVersion}, nil
 }
 
 func runBatchScan(args []string) error {
@@ -187,10 +204,15 @@ func runBatchScan(args []string) error {
 		ecosystem = flagEcosystem
 	}
 
+	if flagPin != "" && flagFile == "" {
+		return fmt.Errorf("--pin requires -f <file>")
+	}
+
 	fmt.Fprintf(os.Stderr, "[*] Scanning %d packages from %s (%s)...\n", len(deps), flagFile, ecosystem)
 
 	var suspicious []string
 	var scanErrors []string
+	var pinned []pinnedDep
 
 	for i, dep := range deps {
 		fmt.Fprintf(os.Stderr, "\n[%d/%d] Scanning %s", i+1, len(deps), dep.Name)
@@ -199,7 +221,7 @@ func runBatchScan(args []string) error {
 		}
 		fmt.Fprintln(os.Stderr)
 
-		scanErr := scanSinglePackage(dep.Name, dep.Version, ecosystem)
+		resolved, scanErr := scanSinglePackage(dep.Name, dep.Version, ecosystem)
 		if scanErr != nil {
 			var ve *VerdictError
 			if errors.As(scanErr, &ve) {
@@ -208,6 +230,8 @@ func runBatchScan(args []string) error {
 				fmt.Fprintf(os.Stderr, "[!] Error scanning %s: %v\n", dep.Name, scanErr)
 				scanErrors = append(scanErrors, dep.Name)
 			}
+		} else if resolved != nil {
+			pinned = append(pinned, *resolved)
 		}
 	}
 
@@ -220,14 +244,80 @@ func runBatchScan(args []string) error {
 
 	if len(suspicious) > 0 {
 		fmt.Fprintf(os.Stderr, "  Flagged:    %s\n", strings.Join(suspicious, ", "))
+		if flagPin != "" {
+			fmt.Fprintf(os.Stderr, "[!] --pin refused: suspicious packages detected\n")
+		}
 		return &VerdictError{Verdict: types.VerdictSuspicious, ExitCode: exitCodeSuspicious}
 	}
 
 	if len(scanErrors) > 0 {
+		if flagPin != "" {
+			fmt.Fprintf(os.Stderr, "[!] --pin refused: scan errors occurred\n")
+		}
 		return fmt.Errorf("scan failed for: %s", strings.Join(scanErrors, ", "))
 	}
 
+	// All clean — generate pinned dependency file if requested.
+	if flagPin != "" {
+		if err := writePinnedFile(flagPin, pinned, ecosystem); err != nil {
+			return fmt.Errorf("writing pinned file: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "[+] Pinned %d packages to %s\n", len(pinned), flagPin)
+	}
+
 	return nil
+}
+
+// writePinnedFile writes a locked dependency file with exact versions.
+// For PyPI: requirements.txt format (pkg==version).
+// For npm: package.json format with pinned dependencies.
+func writePinnedFile(path string, deps []pinnedDep, ecosystem string) error {
+	switch ecosystem {
+	case types.EcosystemPyPI:
+		return writePinnedPyPI(path, deps)
+	case types.EcosystemNpm:
+		return writePinnedNpm(path, deps)
+	default:
+		return fmt.Errorf("unsupported ecosystem for pin: %s", ecosystem)
+	}
+}
+
+func writePinnedPyPI(path string, deps []pinnedDep) error {
+	var b strings.Builder
+	b.WriteString("# Pinned by kojuto — all packages scanned clean\n")
+	for _, dep := range deps {
+		if dep.Version != "" {
+			fmt.Fprintf(&b, "%s==%s\n", dep.Name, dep.Version)
+		} else {
+			fmt.Fprintf(&b, "%s\n", dep.Name)
+		}
+	}
+	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+func writePinnedNpm(path string, deps []pinnedDep) error {
+	pinned := make(map[string]string, len(deps))
+	for _, dep := range deps {
+		if dep.Version != "" {
+			pinned[dep.Name] = dep.Version
+		} else {
+			pinned[dep.Name] = "*"
+		}
+	}
+
+	data := map[string]interface{}{
+		"name":         "pinned-by-kojuto",
+		"private":      true,
+		"dependencies": pinned,
+	}
+
+	jsonBytes, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshalling pinned package.json: %w", err)
+	}
+	jsonBytes = append(jsonBytes, '\n')
+
+	return os.WriteFile(path, jsonBytes, 0o644)
 }
 
 func downloadPackage(ctx context.Context, pkg string) (string, error) {

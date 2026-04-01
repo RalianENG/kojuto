@@ -102,6 +102,15 @@ CLI (cobra)
 3. Import in same container × 3 OS identities (Linux / Windows / macOS) + monitor with strace (Phase 2)
 4. Merge events from all phases and analyze
 5. Generate report
+6. (Optional) If `--pin` specified and all packages clean, generate pinned dependency file
+
+### Dependency Pinning (`--pin`)
+
+- Available in batch scan mode (`-f` required)
+- Generates a locked dependency file with exact versions resolved during download
+- **Refused if any package is suspicious or errored** — only all-clean scans produce a pin file
+- PyPI output: `pkg==version` format (requirements.txt)
+- npm output: `package.json` with pinned `dependencies`
 
 ### Multi-OS Import Probing
 

@@ -60,6 +60,10 @@ sudo kojuto scan requests --probe-method ebpf
 
 # パッケージごとのタイムアウトを設定
 kojuto scan requests --timeout 10m
+
+# スキャン後にバージョン固定ファイルを生成（全パッケージがクリーンの場合のみ）
+kojuto scan -f requirements.txt --pin requirements-locked.txt
+kojuto scan -f package.json -e npm --pin package-pinned.json
 ```
 
 ### フラグ
@@ -70,6 +74,7 @@ kojuto scan requests --timeout 10m
 | `-o, --output` | 出力ファイルパス（デフォルト: 標準出力） |
 | `-e, --ecosystem` | `pypi` / `npm`（デフォルト: `pypi`） |
 | `-f, --file` | 依存ファイルを指定してスキャン（`requirements.txt`、`package.json`、任意の `*.txt`/`*.json`） |
+| `--pin` | 全パッケージがクリーンの場合にバージョン固定ファイルを出力（`-f` 必須） |
 | `--probe-method` | `auto` / `ebpf` / `strace` / `strace-container`（デフォルト: `auto`） |
 | `--timeout` | パッケージごとのタイムアウト（デフォルト: `5m`） |
 

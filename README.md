@@ -55,6 +55,10 @@ sudo ./kojuto scan requests --probe-method ebpf
 
 # Set scan timeout per package
 ./kojuto scan requests --timeout 10m
+
+# Scan and generate pinned dependency file (all packages must be clean)
+./kojuto scan -f requirements.txt --pin requirements-locked.txt
+./kojuto scan -f package.json -e npm --pin package-pinned.json
 ```
 
 ### Flags
@@ -65,6 +69,7 @@ sudo ./kojuto scan requests --probe-method ebpf
 | `-o, --output` | Output file path (default: stdout) |
 | `-e, --ecosystem` | `pypi` / `npm` (default: `pypi`) |
 | `-f, --file` | Dependency file to scan (`requirements.txt`, `package.json`, or any `*.txt`/`*.json`) |
+| `--pin` | Output pinned dependency file after all-clean batch scan (requires `-f`) |
 | `--probe-method` | `auto` / `ebpf` / `strace` / `strace-container` (default: `auto`) |
 | `--timeout` | Scan timeout per package (default: `5m`) |
 
