@@ -29,6 +29,10 @@ make sandbox-image
 # Scan an npm package
 ./kojuto scan lodash -e npm
 
+# Scan all dependencies from a file
+./kojuto scan -f requirements.txt
+./kojuto scan -f package.json
+
 # Scan a specific version
 ./kojuto scan requests --version 2.31.0
 
@@ -38,7 +42,7 @@ make sandbox-image
 # Explicitly use eBPF (connect-only, requires root + kernel 5.8+)
 sudo ./kojuto scan requests --probe-method ebpf
 
-# Set scan timeout
+# Set scan timeout per package
 ./kojuto scan requests --timeout 10m
 ```
 
@@ -49,8 +53,9 @@ sudo ./kojuto scan requests --probe-method ebpf
 | `-v, --version` | Package version to scan (default: latest) |
 | `-o, --output` | Output file path (default: stdout) |
 | `-e, --ecosystem` | `pypi` / `npm` (default: `pypi`) |
+| `-f, --file` | Dependency file to scan (`requirements.txt`, `package.json`, or any `*.txt`/`*.json`) |
 | `--probe-method` | `auto` / `ebpf` / `strace` / `strace-container` (default: `auto`) |
-| `--timeout` | Scan timeout (default: `5m`) |
+| `--timeout` | Scan timeout per package (default: `5m`) |
 
 ### Exit Codes
 

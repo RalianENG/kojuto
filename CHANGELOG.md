@@ -8,8 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.0]
 
 ### Added
+- Batch scan from dependency files (`-f requirements.txt`, `-f package.json`)
+- Dependency file parser supporting `*.txt` (pip) and `*.json` (npm) formats
 - npm ecosystem support (`-e npm`)
-- `sendmsg` syscall monitoring (strace parser + event type)
+- `sendmsg`, `sendmmsg`, `bind`, `listen`, `accept` syscall monitoring
+- Transitive dependency scanning (removed `--no-deps` from pip/npm)
+- Cross-platform pip download (`--platform manylinux2014_x86_64` for Windows/macOS hosts)
 - 2-phase scan: install monitoring + import/require monitoring
 - Multi-OS import probing: simulate Linux, Windows, macOS identities to defeat platform-gated payloads
 - `sh -c` command content inspection with `shellSafeCommands` whitelist

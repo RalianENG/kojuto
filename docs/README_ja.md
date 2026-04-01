@@ -36,6 +36,10 @@ kojuto scan requests
 # npm パッケージをスキャン
 kojuto scan lodash -e npm
 
+# 依存ファイルから一括スキャン
+kojuto scan -f requirements.txt
+kojuto scan -f package.json
+
 # 特定バージョンを指定
 kojuto scan requests --version 2.31.0
 
@@ -45,7 +49,7 @@ kojuto scan requests -o report.json
 # eBPF を明示的に使用（connect のみ、root + kernel 5.8+ が必要）
 sudo kojuto scan requests --probe-method ebpf
 
-# タイムアウトを設定
+# パッケージごとのタイムアウトを設定
 kojuto scan requests --timeout 10m
 ```
 
@@ -56,8 +60,9 @@ kojuto scan requests --timeout 10m
 | `-v, --version` | スキャンするバージョン（デフォルト: 最新） |
 | `-o, --output` | 出力ファイルパス（デフォルト: 標準出力） |
 | `-e, --ecosystem` | `pypi` / `npm`（デフォルト: `pypi`） |
+| `-f, --file` | 依存ファイルを指定してスキャン（`requirements.txt`、`package.json`、任意の `*.txt`/`*.json`） |
 | `--probe-method` | `auto` / `ebpf` / `strace` / `strace-container`（デフォルト: `auto`） |
-| `--timeout` | スキャンのタイムアウト（デフォルト: `5m`） |
+| `--timeout` | パッケージごとのタイムアウト（デフォルト: `5m`） |
 
 ### 終了コード
 
