@@ -30,13 +30,13 @@ const (
 
 // EBPFProbe monitors syscalls using eBPF kprobes.
 type EBPFProbe struct {
-	objs       *probeObjects
-	links      []link.Link
-	reader     *perf.Reader
-	fileReader *perf.Reader
-	events     chan types.SyscallEvent
-	done       chan struct{}
-	closeOnce  sync.Once
+	objs        *probeObjects
+	links       []link.Link
+	reader      *perf.Reader
+	fileReader  *perf.Reader
+	events      chan types.SyscallEvent
+	done        chan struct{}
+	closeOnce   sync.Once
 	LostSamples uint64
 }
 

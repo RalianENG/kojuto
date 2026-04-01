@@ -153,7 +153,7 @@ func sanitizeDockerArg(s string) string {
 // flag values. The container sees the same os.cpu_count() and /proc/meminfo
 // as the host, so resource-based sandbox detection fails.
 // Hard caps: max 4 CPUs, max 4GB — enough to look real, not enough to DoS.
-func getHostResources() (cpus string, memory string) {
+func getHostResources() (cpus, memory string) {
 	n := runtime.NumCPU()
 	if n > 4 {
 		n = 4
@@ -206,9 +206,9 @@ func getHostUsername() string {
 // that DROP all outbound traffic. This replaces --network=none so that:
 // - /proc/net/tcp shows a real network interface (anti-fingerprint)
 // - connect() returns ETIMEDOUT instead of ENETUNREACH (anti-fingerprint)
-// - No actual data can leave the container
+// - No actual data can leave the container.
 func (s *Sandbox) createIsolatedNetwork(ctx context.Context) error {
-	s.networkName = "kojuto-jail-" + fmt.Sprintf("%d", os.Getpid())
+	s.networkName = "kojuto-jail-" + strconv.Itoa(os.Getpid())
 
 	// Create an internal bridge network (no external gateway).
 	cmd := exec.CommandContext(ctx, "docker", "network", "create",
@@ -267,7 +267,7 @@ func (s *Sandbox) Create(ctx context.Context) error {
 }
 
 // StartPaused starts the container and immediately pauses it.
-// This minimises the TOCTOU window between container start and probe attachment.
+// This minimizes the TOCTOU window between container start and probe attachment.
 func (s *Sandbox) StartPaused(ctx context.Context) error {
 	startCmd := exec.CommandContext(ctx, "docker", "start", s.containerID)
 	startCmd.Stdout = io.Discard
@@ -610,22 +610,6 @@ func (s *Sandbox) nodeImportCommands() [][]string {
 		wrapWithFaketime([]string{"node", "/tmp/_kojuto_probe_win32.js"}),
 		wrapWithFaketime([]string{"node", "/tmp/_kojuto_probe_darwin.js"}),
 	}
-}
-
-func (s *Sandbox) findTarball() string {
-	// Best-effort: find .tgz file in package dir.
-	entries, err := os.ReadDir(s.packageDir)
-	if err != nil {
-		return s.pkg + ".tgz"
-	}
-
-	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".tgz") {
-			return e.Name()
-		}
-	}
-
-	return s.pkg + ".tgz"
 }
 
 // PID returns the init PID of the sandbox container on the host.

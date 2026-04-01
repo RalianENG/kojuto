@@ -120,8 +120,8 @@ func parsePackageJSON(path string) ([]Dep, error) {
 func cleanNpmVersion(ver string) string {
 	ver = strings.TrimSpace(ver)
 
-	// Exact version: "1.2.3"
-	if len(ver) > 0 && ver[0] >= '0' && ver[0] <= '9' {
+	// Exact version: "1.2.3".
+	if ver != "" && ver[0] >= '0' && ver[0] <= '9' {
 		return ver
 	}
 

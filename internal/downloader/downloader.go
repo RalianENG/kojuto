@@ -101,7 +101,7 @@ func downloadNpm(ctx context.Context, pkg, version, destDir string) (string, err
 	}
 	pkgJSON, err := json.Marshal(pkgData)
 	if err != nil {
-		return "", fmt.Errorf("marshalling staging package.json: %w", err)
+		return "", fmt.Errorf("marshaling staging package.json: %w", err)
 	}
 
 	if err := os.WriteFile(filepath.Join(destDir, "package.json"), pkgJSON, 0o644); err != nil {

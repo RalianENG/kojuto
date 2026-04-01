@@ -35,7 +35,7 @@ var (
 		`bind\(\d+,\s*\{sa_family=AF_INET6?,\s*sin6?_port=htons\((\d+)\),\s*sin6?_addr=inet6?_addr\("([^"]+)"\)`,
 	)
 
-	// listen(3, 5)
+	// listen(3, 5).
 	straceListenRe = regexp.MustCompile(
 		`listen\((\d+),\s*(\d+)\)`,
 	)
@@ -50,12 +50,12 @@ var (
 		`execve\("([^"]+)",\s*\[([^\]]+)\]`,
 	)
 
-	// openat(AT_FDCWD, "/home/dev/.ssh/id_rsa", O_RDONLY|O_CLOEXEC) = 3
+	// openat(AT_FDCWD, "/home/dev/.ssh/id_rsa", O_RDONLY|O_CLOEXEC) = 3.
 	straceOpenatRe = regexp.MustCompile(
 		`openat\([^,]+,\s*"([^"]+)",\s*([A-Z_|]+)`,
 	)
 
-	// rename("/tmp/evil", "/usr/local/bin/python3") = 0
+	// rename("/tmp/evil", "/usr/local/bin/python3") = 0.
 	straceRenameRe = regexp.MustCompile(
 		`rename\("([^"]+)",\s*"([^"]+)"\)`,
 	)

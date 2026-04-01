@@ -92,7 +92,7 @@ func TestParseStraceLine_Execve(t *testing.T) {
 
 func TestParseStraceLine_Irrelevant(t *testing.T) {
 	lines := []string{
-		"openat(AT_FDCWD, \"/etc/hosts\", O_RDONLY) = 3", // non-sensitive path
+		"openat(AT_FDCWD, \"/etc/hosts\", O_RDONLY) = 3",                               // non-sensitive path
 		"connect(3, {sa_family=AF_UNIX, sun_path=\"/var/run/nscd/socket\"}, 110) = -1", // AF_UNIX
 		"",
 		"some random text",

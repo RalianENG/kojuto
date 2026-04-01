@@ -118,7 +118,7 @@ func runScan(_ *cobra.Command, args []string) error {
 
 	// Single package mode.
 	if len(args) == 0 {
-		return fmt.Errorf("either provide a package name or use -f <file>")
+		return errors.New("either provide a package name or use -f <file>")
 	}
 
 	_, err := scanSinglePackage(args[0], flagVersion, flagEcosystem)
@@ -189,7 +189,7 @@ func scanSinglePackage(pkg, version, ecosystem string) (*pinnedDep, error) {
 	return &pinnedDep{Name: pkg, Version: resolvedVersion}, nil
 }
 
-func runBatchScan(args []string) error {
+func runBatchScan(_ []string) error {
 	deps, ecosystem, err := depfile.Parse(flagFile)
 	if err != nil {
 		return err
@@ -205,7 +205,7 @@ func runBatchScan(args []string) error {
 	}
 
 	if flagPin != "" && flagFile == "" {
-		return fmt.Errorf("--pin requires -f <file>")
+		return errors.New("--pin requires -f <file>")
 	}
 
 	fmt.Fprintf(os.Stderr, "[*] Scanning %d packages from %s (%s)...\n", len(deps), flagFile, ecosystem)
@@ -313,7 +313,7 @@ func writePinnedNpm(path string, deps []pinnedDep) error {
 
 	jsonBytes, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
-		return fmt.Errorf("marshalling pinned package.json: %w", err)
+		return fmt.Errorf("marshaling pinned package.json: %w", err)
 	}
 	jsonBytes = append(jsonBytes, '\n')
 
@@ -377,7 +377,7 @@ func startSandbox(ctx context.Context, dlDir, pkg, method string) (*sandbox.Sand
 	sb := sandbox.New(dlDir, pkg, needsPtrace, flagEcosystem)
 
 	if method == methodEBPF || method == methodStrace {
-		// Create then start-paused to minimise the TOCTOU window
+		// Create then start-paused to minimize the TOCTOU window
 		// between container start and probe attachment.
 		if err := sb.Create(ctx); err != nil {
 			return nil, fmt.Errorf("creating sandbox: %w", err)
