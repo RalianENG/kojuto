@@ -6,6 +6,8 @@
 
 A supply chain attack detection tool that monitors syscalls during package installation and import to detect suspicious activity. Supports PyPI and npm ecosystems.
 
+![kojuto demo — detecting axios/plain-crypto-js supply chain attack](demo.svg)
+
 ## How It Works
 
 1. **Download** — Fetch the target package to the host (network allowed)

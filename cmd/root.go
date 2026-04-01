@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -384,6 +385,17 @@ func runLocalScan(_ []string) error {
 	flagEcosystem = ecosystem
 	flagVersion = downloader.DetectVersion(dlDir, pkg)
 
+	// For npm local packages, we need to create a node_modules structure
+	// from the .tgz so the sandbox can run npm rebuild with lifecycle scripts.
+	if ecosystem == types.EcosystemNpm {
+		npmDir, npmErr := prepareLocalNpm(dlDir, pkg)
+		if npmErr != nil {
+			return fmt.Errorf("preparing local npm package: %w", npmErr)
+		}
+		defer os.RemoveAll(npmDir)
+		dlDir = npmDir
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), flagTimeout)
 	defer cancel()
 
@@ -451,6 +463,59 @@ func detectPackageName(filename string) string {
 	}
 
 	return strings.Join(nameParts, "-")
+}
+
+// prepareLocalNpm creates a staging directory with node_modules from
+// a local .tgz file. This mirrors what downloadNpm does for registry
+// packages: npm install --ignore-scripts on the host, then the sandbox
+// runs npm rebuild to execute lifecycle scripts under strace.
+func prepareLocalNpm(sourceDir, pkg string) (string, error) {
+	stagingDir, err := os.MkdirTemp("", "kojuto-local-npm-*")
+	if err != nil {
+		return "", fmt.Errorf("creating npm staging dir: %w", err)
+	}
+
+	// Find .tgz in source directory.
+	entries, err := os.ReadDir(sourceDir)
+	if err != nil {
+		return "", fmt.Errorf("reading source dir: %w", err)
+	}
+
+	var tgzPath string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".tgz") {
+			tgzPath = filepath.Join(sourceDir, e.Name())
+			break
+		}
+	}
+	if tgzPath == "" {
+		return "", errors.New("no .tgz file found in local package directory")
+	}
+
+	// Create package.json that references the local tarball.
+	pkgJSON := map[string]interface{}{
+		"name":         "kojuto-local-staging",
+		"private":      true,
+		"dependencies": map[string]string{pkg: "file:" + tgzPath},
+	}
+	jsonBytes, err := json.Marshal(pkgJSON)
+	if err != nil {
+		return "", fmt.Errorf("marshaling staging package.json: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(stagingDir, "package.json"), jsonBytes, 0o644); err != nil {
+		return "", fmt.Errorf("writing staging package.json: %w", err)
+	}
+
+	// Install without scripts on host to resolve deps and create node_modules.
+	cmd := exec.CommandContext(context.Background(), "npm", "install", "--ignore-scripts")
+	cmd.Dir = stagingDir
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("npm install (local staging) failed: %w", err)
+	}
+
+	return stagingDir, nil
 }
 
 func downloadPackage(ctx context.Context, pkg string) (string, error) {

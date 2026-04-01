@@ -168,7 +168,26 @@ CLI (cobra)
 
 ---
 
-## 5. Technology Stack
+## 5. Validation
+
+### Test Data
+
+The `testdata/` directory contains attack simulation packages for detection validation:
+
+- `axios-demo/` — Simulates the axios/plain-crypto-js supply chain attack (March 2026)
+  - postinstall hook executing `setup.js`
+  - C2 connection to `142.11.206.73:8000`
+  - Credential file enumeration (`.ssh/`, `.aws/`, `.git-credentials`, `.netrc`, `.config/gh/`)
+  - Stage 2 payload drop and execution (`/tmp/ld.py`)
+  - Self-deletion (anti-forensics)
+
+Usage: `kojuto scan --local testdata/axios-attack-demo-1.14.1.tgz -e npm`
+
+Expected result: `suspicious` with ~10 events (connect, openat, execve).
+
+---
+
+## 6. Technology Stack
 
 | Layer | Technology | Rationale |
 |---|---|---|
