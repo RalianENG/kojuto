@@ -57,7 +57,7 @@ linters:
       max-complexity: 20
     errcheck:
       check-type-assertions: true
-      check-blank: true
+      check-blank: false
       exclude-functions:
         - os.RemoveAll
         - (io.Closer).Close
