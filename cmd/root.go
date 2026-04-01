@@ -139,7 +139,9 @@ func runScan(_ *cobra.Command, args []string) error {
 		return err
 	}
 	defer func() {
-		if cleanupErr := sb.Cleanup(ctx); cleanupErr != nil {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		if cleanupErr := sb.Cleanup(cleanupCtx); cleanupErr != nil {
 			fmt.Fprintf(os.Stderr, "[!] Cleanup warning: %v\n", cleanupErr)
 		}
 	}()
@@ -207,13 +209,19 @@ func startSandbox(ctx context.Context, dlDir, pkg, method string) (*sandbox.Sand
 	needsPtrace := method == methodStraceContainer
 	sb := sandbox.New(dlDir, pkg, needsPtrace, flagEcosystem)
 
-	if err := sb.Start(ctx); err != nil {
-		return nil, fmt.Errorf("starting sandbox: %w", err)
-	}
-
 	if method == methodEBPF || method == methodStrace {
-		if err := sb.Pause(ctx); err != nil {
-			return nil, fmt.Errorf("pausing container: %w", err)
+		// Create then start-paused to minimise the TOCTOU window
+		// between container start and probe attachment.
+		if err := sb.Create(ctx); err != nil {
+			return nil, fmt.Errorf("creating sandbox: %w", err)
+		}
+		if err := sb.StartPaused(ctx); err != nil {
+			return nil, fmt.Errorf("starting sandbox paused: %w", err)
+		}
+	} else {
+		// strace-container mode doesn't need the pause-before-probe pattern.
+		if err := sb.Start(ctx); err != nil {
+			return nil, fmt.Errorf("starting sandbox: %w", err)
 		}
 	}
 

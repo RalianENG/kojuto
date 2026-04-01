@@ -1,0 +1,48 @@
+{
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "syscalls": [
+    {
+      "names": [
+        "ptrace"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "comment": "Allow ptrace only for strace (PTRACE_ATTACH, PTRACE_SEIZE, PTRACE_SYSCALL, PTRACE_CONT, PTRACE_DETACH, PTRACE_PEEKDATA, PTRACE_GETREGSET)"
+    },
+    {
+      "names": [
+        "process_vm_readv",
+        "process_vm_writev"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
+      "comment": "Block cross-process memory access to prevent abuse of SYS_PTRACE capability"
+    },
+    {
+      "names": [
+        "mount",
+        "umount2",
+        "pivot_root",
+        "swapon",
+        "swapoff",
+        "reboot",
+        "sethostname",
+        "setdomainname",
+        "init_module",
+        "finit_module",
+        "delete_module",
+        "kexec_load",
+        "kexec_file_load",
+        "bpf",
+        "userfaultfd",
+        "perf_event_open",
+        "open_by_handle_at",
+        "keyctl",
+        "request_key",
+        "add_key"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
+      "comment": "Block dangerous syscalls that could be leveraged with SYS_PTRACE for container escape"
+    }
+  ]
+}

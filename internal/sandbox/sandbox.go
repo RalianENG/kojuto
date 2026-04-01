@@ -2,15 +2,20 @@ package sandbox
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/RalianENG/kojuto/internal/types"
 )
+
+//go:embed seccomp.json
+var seccompProfile []byte
 
 // SandboxImage is the Docker image used for the sandbox container.
 const SandboxImage = "kojuto-sandbox:latest"
@@ -34,21 +39,49 @@ func New(packageDir, pkg string, needsPtrace bool, ecosystem string) *Sandbox {
 	}
 }
 
-// Start creates and starts the sandbox container.
-// The container runs with --network=none and --no-new-privileges.
-// The filesystem is writable within the ephemeral container layer only;
-// the host filesystem is protected by Docker's copy-on-write isolation.
-func (s *Sandbox) Start(ctx context.Context) error {
+// seccompDir holds the path to a temporary directory containing the seccomp profile.
+// It is set by writeSeccompProfile and cleaned up by Cleanup.
+var seccompDir string
+
+// writeSeccompProfile writes the embedded seccomp profile to a temp file
+// and returns the --security-opt flag value to pass to docker.
+func writeSeccompProfile() (string, error) {
+	dir, err := os.MkdirTemp("", "kojuto-seccomp-*")
+	if err != nil {
+		return "", fmt.Errorf("creating seccomp temp dir: %w", err)
+	}
+	seccompDir = dir
+
+	path := filepath.Join(dir, "seccomp.json")
+	if err := os.WriteFile(path, seccompProfile, 0o444); err != nil {
+		return "", fmt.Errorf("writing seccomp profile: %w", err)
+	}
+
+	return "seccomp=" + path, nil
+}
+
+// containerArgs builds the common Docker flags for both Create and Start.
+func (s *Sandbox) containerArgs() ([]string, error) {
 	args := []string{
-		"run", "-d",
 		"--network=none",
 		"--security-opt=no-new-privileges",
+		"--read-only",
+		"--tmpfs=/tmp:nosuid,size=64m",
+		"--tmpfs=/install:nosuid,size=256m",
+		"--tmpfs=/usr/local/lib/python3.12/site-packages:nosuid,size=256m",
+		"--tmpfs=/usr/local/bin:nosuid,size=16m",
 		"--memory=512m",
 		"--cpus=1",
 		"--pids-limit=256",
 	}
 	if s.needsPtrace {
 		args = append(args, "--cap-add=SYS_PTRACE")
+
+		seccompOpt, err := writeSeccompProfile()
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, "--security-opt="+seccompOpt)
 	}
 
 	args = append(args,
@@ -57,14 +90,66 @@ func (s *Sandbox) Start(ctx context.Context) error {
 		"sleep", "3600",
 	)
 
+	return args, nil
+}
+
+// Create creates the sandbox container without starting it.
+// The container is configured with --network=none, --no-new-privileges, and --read-only.
+// Writable tmpfs mounts are provided only where needed (site-packages, /tmp, /install).
+// The host filesystem is protected by Docker's copy-on-write isolation.
+// When SYS_PTRACE is needed, a restrictive seccomp profile is applied to block
+// process_vm_readv/writev and other dangerous syscalls.
+func (s *Sandbox) Create(ctx context.Context) error {
+	cArgs, err := s.containerArgs()
+	if err != nil {
+		return err
+	}
+
+	args := append([]string{"create"}, cArgs...)
 	cmd := exec.CommandContext(ctx, "docker", args...)
 
 	out, err := cmd.Output()
 	if err != nil {
-		return fmt.Errorf("docker run failed: %w", err)
+		return fmt.Errorf("docker create failed: %w", err)
 	}
 
 	s.containerID = strings.TrimSpace(string(out))
+
+	return nil
+}
+
+// StartPaused starts the container and immediately pauses it.
+// This minimises the TOCTOU window between container start and probe attachment.
+func (s *Sandbox) StartPaused(ctx context.Context) error {
+	startCmd := exec.CommandContext(ctx, "docker", "start", s.containerID)
+	startCmd.Stdout = io.Discard
+	startCmd.Stderr = io.Discard
+
+	if err := startCmd.Run(); err != nil {
+		return fmt.Errorf("docker start failed: %w", err)
+	}
+
+	if err := s.Pause(ctx); err != nil {
+		return fmt.Errorf("immediate pause after start: %w", err)
+	}
+
+	return nil
+}
+
+// Start creates and starts the sandbox container (convenience for strace-container mode
+// which does not need the pause-before-probe pattern).
+func (s *Sandbox) Start(ctx context.Context) error {
+	if err := s.Create(ctx); err != nil {
+		return err
+	}
+
+	startCmd := exec.CommandContext(ctx, "docker", "start", s.containerID)
+	startCmd.Stdout = io.Discard
+	startCmd.Stderr = io.Discard
+
+	if err := startCmd.Run(); err != nil {
+		return fmt.Errorf("docker start failed: %w", err)
+	}
 
 	return nil
 }
@@ -104,7 +189,7 @@ func (s *Sandbox) InstallCommand() []string {
 		"--no-deps",
 		"--no-index",
 		"--find-links=/packages",
-		s.pkg,
+		"--", s.pkg,
 	}
 }
 
@@ -184,8 +269,13 @@ func (s *Sandbox) Unpause(ctx context.Context) error {
 	return nil
 }
 
-// Cleanup stops and removes the container.
+// Cleanup stops and removes the container, and cleans up temporary files.
 func (s *Sandbox) Cleanup(ctx context.Context) error {
+	if seccompDir != "" {
+		os.RemoveAll(seccompDir)
+		seccompDir = ""
+	}
+
 	cmd := exec.CommandContext(ctx, "docker", "rm", "-f", s.containerID)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
