@@ -305,8 +305,9 @@ func runStraceProbe(ctx context.Context, sb *sandbox.Sandbox, pkg string) (*scan
 }
 
 func runContainerStraceProbe(ctx context.Context, sb *sandbox.Sandbox, pkg string) (*scanResult, error) {
+	// Phase 1: Install with strace monitoring.
 	cp := probe.NewContainerStrace()
-	fmt.Fprintf(os.Stderr, "[*] Installing %s in sandbox (with strace)...\n", pkg)
+	fmt.Fprintf(os.Stderr, "[*] Phase 1/2: Installing %s in sandbox (with strace)...\n", pkg)
 
 	installOut, err := cp.StartAndInstall(ctx, sb.ContainerID(), sb.InstallCommand())
 	if err != nil {
@@ -318,6 +319,28 @@ func runContainerStraceProbe(ctx context.Context, sb *sandbox.Sandbox, pkg strin
 	var events []types.SyscallEvent
 	for evt := range cp.Events() {
 		events = append(events, evt)
+	}
+
+	// Phase 2: Import under each simulated OS to defeat platform-gated payloads.
+	// Malware that checks platform.system() == "Windows" will only fire on
+	// Windows — by patching the return value, we exercise all OS code paths.
+	importCmds := sb.ImportCommands()
+	osNames := []string{"Linux", "Windows", "macOS"}
+
+	for i, cmd := range importCmds {
+		label := osNames[i%len(osNames)]
+		fmt.Fprintf(os.Stderr, "[*] Phase 2/2: Importing %s (simulating %s)...\n", pkg, label)
+
+		ip := probe.NewContainerStrace()
+		importOut, importErr := ip.StartAndInstall(ctx, sb.ContainerID(), cmd)
+		if importErr != nil {
+			fmt.Fprintf(os.Stderr, "[!] Import (%s) failed (non-fatal): %v\n", label, importErr)
+			_ = importOut
+		}
+
+		for evt := range ip.Events() {
+			events = append(events, evt)
+		}
 	}
 
 	return &scanResult{

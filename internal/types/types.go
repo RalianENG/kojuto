@@ -22,16 +22,25 @@ type SyscallEvent struct {
 	DstPort   uint16    `json:"dst_port,omitempty"`
 }
 
+// StaticFinding represents a suspicious pattern found by static analysis.
+type StaticFinding struct {
+	File    string `json:"file"`
+	Line    int    `json:"line"`
+	Rule    string `json:"rule"`
+	Snippet string `json:"snippet"`
+}
+
 // Report is the final scan output.
 type Report struct {
-	Timestamp   time.Time      `json:"timestamp"`
-	Package     string         `json:"package"`
-	Version     string         `json:"version,omitempty"`
-	Ecosystem   string         `json:"ecosystem"`
-	Verdict     string         `json:"verdict"`
-	ProbeMethod string         `json:"probe_method"`
-	Events      []SyscallEvent `json:"events"`
-	LostSamples uint64         `json:"lost_samples,omitempty"`
+	Timestamp      time.Time       `json:"timestamp"`
+	Package        string          `json:"package"`
+	Version        string          `json:"version,omitempty"`
+	Ecosystem      string          `json:"ecosystem"`
+	Verdict        string          `json:"verdict"`
+	ProbeMethod    string          `json:"probe_method"`
+	Events         []SyscallEvent  `json:"events"`
+	StaticFindings []StaticFinding `json:"static_findings,omitempty"`
+	LostSamples    uint64          `json:"lost_samples,omitempty"`
 }
 
 // Verdict constants.

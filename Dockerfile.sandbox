@@ -13,8 +13,8 @@ RUN apt-get update && \
 
 RUN pip install --no-cache-dir pip setuptools wheel
 
-RUN useradd -m -s /bin/bash scanner && \
+RUN useradd -m -u 1000 -s /bin/bash dev && \
     chmod -R a+rw /usr/local/lib/python3.12/site-packages /usr/local/bin
 
 WORKDIR /install
-USER scanner
+USER dev
