@@ -18,6 +18,9 @@ var (
 	validVersion = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9.*!+_-]*$`)
 )
 
+// execCommand is a package-level variable for exec.CommandContext, allowing tests to mock it.
+var execCommand = exec.CommandContext
+
 // ValidatePackage checks that the package name and version are safe.
 func ValidatePackage(pkg, version string) error {
 	if !validPkgName.MatchString(pkg) {
@@ -77,7 +80,7 @@ func downloadPyPI(ctx context.Context, pkg, version, destDir string) (string, er
 		"-d", destDir,
 		target,
 	}
-	cmd := exec.CommandContext(ctx, "pip", args...)
+	cmd := execCommand(ctx, "pip", args...)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 
@@ -108,7 +111,7 @@ func downloadNpm(ctx context.Context, pkg, version, destDir string) (string, err
 		return "", fmt.Errorf("writing staging package.json: %w", err)
 	}
 
-	cmd := exec.CommandContext(ctx, "npm", "install", "--ignore-scripts")
+	cmd := execCommand(ctx, "npm", "install", "--ignore-scripts")
 	cmd.Dir = destDir
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr

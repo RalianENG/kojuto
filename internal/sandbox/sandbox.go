@@ -17,6 +17,10 @@ import (
 	"github.com/RalianENG/kojuto/internal/types"
 )
 
+// execCommand is the function used to create exec.Cmd instances.
+// Tests can replace this to avoid calling Docker.
+var execCommand = exec.CommandContext
+
 //go:embed seccomp.json
 var seccompProfile []byte
 
@@ -228,7 +232,7 @@ func (s *Sandbox) createIsolatedNetwork(ctx context.Context) error {
 	s.networkName = "kojuto-jail-" + strconv.Itoa(os.Getpid())
 
 	// Create an internal bridge network (no external gateway).
-	cmd := exec.CommandContext(ctx, "docker", "network", "create",
+	cmd := execCommand(ctx, "docker", "network", "create",
 		"--internal",
 		"--subnet=172.30.0.0/24",
 		s.networkName)
@@ -249,7 +253,7 @@ func (s *Sandbox) removeIsolatedNetwork(ctx context.Context) {
 		return
 	}
 
-	cmd := exec.CommandContext(ctx, "docker", "network", "rm", s.networkName)
+	cmd := execCommand(ctx, "docker", "network", "rm", s.networkName)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	_ = cmd.Run()
@@ -271,7 +275,7 @@ func (s *Sandbox) Create(ctx context.Context) error {
 	}
 
 	args := append([]string{"create"}, cArgs...)
-	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd := execCommand(ctx, "docker", args...)
 
 	out, err := cmd.Output()
 	if err != nil {
@@ -286,7 +290,7 @@ func (s *Sandbox) Create(ctx context.Context) error {
 // StartPaused starts the container and immediately pauses it.
 // This minimizes the TOCTOU window between container start and probe attachment.
 func (s *Sandbox) StartPaused(ctx context.Context) error {
-	startCmd := exec.CommandContext(ctx, "docker", "start", s.containerID)
+	startCmd := execCommand(ctx, "docker", "start", s.containerID)
 	startCmd.Stdout = io.Discard
 	startCmd.Stderr = io.Discard
 
@@ -314,7 +318,7 @@ func (s *Sandbox) Start(ctx context.Context) error {
 		return err
 	}
 
-	startCmd := exec.CommandContext(ctx, "docker", "start", s.containerID)
+	startCmd := execCommand(ctx, "docker", "start", s.containerID)
 	startCmd.Stdout = io.Discard
 	startCmd.Stderr = io.Discard
 
@@ -484,7 +488,7 @@ func (s *Sandbox) eraseFingerprints(ctx context.Context) {
 
 func (s *Sandbox) dockerExecRoot(ctx context.Context, args ...string) {
 	cmdArgs := append([]string{"exec", "--user=root", s.containerID}, args...)
-	cmd := exec.CommandContext(ctx, "docker", cmdArgs...)
+	cmd := execCommand(ctx, "docker", cmdArgs...)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	_ = cmd.Run()
@@ -493,7 +497,7 @@ func (s *Sandbox) dockerExecRoot(ctx context.Context, args ...string) {
 // Exec runs a command inside the sandbox container and returns the combined output.
 func (s *Sandbox) Exec(ctx context.Context, command []string) ([]byte, error) {
 	args := append([]string{"exec", s.containerID}, command...)
-	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd := execCommand(ctx, "docker", args...)
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -631,7 +635,7 @@ func (s *Sandbox) nodeImportCommands() [][]string {
 
 // PID returns the init PID of the sandbox container on the host.
 func (s *Sandbox) PID(ctx context.Context) (uint32, error) {
-	cmd := exec.CommandContext(ctx, "docker", "inspect", "-f", "{{.State.Pid}}", s.containerID)
+	cmd := execCommand(ctx, "docker", "inspect", "-f", "{{.State.Pid}}", s.containerID)
 
 	out, err := cmd.Output()
 	if err != nil {
@@ -653,7 +657,7 @@ func (s *Sandbox) ContainerID() string {
 
 // Logs returns the container logs.
 func (s *Sandbox) Logs(ctx context.Context) (string, error) {
-	cmd := exec.CommandContext(ctx, "docker", "logs", s.containerID)
+	cmd := execCommand(ctx, "docker", "logs", s.containerID)
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -665,7 +669,7 @@ func (s *Sandbox) Logs(ctx context.Context) (string, error) {
 
 // Pause freezes all processes in the container.
 func (s *Sandbox) Pause(ctx context.Context) error {
-	cmd := exec.CommandContext(ctx, "docker", "pause", s.containerID)
+	cmd := execCommand(ctx, "docker", "pause", s.containerID)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 
@@ -678,7 +682,7 @@ func (s *Sandbox) Pause(ctx context.Context) error {
 
 // Unpause resumes all processes in the container.
 func (s *Sandbox) Unpause(ctx context.Context) error {
-	cmd := exec.CommandContext(ctx, "docker", "unpause", s.containerID)
+	cmd := execCommand(ctx, "docker", "unpause", s.containerID)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 
@@ -696,7 +700,7 @@ func (s *Sandbox) Cleanup(ctx context.Context) error {
 		s.seccompDir = ""
 	}
 
-	cmd := exec.CommandContext(ctx, "docker", "rm", "-f", s.containerID)
+	cmd := execCommand(ctx, "docker", "rm", "-f", s.containerID)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 
@@ -712,7 +716,7 @@ func (s *Sandbox) Cleanup(ctx context.Context) error {
 
 // EnsureImage checks if the sandbox image exists, builds it if not.
 func EnsureImage(ctx context.Context, dockerfilePath string) error {
-	cmd := exec.CommandContext(ctx, "docker", "image", "inspect", SandboxImage)
+	cmd := execCommand(ctx, "docker", "image", "inspect", SandboxImage)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 
@@ -720,7 +724,7 @@ func EnsureImage(ctx context.Context, dockerfilePath string) error {
 		return nil // image exists
 	}
 
-	buildCmd := exec.CommandContext(ctx, "docker", "build", "-f", dockerfilePath, "-t", SandboxImage, ".")
+	buildCmd := execCommand(ctx, "docker", "build", "-f", dockerfilePath, "-t", SandboxImage, ".")
 	buildCmd.Stdout = io.Discard
 	buildCmd.Stderr = io.Discard
 
