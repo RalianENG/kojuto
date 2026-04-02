@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.3.0]
 
 ### Added
+- GitHub Action: `ecosystem`, `file`, `pin`, `local`, `runtime`, `timeout` inputs added to match full CLI capability; supports single, batch, and local scan modes
+- Cosign keyless signing for release checksums via GitHub OIDC (no GPG key management required)
+- `CONTRIBUTING.md` with development setup, commit conventions, syscall addition checklist, and release verification guide
+- `make help` target listing all available Makefile commands
+- CLI help: detailed `--help` output with prerequisites, long description, and usage examples for the `scan` command
+- Actionable error hints for missing Docker, pip/npm, timeout, and invalid input scenarios
+- Comprehensive unit test suite with mock infrastructure (TestHelperProcess pattern) — coverage 25% → 81%
+- Build-time version injection via ldflags (`kojuto version` now shows commit and build date)
 - `openat` syscall monitoring for sensitive file access detection (`.ssh/`, `.aws/`, `/etc/shadow`, `/proc/self/environ`, `.netrc`, `.git-credentials`, `.docker/config.json`, `.config/gh/`)
 - `rename`/`renameat`/`renameat2` syscall monitoring to detect trusted binary hijacking
 - `sendfile` added to strace trace list for forensic completeness
@@ -31,6 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Test coverage for new parsers (openat, rename), analyzer (rename trusted binary, openat, bind/listen/accept), and sandbox (honeypot token generation, sanitizeDockerArg)
 
 ### Changed
+- Documentation (README, Japanese docs, SPECIFICATION) updated to list all 13 monitored syscalls including `sendmmsg`, `bind`, `listen`, `accept`/`accept4`, `renameat`/`renameat2`, `sendfile`
+- `openat` sensitive path documentation expanded to include all 9 monitored paths (`.gnupg/`, `/proc/self/environ`, `.netrc`, `.docker/config.json`, `.config/gh/`)
+- GitHub Action README examples expanded to show batch and local scanning modes
+- Version string no longer hardcoded; injected at build time by GoReleaser
+- Removed unused `.golangci.bck.yml`
 - Custom seccomp profile is now always applied regardless of `--probe-method` (previously only applied when strace needed SYS_PTRACE)
 - `seccompDir` moved from global variable to per-`Sandbox` struct field (fixes race condition in concurrent scans)
 - `/usr/local/bin` tmpfs permissions tightened from `mode=1777` to `mode=0755`
