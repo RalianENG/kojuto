@@ -1,5 +1,10 @@
 # kojuto
 
+[![CI](https://github.com/RalianENG/kojuto/actions/workflows/ci.yml/badge.svg)](https://github.com/RalianENG/kojuto/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/RalianENG/kojuto/branch/main/graph/badge.svg)](https://codecov.io/gh/RalianENG/kojuto)
+[![Go Report Card](https://goreportcard.com/badge/github.com/RalianENG/kojuto)](https://goreportcard.com/report/github.com/RalianENG/kojuto)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 > Caught you. — Runtime syscall surveillance for package installations.
 
 [Remember Mar 30th 2026.](https://cloud.google.com/blog/topics/threat-intelligence/north-korea-threat-actor-targets-axios-npm-package)

@@ -52,12 +52,12 @@ jobs:
       - name: Unit tests
         run: go test -race -coverprofile coverage.txt -covermode atomic ./...
 
-      - name: Upload coverage
+      - name: Upload coverage to Codecov
         if: matrix.os == 'ubuntu-latest'
-        uses: actions/upload-artifact@v4
+        uses: codecov/codecov-action@v5
         with:
-          name: coverage
-          path: coverage.txt
+          files: coverage.txt
+          fail_ci_if_error: false
 
   # ──────────────────────────────────────────────
   # 3. Cross-compile — ensure all targets build
