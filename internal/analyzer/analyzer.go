@@ -1,6 +1,7 @@
 package analyzer
 
 import (
+	"math"
 	"net"
 	"path"
 	"strings"
@@ -53,6 +54,12 @@ func isBenignNetwork(evt *types.SyscallEvent) bool {
 	// Empty address means the parser failed to extract the destination.
 	// Treat as suspicious — a missed parse must not silence a real connection.
 	if evt.DstAddr == "" {
+		return false
+	}
+
+	// DNS tunneling check: even if the DNS server IP is benign (e.g. 8.8.8.8),
+	// the query domain itself may be carrying exfiltrated data.
+	if evt.DNSQuery != "" && isDNSTunnel(evt.DNSQuery) {
 		return false
 	}
 
@@ -376,4 +383,91 @@ func hasInlineExecFlag(cmdline string, flags []string) bool {
 
 func hasAllowedDir(dir string) bool {
 	return dir == "/usr/bin/" || dir == "/usr/local/bin/" || dir == "/bin/"
+}
+
+// DNS tunneling detection.
+//
+// Exfiltration via DNS encodes data in subdomain labels:
+//   aGVsbG8gd29ybGQ.evil.com  (base64 in subdomain)
+//   68656c6c6f.evil.com       (hex in subdomain)
+//
+// Heuristics:
+// 1. Any single label longer than 30 chars (normal labels rarely exceed 15).
+// 2. Total query length > 80 chars.
+// 3. High Shannon entropy in longest label (> 3.5 bits/char = encoded data).
+
+const (
+	dnsMaxLabelLen      = 30
+	dnsMaxQueryLen      = 80
+	dnsEntropyThreshold = 3.5
+)
+
+// benignDNSSuffixes are domain suffixes that are expected during package installation.
+// DNS queries to these are never flagged as tunneling regardless of label entropy.
+var benignDNSSuffixes = []string{
+	"pypi.org",
+	"pythonhosted.org",
+	"npmjs.org",
+	"npmjs.com",
+	"registry.npmjs.org",
+	"googleapis.com",
+	"debian.org",
+	"ubuntu.com",
+}
+
+// isDNSTunnel returns true if the DNS query domain shows signs of data exfiltration.
+func isDNSTunnel(query string) bool {
+	// Skip known-benign package registry domains.
+	lower := strings.ToLower(query)
+	for _, suffix := range benignDNSSuffixes {
+		if strings.HasSuffix(lower, suffix) {
+			return false
+		}
+	}
+
+	if len(query) > dnsMaxQueryLen {
+		return true
+	}
+
+	labels := strings.Split(query, ".")
+	// Need at least a subdomain + domain + TLD to be interesting.
+	if len(labels) < 3 {
+		return false
+	}
+
+	// Check subdomain labels (everything except the last two: domain + TLD).
+	for _, label := range labels[:len(labels)-2] {
+		if len(label) > dnsMaxLabelLen {
+			return true
+		}
+		if shannonEntropy(label) > dnsEntropyThreshold {
+			return true
+		}
+	}
+
+	return false
+}
+
+// shannonEntropy calculates the Shannon entropy (bits per character) of a string.
+// High entropy (> 3.5) indicates encoded/encrypted data rather than natural language.
+func shannonEntropy(s string) float64 {
+	if s == "" {
+		return 0
+	}
+
+	freq := make(map[rune]int)
+	for _, c := range s {
+		freq[c]++
+	}
+
+	length := float64(len(s))
+	entropy := 0.0
+	for _, count := range freq {
+		p := float64(count) / length
+		if p > 0 {
+			entropy -= p * math.Log2(p)
+		}
+	}
+
+	return entropy
 }

@@ -297,6 +297,63 @@ func TestAnalyze_BindListenAccept(t *testing.T) {
 	}
 }
 
+func TestAnalyze_DNSTunneling(t *testing.T) {
+	// DNS tunneling: sendto to loopback:53 with suspicious query.
+	// Using loopback so only the DNS query content determines the verdict
+	// (loopback is normally benign, but tunneling overrides that).
+	tunnelCases := []struct {
+		name  string
+		query string
+		want  string
+	}{
+		// Suspicious: base64-encoded data in subdomain.
+		{"base64 exfil", "aGVsbG8gd29ybGQgdGhpcyBpcyBhIHRlc3Q.evil.com", types.VerdictSuspicious},
+		// Suspicious: hex-encoded data in subdomain.
+		{"hex exfil", "68656c6c6f20776f726c6420746869732069732061.evil.com", types.VerdictSuspicious},
+		// Suspicious: very long query.
+		{"long query", "aaaaaaaaaa.bbbbbbbbbb.cccccccccc.dddddddddd.eeeeeeeeee.ffffffffff.gggggggggg.hhhhhhhhhh.evil.com", types.VerdictSuspicious},
+		// Clean: normal domain lookup (short labels, low entropy).
+		{"normal domain", "www.google.com", types.VerdictClean},
+		// Clean: pypi.org (benign suffix).
+		{"pypi lookup", "files.pythonhosted.org", types.VerdictClean},
+		// Clean: npm registry.
+		{"npm lookup", "registry.npmjs.org", types.VerdictClean},
+		// Clean: short subdomain.
+		{"short sub", "api.github.com", types.VerdictClean},
+		// Clean: only two labels (no subdomain to tunnel through).
+		{"two labels", "evil.com", types.VerdictClean},
+	}
+
+	for _, tc := range tunnelCases {
+		t.Run(tc.name, func(t *testing.T) {
+			events := []types.SyscallEvent{
+				{Syscall: types.EventSendto, DstAddr: "127.0.0.1", DstPort: 53, Family: 2, DNSQuery: tc.query},
+			}
+			verdict, _ := Analyze(events)
+			if verdict != tc.want {
+				t.Errorf("expected %s for query=%q, got %s", tc.want, tc.query, verdict)
+			}
+		})
+	}
+}
+
+func TestShannonEntropy(t *testing.T) {
+	// Low entropy: repeated character.
+	if e := shannonEntropy("aaaaaaa"); e > 0.1 {
+		t.Errorf("expected low entropy for 'aaaaaaa', got %f", e)
+	}
+
+	// High entropy: random-looking base64.
+	if e := shannonEntropy("aGVsbG8gd29ybGQ"); e < 3.0 {
+		t.Errorf("expected high entropy for base64, got %f", e)
+	}
+
+	// Empty string.
+	if e := shannonEntropy(""); e != 0 {
+		t.Errorf("expected 0 entropy for empty string, got %f", e)
+	}
+}
+
 func TestAnalyze_SedExcluded(t *testing.T) {
 	// sed is excluded from benignPaths because GNU sed -e can execute shell commands.
 	events := []types.SyscallEvent{

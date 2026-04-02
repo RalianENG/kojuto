@@ -1,6 +1,7 @@
 package probe
 
 import (
+	"encoding/hex"
 	"regexp"
 	"strconv"
 	"strings"
@@ -100,6 +101,10 @@ func parseStraceLine(line string) (types.SyscallEvent, bool) {
 	}
 
 	if evt, ok := parseConnectOrSendto(line, straceSendtoRe, types.EventSendto); ok {
+		// If port is 53, try to extract DNS query domain from the buffer.
+		if evt.DstPort == 53 {
+			evt.DNSQuery = extractDNSQuery(line)
+		}
 		return evt, true
 	}
 
@@ -282,4 +287,100 @@ func extractPID(line string) uint32 {
 	}
 
 	return uint32(p)
+}
+
+// straceSendtoBufRe captures the buffer content from sendto() output.
+// strace format: sendto(4, "...", len, flags, {sockaddr}).
+var straceSendtoBufRe = regexp.MustCompile(`sendto\(\d+,\s*"([^"]*)"`)
+
+// extractDNSQuery parses the DNS wire-format query domain from a sendto strace line.
+// DNS wire format: [header 12 bytes][question: label-length-prefixed name, type, class]
+// strace renders the buffer as C-escaped bytes: \x06google\x03com\0 → "google.com".
+func extractDNSQuery(line string) string {
+	matches := straceSendtoBufRe.FindStringSubmatch(line)
+	if matches == nil {
+		return ""
+	}
+
+	raw := unescapeStraceBuf(matches[1])
+	if len(raw) < 13 { // 12-byte header + at least 1 byte question.
+		return ""
+	}
+
+	// Skip 12-byte DNS header, parse question name.
+	return parseDNSName(raw[12:])
+}
+
+// unescapeStraceBuf converts strace's C-escaped buffer representation to bytes.
+// Handles: \xNN (hex), \NNN or \N (octal), \n, \t, \r, \\, and literal ASCII.
+func unescapeStraceBuf(s string) []byte {
+	var buf []byte
+	for i := 0; i < len(s); i++ {
+		if s[i] != '\\' {
+			buf = append(buf, s[i])
+			continue
+		}
+		if i+1 >= len(s) {
+			break
+		}
+		switch {
+		case s[i+1] == 'x' && i+4 <= len(s):
+			b, err := hex.DecodeString(s[i+2 : i+4])
+			if err == nil && len(b) == 1 {
+				buf = append(buf, b[0])
+				i += 3
+				continue
+			}
+			buf = append(buf, s[i])
+		case s[i+1] >= '0' && s[i+1] <= '7':
+			// Octal escape: \0, \00, \000, \1, \12, \123, etc.
+			val := 0
+			j := i + 1
+			for j < len(s) && j < i+4 && s[j] >= '0' && s[j] <= '7' {
+				val = val*8 + int(s[j]-'0')
+				j++
+			}
+			buf = append(buf, byte(val))
+			i = j - 1
+		case s[i+1] == 'n':
+			buf = append(buf, '\n')
+			i++
+		case s[i+1] == 't':
+			buf = append(buf, '\t')
+			i++
+		case s[i+1] == 'r':
+			buf = append(buf, '\r')
+			i++
+		case s[i+1] == '\\':
+			buf = append(buf, '\\')
+			i++
+		default:
+			buf = append(buf, s[i])
+		}
+	}
+	return buf
+}
+
+// parseDNSName reads a DNS wire-format label sequence from the question section.
+// Each label is preceded by its length byte. The sequence ends with a 0-byte.
+// Example: [6]google[3]com[0] → "google.com".
+func parseDNSName(data []byte) string {
+	var labels []string
+	i := 0
+	for i < len(data) {
+		labelLen := int(data[i])
+		if labelLen == 0 {
+			break
+		}
+		// Sanity: label length must be 1-63 per RFC 1035.
+		if labelLen > 63 || i+1+labelLen > len(data) {
+			break
+		}
+		labels = append(labels, string(data[i+1:i+1+labelLen]))
+		i += 1 + labelLen
+	}
+	if len(labels) == 0 {
+		return ""
+	}
+	return strings.Join(labels, ".")
 }

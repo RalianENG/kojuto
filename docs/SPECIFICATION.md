@@ -35,7 +35,7 @@ An OSS tool that detects suspicious syscalls during package installation and imp
 | Syscall | Target | Attack Example |
 |---|---|---|
 | `connect(2)` | Outbound TCP/UDP connections | Data exfiltration to C2 server |
-| `sendto(2)` | UDP send (without connect) | DNS-based data theft |
+| `sendto(2)` | UDP send (without connect) + DNS query extraction | DNS tunneling, data exfiltration |
 | `sendmsg(2)` | Message send | Bypassing connect-based detection |
 | `execve(2)` | Process creation | Malware binary execution, reverse shell |
 | `openat(2)` | File access (sensitive paths only) | Credential theft (`.ssh/`, `.aws/`, `/etc/shadow`) |
@@ -64,6 +64,18 @@ An OSS tool that detects suspicious syscalls during package installation and imp
 - Suspicious if `dst_path` overwrites a known trusted binary (e.g. `python3`, `node`, `sh` in `/usr/bin/` or `/usr/local/bin/`)
 - Benign if the destination is not a whitelisted binary (e.g. pip installing a new CLI script)
 
+### DNS Tunneling Detection
+
+- Extracts DNS query domain from `sendto` payload when destination port is 53
+- Parses DNS wire format (RFC 1035) to reconstruct the queried domain name
+- Events include `dns_query` field with the extracted domain
+- Heuristics for tunneling detection:
+  - Subdomain label length > 30 characters
+  - Total query length > 80 characters
+  - Shannon entropy > 3.5 bits/char in subdomain labels (indicates base64/hex-encoded data)
+- Benign suffixes excluded: `pypi.org`, `npmjs.org`, `pythonhosted.org`, `googleapis.com`, etc.
+- Loopback DNS queries with clean domains are treated as benign
+
 ---
 
 ## 3. Architecture
@@ -83,10 +95,11 @@ CLI (cobra)
   ├─ Probe            Syscall monitoring
   │   ├─ strace-container (default, full syscall coverage)
   │   ├─ strace (host-level, Linux only)
-  │   └─ eBPF (opt-in, connect+sendto+execve+openat+rename, fastest)
+  │   └─ eBPF (opt-in, full syscall parity with strace, fastest)
   │
   ├─ Analyzer         Event classification and risk assessment
   │   ├─ Network events: filter out loopback/unspecified/link-local
+  │   ├─ DNS tunneling: entropy-based detection of exfil via subdomains
   │   ├─ execve: path validation + shell command content inspection
   │   ├─ openat: sensitive file access detection (credentials, keys)
   │   ├─ rename: trusted binary hijacking detection

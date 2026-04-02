@@ -297,6 +297,81 @@ func TestIsSensitivePath(t *testing.T) {
 	}
 }
 
+func TestExtractDNSQuery(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		want string
+	}{
+		{
+			name: "standard A query",
+			line: `[pid 100] sendto(4, "\0\0\1\0\0\1\0\0\0\0\0\0\x06google\x03com\0\0\1\0\1", 28, 0, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, 16) = 28`,
+			want: "google.com",
+		},
+		{
+			name: "tunneling query",
+			line: `[pid 200] sendto(4, "\0\0\x01\0\0\x01\0\0\0\0\0\0\x0faGVsbG8gd29ybGQ\x04evil\x03com\0\0\x01\0\x01", 42, 0, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, 16) = 42`,
+			want: "aGVsbG8gd29ybGQ.evil.com",
+		},
+		{
+			name: "no buffer match",
+			line: `[pid 300] sendto(4, ..., 28, 0, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, 16) = 28`,
+			want: "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := extractDNSQuery(tc.line)
+			if got != tc.want {
+				t.Errorf("expected %q, got %q", tc.want, got)
+			}
+		})
+	}
+}
+
+func TestParseDNSName(t *testing.T) {
+	// \x06google\x03com\x00 → "google.com".
+	data := []byte{6, 'g', 'o', 'o', 'g', 'l', 'e', 3, 'c', 'o', 'm', 0}
+	if got := parseDNSName(data); got != "google.com" {
+		t.Errorf("expected google.com, got %q", got)
+	}
+
+	// Empty.
+	if got := parseDNSName([]byte{0}); got != "" {
+		t.Errorf("expected empty, got %q", got)
+	}
+}
+
+func TestUnescapeStraceBuf(t *testing.T) {
+	// \x06google\x03com\0.
+	input := `\x06google\x03com\0`
+	got := unescapeStraceBuf(input)
+	expected := []byte{6, 'g', 'o', 'o', 'g', 'l', 'e', 3, 'c', 'o', 'm', 0}
+	if len(got) != len(expected) {
+		t.Fatalf("length mismatch: got %d, want %d", len(got), len(expected))
+	}
+	for i := range expected {
+		if got[i] != expected[i] {
+			t.Errorf("byte %d: got %d, want %d", i, got[i], expected[i])
+		}
+	}
+
+	// Tunneling payload: 15-char label + "evil" + "com".
+	input2 := `\0\0\x01\0\0\x01\0\0\0\0\0\0\x0faGVsbG8gd29ybGQ\x04evil\x03com\0\0\x01\0\x01`
+	got2 := unescapeStraceBuf(input2)
+	// Byte 12 = 0x0f (15), bytes 13-27 = "aGVsbG8gd29ybGQ", byte 28 = 4.
+	if len(got2) < 28 {
+		t.Fatalf("tunneling unescape too short: %d bytes: %v", len(got2), got2)
+	}
+	if got2[12] != 15 {
+		t.Errorf("label len at byte 12: got %d, want 15", got2[12])
+	}
+	if got2[28] != 4 {
+		t.Errorf("label len at byte 28: got %d, want 4", got2[28])
+	}
+}
+
 func TestParseStraceLine_NoPID(t *testing.T) {
 	line := `connect(3, {sa_family=AF_INET, sin_port=htons(8080), sin_addr=inet_addr("127.0.0.1")}, 16) = 0`
 

@@ -26,6 +26,7 @@ type SyscallEvent struct {
 	OpenFlags string    `json:"open_flags,omitempty"`
 	SrcPath   string    `json:"src_path,omitempty"`
 	DstPath   string    `json:"dst_path,omitempty"`
+	DNSQuery  string    `json:"dns_query,omitempty"`
 	Syscall   string    `json:"syscall"`
 	PID       uint32    `json:"pid"`
 	Family    uint16    `json:"family,omitempty"`

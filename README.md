@@ -23,7 +23,7 @@ The sandbox is intentionally seeded with realistic artifacts to provoke maliciou
 
 All values are randomly generated per scan to prevent signature-based evasion and ensure unique execution environments.
 
-`openat` detects credential access (`.ssh/`, `.aws/`, `/etc/shadow`) and `rename` detects trusted binary replacement. Additionally, `sendfile` is traced for forensic purposes but not parsed into structured events.
+`openat` detects credential access (`.ssh/`, `.aws/`, `/etc/shadow`), `rename` detects trusted binary replacement, and DNS tunneling detection extracts query domains from `sendto` payloads to flag high-entropy subdomains used for data exfiltration. `sendfile` is traced for forensic purposes but not parsed into structured events.
 
 Well-behaved packages typically do not make unexpected network connections, spawn unrelated processes, access credential files, or modify trusted binaries during install or import. Any such activity is treated as suspicious and surfaced for review.
 
@@ -139,6 +139,15 @@ sudo ./scripts/setup-caps.sh ./kojuto
       "syscall": "rename",
       "src_path": "/tmp/python3",
       "dst_path": "/usr/local/bin/python3"
+    },
+    {
+      "timestamp": "2026-04-01T12:00:05Z",
+      "pid": 1238,
+      "syscall": "sendto",
+      "dst_addr": "8.8.8.8",
+      "dst_port": 53,
+      "family": 2,
+      "dns_query": "aGVsbG8gd29ybGQ.evil.com"
     }
   ]
 }
