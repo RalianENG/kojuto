@@ -17,7 +17,7 @@ A supply chain attack detection tool that monitors syscalls during package insta
 
 1. **Download** — Fetch the target package to the host (network allowed)
 2. **Isolate** — Run installation inside a hardened Docker container with network isolation
-3. **Install + Monitor** — Record `connect`, `sendto`, `sendmsg`, `execve`, `openat`, and `rename` syscalls via strace (or eBPF)
+3. **Install + Monitor** — Record `connect`, `sendto`, `sendmsg`, `sendmmsg`, `bind`, `listen`, `accept`, `execve`, `openat`, `rename`, and `sendfile` syscalls via strace (or eBPF)
 4. **Import + Monitor** — Import/require the package under 3 simulated OS identities (Linux, Windows, macOS) with time shifted +30 days via `libfaketime` to trigger platform-gated and date-gated payloads
 5. **Report** — Output findings as JSON
 
@@ -28,7 +28,7 @@ The sandbox is intentionally seeded with realistic artifacts to provoke maliciou
 
 All values are randomly generated per scan to prevent signature-based evasion and ensure unique execution environments.
 
-`openat` detects credential access (`.ssh/`, `.aws/`, `/etc/shadow`), `rename` detects trusted binary replacement, and DNS tunneling detection extracts query domains from `sendto` payloads to flag high-entropy subdomains used for data exfiltration. `sendfile` is traced for forensic purposes but not parsed into structured events.
+`openat` detects credential access (`.ssh/`, `.gnupg/`, `.aws/`, `/etc/shadow`, `/proc/self/environ`, `.netrc`, `.git-credentials`, `.docker/config.json`, `.config/gh/`), `rename` detects trusted binary replacement, `bind`/`listen`/`accept` detect backdoor server setup, and DNS tunneling detection extracts query domains from `sendto` payloads to flag high-entropy subdomains used for data exfiltration. `sendfile` is traced for forensic purposes but not parsed into structured events.
 
 Well-behaved packages typically do not make unexpected network connections, spawn unrelated processes, access credential files, or modify trusted binaries during install or import. Any such activity is treated as suspicious and surfaced for review.
 
@@ -171,7 +171,6 @@ sudo ./scripts/setup-caps.sh ./kojuto
   with:
     package: your-dependency
     version: '2.31.0'        # optional
-    ecosystem: pypi           # optional: pypi, npm
     probe-method: auto        # optional: auto, ebpf, strace, strace-container
 ```
 
