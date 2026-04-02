@@ -6,6 +6,11 @@ import (
 	"github.com/RalianENG/kojuto/internal/types"
 )
 
+const (
+	testMountPoint = "/home/dev/projects"
+	envCmd         = "env"
+)
+
 func TestNew(t *testing.T) {
 	sb := New("/tmp/pkg", "testpkg", true, types.EcosystemPyPI, "")
 
@@ -39,7 +44,7 @@ func TestNew_GVisor(t *testing.T) {
 
 func TestInstallCommand_PyPI(t *testing.T) {
 	sb := New("/mnt/packages", "requests", false, types.EcosystemPyPI, "")
-	sb.mountPoint = "/home/dev/projects"
+	sb.mountPoint = testMountPoint
 
 	cmd := sb.InstallCommand()
 	if len(cmd) == 0 {
@@ -96,7 +101,7 @@ func TestImportCommands_PyPI(t *testing.T) {
 
 	// Each should start with "env" (faketime wrapper).
 	for i, cmd := range cmds {
-		if cmd[0] != "env" {
+		if cmd[0] != envCmd {
 			t.Errorf("cmd[%d] should start with 'env', got %q", i, cmd[0])
 		}
 		// Should contain python3.
@@ -121,7 +126,7 @@ func TestImportCommands_Npm(t *testing.T) {
 	}
 
 	for i, cmd := range cmds {
-		if cmd[0] != "env" {
+		if cmd[0] != envCmd {
 			t.Errorf("cmd[%d] should start with 'env', got %q", i, cmd[0])
 		}
 		hasNode := false
@@ -204,7 +209,7 @@ func TestWrapWithFaketime(t *testing.T) {
 	cmd := []string{"python3", "/tmp/script.py"}
 	wrapped := wrapWithFaketime(cmd)
 
-	if wrapped[0] != "env" {
+	if wrapped[0] != envCmd {
 		t.Errorf("expected first arg 'env', got %q", wrapped[0])
 	}
 

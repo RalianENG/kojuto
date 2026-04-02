@@ -1,6 +1,9 @@
 package types
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestEventConstants(t *testing.T) {
 	events := map[string]string{
@@ -46,24 +49,30 @@ func TestEcosystemConstants(t *testing.T) {
 }
 
 func TestSyscallEventJSON(t *testing.T) {
-	// Verify omitempty fields — SyscallEvent with only required fields
-	// should serialize without optional fields.
+	// Verify omitempty: a minimal event should omit optional fields in JSON.
 	evt := SyscallEvent{
 		Syscall: EventConnect,
 		PID:     1234,
 	}
 
-	if evt.Syscall != EventConnect {
-		t.Errorf("Syscall = %q, want %q", evt.Syscall, EventConnect)
+	data, err := json.Marshal(evt)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
 	}
-	if evt.DstAddr != "" {
-		t.Error("DstAddr should be empty")
+
+	var decoded map[string]interface{}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
 	}
-	if evt.Cmdline != "" {
-		t.Error("Cmdline should be empty")
+
+	if decoded["syscall"] != EventConnect {
+		t.Errorf("syscall = %v, want %q", decoded["syscall"], EventConnect)
 	}
-	if evt.FilePath != "" {
-		t.Error("FilePath should be empty")
+	// omitempty fields should be absent from JSON.
+	for _, key := range []string{"dst_addr", "cmdline", "file_path", "src_path", "dst_path", "dns_query"} {
+		if _, ok := decoded[key]; ok {
+			t.Errorf("expected %q to be omitted from JSON", key)
+		}
 	}
 }
 
@@ -75,13 +84,23 @@ func TestReportStructure(t *testing.T) {
 		Events:    []SyscallEvent{},
 	}
 
-	if r.Package != "test" {
-		t.Errorf("Package = %q, want 'test'", r.Package)
+	data, err := json.Marshal(r)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
 	}
-	if len(r.Events) != 0 {
-		t.Errorf("Events length = %d, want 0", len(r.Events))
+
+	var decoded Report
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
 	}
-	if r.LostSamples != 0 {
-		t.Errorf("LostSamples = %d, want 0", r.LostSamples)
+
+	if decoded.Package != "test" {
+		t.Errorf("Package = %q, want 'test'", decoded.Package)
+	}
+	if len(decoded.Events) != 0 {
+		t.Errorf("Events length = %d, want 0", len(decoded.Events))
+	}
+	if decoded.LostSamples != 0 {
+		t.Errorf("LostSamples = %d, want 0", decoded.LostSamples)
 	}
 }

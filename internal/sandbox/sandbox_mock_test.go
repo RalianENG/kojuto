@@ -12,6 +12,8 @@ import (
 	"github.com/RalianENG/kojuto/internal/types"
 )
 
+const fakeContainerID = "fake-id"
+
 // fakeExecCommand returns an *exec.Cmd that re-invokes the test binary
 // with TestHelperProcess as the entry point instead of calling Docker.
 func fakeExecCommand(ctx context.Context, name string, args ...string) *exec.Cmd {
@@ -32,7 +34,7 @@ func withFakeExec(t *testing.T) {
 
 // TestHelperProcess is the fake subprocess spawned by fakeExecCommand.
 // It inspects the arguments after "--" and prints appropriate output.
-func TestHelperProcess(t *testing.T) {
+func TestHelperProcess(_ *testing.T) {
 	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
 		return
 	}
@@ -226,7 +228,7 @@ func TestRemoveIsolatedNetwork(t *testing.T) {
 func TestRemoveIsolatedNetwork_None(t *testing.T) {
 	withFakeExec(t)
 	sb := newTestSandbox(t, types.EcosystemPyPI)
-	sb.networkName = "none"
+	sb.networkName = networkNone
 
 	// Should return early without calling docker.
 	sb.removeIsolatedNetwork(context.Background())
@@ -266,7 +268,7 @@ func TestCreate(t *testing.T) {
 func TestStartPaused(t *testing.T) {
 	withFakeExec(t)
 	sb := newTestSandbox(t, types.EcosystemPyPI)
-	sb.containerID = "fake-id"
+	sb.containerID = fakeContainerID
 	sb.networkName = "test-net"
 
 	err := sb.StartPaused(context.Background())
@@ -296,7 +298,7 @@ func TestStart(t *testing.T) {
 func TestDockerExecRoot(t *testing.T) {
 	withFakeExec(t)
 	sb := newTestSandbox(t, types.EcosystemPyPI)
-	sb.containerID = "fake-id"
+	sb.containerID = fakeContainerID
 
 	// Should not panic or error (errors are silently discarded).
 	sb.dockerExecRoot(context.Background(), "ls", "-la")
@@ -305,7 +307,7 @@ func TestDockerExecRoot(t *testing.T) {
 func TestExec(t *testing.T) {
 	withFakeExec(t)
 	sb := newTestSandbox(t, types.EcosystemPyPI)
-	sb.containerID = "fake-id"
+	sb.containerID = fakeContainerID
 
 	out, err := sb.Exec(context.Background(), []string{"echo", "hello"})
 	if err != nil {
@@ -319,8 +321,8 @@ func TestExec(t *testing.T) {
 func TestInstallPackage(t *testing.T) {
 	withFakeExec(t)
 	sb := newTestSandbox(t, types.EcosystemPyPI)
-	sb.containerID = "fake-id"
-	sb.mountPoint = "/home/dev/projects"
+	sb.containerID = fakeContainerID
+	sb.mountPoint = testMountPoint
 
 	_, err := sb.InstallPackage(context.Background())
 	if err != nil {
@@ -331,8 +333,8 @@ func TestInstallPackage(t *testing.T) {
 func TestInstallPackage_Npm(t *testing.T) {
 	withFakeExec(t)
 	sb := newTestSandbox(t, types.EcosystemNpm)
-	sb.containerID = "fake-id"
-	sb.mountPoint = "/home/dev/projects"
+	sb.containerID = fakeContainerID
+	sb.mountPoint = testMountPoint
 
 	_, err := sb.InstallPackage(context.Background())
 	if err != nil {
@@ -343,7 +345,7 @@ func TestInstallPackage_Npm(t *testing.T) {
 func TestWriteProbeScripts(t *testing.T) {
 	withFakeExec(t)
 	sb := newTestSandbox(t, types.EcosystemPyPI)
-	sb.containerID = "fake-id"
+	sb.containerID = fakeContainerID
 
 	// Should not panic.
 	sb.WriteProbeScripts(context.Background())
@@ -352,7 +354,7 @@ func TestWriteProbeScripts(t *testing.T) {
 func TestWriteProbeScripts_Npm(t *testing.T) {
 	withFakeExec(t)
 	sb := New(t.TempDir(), "lodash", false, types.EcosystemNpm, "")
-	sb.containerID = "fake-id"
+	sb.containerID = fakeContainerID
 
 	sb.WriteProbeScripts(context.Background())
 }
@@ -360,7 +362,7 @@ func TestWriteProbeScripts_Npm(t *testing.T) {
 func TestPID(t *testing.T) {
 	withFakeExec(t)
 	sb := newTestSandbox(t, types.EcosystemPyPI)
-	sb.containerID = "fake-id"
+	sb.containerID = fakeContainerID
 
 	pid, err := sb.PID(context.Background())
 	if err != nil {
@@ -375,7 +377,7 @@ func TestPID(t *testing.T) {
 func TestLogs(t *testing.T) {
 	withFakeExec(t)
 	sb := newTestSandbox(t, types.EcosystemPyPI)
-	sb.containerID = "fake-id"
+	sb.containerID = fakeContainerID
 
 	out, err := sb.Logs(context.Background())
 	if err != nil {
@@ -390,7 +392,7 @@ func TestLogs(t *testing.T) {
 func TestPause(t *testing.T) {
 	withFakeExec(t)
 	sb := newTestSandbox(t, types.EcosystemPyPI)
-	sb.containerID = "fake-id"
+	sb.containerID = fakeContainerID
 
 	if err := sb.Pause(context.Background()); err != nil {
 		t.Fatalf("Pause: %v", err)
@@ -400,7 +402,7 @@ func TestPause(t *testing.T) {
 func TestUnpause(t *testing.T) {
 	withFakeExec(t)
 	sb := newTestSandbox(t, types.EcosystemPyPI)
-	sb.containerID = "fake-id"
+	sb.containerID = fakeContainerID
 
 	if err := sb.Unpause(context.Background()); err != nil {
 		t.Fatalf("Unpause: %v", err)
@@ -410,7 +412,7 @@ func TestUnpause(t *testing.T) {
 func TestCleanup(t *testing.T) {
 	withFakeExec(t)
 	sb := newTestSandbox(t, types.EcosystemPyPI)
-	sb.containerID = "fake-id"
+	sb.containerID = fakeContainerID
 	sb.networkName = "kojuto-jail-test"
 
 	// Create a seccomp temp dir to verify cleanup removes it.
@@ -429,8 +431,8 @@ func TestCleanup(t *testing.T) {
 func TestCleanup_NoSeccomp(t *testing.T) {
 	withFakeExec(t)
 	sb := newTestSandbox(t, types.EcosystemPyPI)
-	sb.containerID = "fake-id"
-	sb.networkName = "none"
+	sb.containerID = fakeContainerID
+	sb.networkName = networkNone
 
 	if err := sb.Cleanup(context.Background()); err != nil {
 		t.Fatalf("Cleanup: %v", err)
@@ -450,7 +452,7 @@ func TestEnsureImage_Exists(t *testing.T) {
 func TestEraseFingerprints(t *testing.T) {
 	withFakeExec(t)
 	sb := newTestSandbox(t, types.EcosystemPyPI)
-	sb.containerID = "fake-id"
+	sb.containerID = fakeContainerID
 
 	// Should not panic.
 	sb.eraseFingerprints(context.Background())
@@ -459,7 +461,7 @@ func TestEraseFingerprints(t *testing.T) {
 func TestPlantHoneypotFiles(t *testing.T) {
 	withFakeExec(t)
 	sb := newTestSandbox(t, types.EcosystemPyPI)
-	sb.containerID = "fake-id"
+	sb.containerID = fakeContainerID
 
 	// Should not panic.
 	sb.plantHoneypotFiles(context.Background())
@@ -468,8 +470,8 @@ func TestPlantHoneypotFiles(t *testing.T) {
 func TestRestoreLocalBin_PyPI(t *testing.T) {
 	withFakeExec(t)
 	sb := newTestSandbox(t, types.EcosystemPyPI)
-	sb.containerID = "fake-id"
-	sb.mountPoint = "/home/dev/projects"
+	sb.containerID = fakeContainerID
+	sb.mountPoint = testMountPoint
 
 	sb.restoreLocalBin(context.Background())
 }
@@ -477,8 +479,8 @@ func TestRestoreLocalBin_PyPI(t *testing.T) {
 func TestRestoreLocalBin_Npm(t *testing.T) {
 	withFakeExec(t)
 	sb := New(t.TempDir(), "lodash", false, types.EcosystemNpm, "")
-	sb.containerID = "fake-id"
-	sb.mountPoint = "/home/dev/projects"
+	sb.containerID = fakeContainerID
+	sb.mountPoint = testMountPoint
 
 	// For npm, restoreLocalBin also copies node_modules.
 	sb.restoreLocalBin(context.Background())

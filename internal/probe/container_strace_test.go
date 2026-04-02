@@ -192,7 +192,7 @@ func TestParseStraceOutput(t *testing.T) {
 	}
 }
 
-func TestParseStraceOutput_Done(t *testing.T) {
+func TestParseStraceOutput_Done(_ *testing.T) {
 	// Verify that parseStraceOutput exits when c.done is closed.
 	cs := &ContainerStrace{
 		events: make(chan types.SyscallEvent), // unbuffered — will block
@@ -201,7 +201,7 @@ func TestParseStraceOutput_Done(t *testing.T) {
 
 	// Many lines to ensure it would block on the channel send.
 	var lines []string
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		lines = append(lines, `[pid 100] connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("1.2.3.4")}, 16) = 0`)
 	}
 	reader := io.NopCloser(strings.NewReader(strings.Join(lines, "\n")))

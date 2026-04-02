@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -291,7 +292,7 @@ func TestVersionCmd(t *testing.T) {
 	}
 }
 
-func TestPrintVerdict(t *testing.T) {
+func TestPrintVerdict(_ *testing.T) {
 	// Just ensure printVerdict doesn't panic for each verdict type.
 	// Output goes to stderr which we don't capture, but no panic = pass.
 	printVerdict(types.VerdictClean, 0, 0)
@@ -348,7 +349,7 @@ func TestOutputReport_Clean(t *testing.T) {
 
 	dir := t.TempDir()
 	flagOutput = filepath.Join(dir, "report.json")
-	flagVersion = "1.0.0"
+	flagVersion = testVersion
 	flagEcosystem = types.EcosystemPyPI
 
 	result := &scanResult{
@@ -386,7 +387,7 @@ func TestOutputReport_Suspicious(t *testing.T) {
 
 	dir := t.TempDir()
 	flagOutput = filepath.Join(dir, "report.json")
-	flagVersion = "1.0.0"
+	flagVersion = testVersion
 	flagEcosystem = types.EcosystemPyPI
 
 	// A listen event is always suspicious per the analyzer.
@@ -426,7 +427,7 @@ func TestOutputReport_Inconclusive(t *testing.T) {
 
 	dir := t.TempDir()
 	flagOutput = filepath.Join(dir, "report.json")
-	flagVersion = "1.0.0"
+	flagVersion = testVersion
 	flagEcosystem = types.EcosystemPyPI
 
 	result := &scanResult{
@@ -461,7 +462,7 @@ func TestGetPIDNSInode_NonLinux(t *testing.T) {
 }
 
 func TestRunProbeAndInstall_UnknownMethod(t *testing.T) {
-	_, err := runProbeAndInstall(nil, nil, "test-pkg", "unknown-method")
+	_, err := runProbeAndInstall(context.TODO(), nil, "test-pkg", "unknown-method")
 	if err == nil {
 		t.Fatal("expected error for unknown probe method")
 	}

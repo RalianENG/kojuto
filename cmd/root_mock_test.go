@@ -17,8 +17,14 @@ import (
 	"github.com/RalianENG/kojuto/internal/types"
 )
 
+const (
+	testVersion     = "1.0.0"
+	testVersion2310 = "2.31.0"
+	testReqFile     = "requirements.txt"
+)
+
 // TestHelperProcess is used by fakeExecCommand to mock external commands.
-func TestHelperProcess(t *testing.T) {
+func TestHelperProcess(_ *testing.T) {
 	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
 		return
 	}
@@ -100,7 +106,7 @@ func TestScanSinglePackage_InvalidInput(t *testing.T) {
 	saveAndRestoreDeps(t)
 
 	flagTimeout = 5 * time.Second
-	downloaderValidate = func(pkg, version string) error {
+	downloaderValidate = func(pkg, _ string) error {
 		return fmt.Errorf("invalid package: %s", pkg)
 	}
 
@@ -136,7 +142,7 @@ func TestScanSinglePackage_DownloadFailure(t *testing.T) {
 	flagTimeout = 5 * time.Second
 	downloaderValidate = func(_, _ string) error { return nil }
 	downloaderDownload = func(_ context.Context, _, _, _, _ string) (string, error) {
-		return "", fmt.Errorf("download failed: network error")
+		return "", errors.New("download failed: network error")
 	}
 
 	_, err := scanSinglePackage("pkg", "", types.EcosystemPyPI)
@@ -161,13 +167,13 @@ func TestDownloadPackage_Success(t *testing.T) {
 	pkgDir := filepath.Join(tmpDir, "packages")
 	os.MkdirAll(pkgDir, 0o755)
 
-	downloaderDownload = func(_ context.Context, pkg, version, destDir, ecosystem string) (string, error) {
+	downloaderDownload = func(_ context.Context, _, _, destDir, _ string) (string, error) {
 		// Create a fake wheel file.
 		os.WriteFile(filepath.Join(destDir, "requests-2.31.0-py3-none-any.whl"), []byte("fake"), 0o644)
 		return destDir, nil
 	}
-	downloaderDetectVersion = func(dir, pkg string) string {
-		return "2.31.0"
+	downloaderDetectVersion = func(_, _ string) string {
+		return testVersion2310
 	}
 
 	ctx := context.Background()
@@ -180,8 +186,8 @@ func TestDownloadPackage_Success(t *testing.T) {
 	if dlDir == "" {
 		t.Error("expected non-empty dlDir")
 	}
-	if flagVersion != "2.31.0" {
-		t.Errorf("flagVersion = %q, want 2.31.0", flagVersion)
+	if flagVersion != testVersion2310 {
+		t.Errorf("flagVersion = %q, want %s", flagVersion, testVersion2310)
 	}
 }
 
@@ -193,7 +199,7 @@ func TestDownloadPackage_Failure(t *testing.T) {
 	flagVersion = ""
 
 	downloaderDownload = func(_ context.Context, _, _, _, _ string) (string, error) {
-		return "", fmt.Errorf("pip not found")
+		return "", errors.New("pip not found")
 	}
 
 	ctx := context.Background()
@@ -213,7 +219,7 @@ func TestStartSandbox_EnsureImageFailure(t *testing.T) {
 	saveAndRestoreDeps(t)
 
 	sandboxEnsureImage = func(_ context.Context, _ string) error {
-		return fmt.Errorf("docker not found")
+		return errors.New("docker not found")
 	}
 
 	ctx := context.Background()
@@ -233,8 +239,8 @@ func TestRunBatchScan_ParseError(t *testing.T) {
 	saveAndRestoreDeps(t)
 
 	flagFile = "/nonexistent/requirements.txt"
-	depfileParse = func(path string) ([]depfile.Dep, string, error) {
-		return nil, "", fmt.Errorf("file not found")
+	depfileParse = func(_ string) ([]depfile.Dep, string, error) {
+		return nil, "", errors.New("file not found")
 	}
 
 	err := runBatchScan(nil)
@@ -247,7 +253,7 @@ func TestRunBatchScan_EmptyDeps(t *testing.T) {
 	saveAndRestoreFlags(t)
 	saveAndRestoreDeps(t)
 
-	flagFile = "requirements.txt"
+	flagFile = testReqFile
 	depfileParse = func(_ string) ([]depfile.Dep, string, error) {
 		return []depfile.Dep{}, types.EcosystemPyPI, nil
 	}
@@ -284,13 +290,13 @@ func TestRunBatchScan_WithSuspicious(t *testing.T) {
 	saveAndRestoreFlags(t)
 	saveAndRestoreDeps(t)
 
-	flagFile = "requirements.txt"
+	flagFile = testReqFile
 	flagTimeout = 5 * time.Second
 	flagPin = ""
 
 	depfileParse = func(_ string) ([]depfile.Dep, string, error) {
 		return []depfile.Dep{
-			{Name: "evil-pkg", Version: "1.0.0"},
+			{Name: "evil-pkg", Version: testVersion},
 		}, types.EcosystemPyPI, nil
 	}
 	downloaderValidate = func(_, _ string) error { return nil }
@@ -298,17 +304,14 @@ func TestRunBatchScan_WithSuspicious(t *testing.T) {
 		os.WriteFile(filepath.Join(destDir, "evil_pkg-1.0.0.whl"), []byte("x"), 0o644)
 		return destDir, nil
 	}
-	downloaderDetectVersion = func(_, _ string) string { return "1.0.0" }
-	sandboxEnsureImage = func(_ context.Context, _ string) error { return nil }
-
-	// Return a sandbox whose Start succeeds but probe finds suspicious events.
+	downloaderDetectVersion = func(_, _ string) string { return testVersion }
 	sandboxNew = func(packageDir, pkg string, needsPtrace bool, ecosystem, runtime string) *sandbox.Sandbox {
 		return sandbox.New(packageDir, pkg, needsPtrace, ecosystem, runtime)
 	}
 
 	// Make sandbox operations fail to trigger scanErr path.
 	sandboxEnsureImage = func(_ context.Context, _ string) error {
-		return fmt.Errorf("intentional failure")
+		return errors.New("intentional failure")
 	}
 
 	err := runBatchScan(nil)
@@ -322,13 +325,13 @@ func TestRunBatchScan_AllCleanWithPin(t *testing.T) {
 	saveAndRestoreDeps(t)
 
 	dir := t.TempDir()
-	flagFile = "requirements.txt"
+	flagFile = testReqFile
 	flagTimeout = 5 * time.Second
 	flagPin = filepath.Join(dir, "locked.txt")
 
 	depfileParse = func(_ string) ([]depfile.Dep, string, error) {
 		return []depfile.Dep{
-			{Name: "requests", Version: "2.31.0"},
+			{Name: "requests", Version: testVersion2310},
 		}, types.EcosystemPyPI, nil
 	}
 	downloaderValidate = func(_, _ string) error { return nil }
@@ -338,15 +341,12 @@ func TestRunBatchScan_AllCleanWithPin(t *testing.T) {
 		os.WriteFile(filepath.Join(destDir, "requests-2.31.0.whl"), []byte("x"), 0o644)
 		return destDir, nil
 	}
-	downloaderDetectVersion = func(_, _ string) string { return "2.31.0" }
+	downloaderDetectVersion = func(_, _ string) string { return testVersion2310 }
 	sandboxEnsureImage = func(_ context.Context, _ string) error { return nil }
 
-	// We need sandboxNew to return a sandbox that can be started.
-	// This will fail at sandbox.Start because there's no Docker, but
-	// we can't fully mock sandbox internals from here. Let's make the
-	// scan fail gracefully and check the error path.
+	// Will fail at sandbox.Start because there's no Docker, but
+	// tests the batch logic up to that point.
 	err := runBatchScan(nil)
-	// Will fail at sandbox start, but tests the batch logic up to that point.
 	if err == nil {
 		// If somehow it succeeds, check pin file was created.
 		if _, statErr := os.Stat(flagPin); statErr != nil {
@@ -383,18 +383,14 @@ func TestRunLocalScan_Directory(t *testing.T) {
 	flagEcosystem = types.EcosystemPyPI
 	flagTimeout = 5 * time.Second
 
-	downloaderDetectVersion = func(_, _ string) string { return "1.0.0" }
+	downloaderDetectVersion = func(_, _ string) string { return testVersion }
 	sandboxEnsureImage = func(_ context.Context, _ string) error {
-		return fmt.Errorf("no docker for test")
+		return errors.New("no docker for test")
 	}
 
 	err := runLocalScan(nil)
 	if err == nil {
 		t.Fatal("expected error (no Docker)")
-	}
-	// Should have gotten past the directory detection to sandbox start.
-	if !strings.Contains(err.Error(), "sandbox") && !strings.Contains(err.Error(), "docker") {
-		// Acceptable — the error should come from sandbox/docker layer.
 	}
 }
 
@@ -412,7 +408,7 @@ func TestRunLocalScan_SingleFile(t *testing.T) {
 
 	downloaderDetectVersion = func(_, _ string) string { return "2.0.0" }
 	sandboxEnsureImage = func(_ context.Context, _ string) error {
-		return fmt.Errorf("no docker")
+		return errors.New("no docker")
 	}
 
 	err := runLocalScan(nil)
@@ -433,7 +429,7 @@ func TestRunLocalScan_NpmAutoDetect(t *testing.T) {
 	flagEcosystem = types.EcosystemPyPI // should auto-detect to npm
 	flagTimeout = 5 * time.Second
 
-	downloaderDetectVersion = func(_, _ string) string { return "1.0.0" }
+	downloaderDetectVersion = func(_, _ string) string { return testVersion }
 	execCommandCmd = fakeExecCommand
 
 	// prepareLocalNpm will fail because no real tgz.
@@ -521,10 +517,10 @@ func TestRunScan_BatchMode(t *testing.T) {
 	saveAndRestoreDeps(t)
 
 	flagLocal = ""
-	flagFile = "requirements.txt"
+	flagFile = testReqFile
 
 	depfileParse = func(_ string) ([]depfile.Dep, string, error) {
-		return nil, "", fmt.Errorf("parse error")
+		return nil, "", errors.New("parse error")
 	}
 
 	err := runScan(nil, nil)
@@ -558,7 +554,7 @@ func TestRunBatchScan_EcosystemOverride(t *testing.T) {
 	}
 	downloaderDetectVersion = func(_, _ string) string { return "1.0" }
 	sandboxEnsureImage = func(_ context.Context, _ string) error {
-		return fmt.Errorf("no docker")
+		return errors.New("no docker")
 	}
 
 	// Will fail at sandbox, but the ecosystem override is tested.
@@ -572,7 +568,7 @@ func TestOutputReport_WritesToFile(t *testing.T) {
 
 	dir := t.TempDir()
 	flagOutput = filepath.Join(dir, "out.json")
-	flagVersion = "1.0.0"
+	flagVersion = testVersion
 	flagEcosystem = types.EcosystemPyPI
 
 	result := &scanResult{

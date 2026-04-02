@@ -99,8 +99,8 @@ Prerequisites:
 
   # Use gVisor runtime for stronger isolation
   kojuto scan requests --runtime runsc`,
-	Args:         cobra.MaximumNArgs(1),
-	RunE:         runScan,
+	Args:          cobra.MaximumNArgs(1),
+	RunE:          runScan,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 }

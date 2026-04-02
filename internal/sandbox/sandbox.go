@@ -34,6 +34,7 @@ const SandboxPythonVersion = "3.12"
 const (
 	RuntimeDefault = ""      // Docker default (runc).
 	RuntimeGVisor  = "runsc" // gVisor user-space kernel.
+	networkNone    = "none"  // Fallback when isolated network creation fails.
 )
 
 // Sandbox manages a Docker container for isolated package installation.
@@ -241,7 +242,7 @@ func (s *Sandbox) createIsolatedNetwork(ctx context.Context) error {
 
 	if err := cmd.Run(); err != nil {
 		// Fallback to --network=none if network creation fails.
-		s.networkName = "none"
+		s.networkName = networkNone
 	}
 
 	return nil
@@ -249,7 +250,7 @@ func (s *Sandbox) createIsolatedNetwork(ctx context.Context) error {
 
 // removeIsolatedNetwork deletes the Docker network created for this sandbox.
 func (s *Sandbox) removeIsolatedNetwork(ctx context.Context) {
-	if s.networkName == "" || s.networkName == "none" {
+	if s.networkName == "" || s.networkName == networkNone {
 		return
 	}
 
