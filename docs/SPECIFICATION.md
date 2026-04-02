@@ -159,12 +159,19 @@ CLI (cobra)
 | Network | Internal bridge makes `/proc/net/tcp` non-empty, `connect()` returns `ETIMEDOUT` |
 | Mount path | `/home/<host-user>/projects` (resembles host layout) |
 
-### Known Unmasked Signals (Docker Structural Constraints)
+### Container Runtime
 
-| Signal | Reason | Mitigation Path |
+| Runtime | Flag | Isolation | /proc masking |
+|---|---|---|---|
+| runc (default) | (none) | Docker kernel sharing | /proc/1/cgroup, mountinfo leak |
+| gVisor (runsc) | `--runtime runsc` | User-space kernel | Fully masked |
+
+### Known Unmasked Signals (runc only)
+
+| Signal | Reason | Mitigation |
 |---|---|---|
-| `/proc/1/cgroup` contains `docker` | Written by kernel | gVisor / Firecracker |
-| `/proc/self/mountinfo` contains `overlay` | Docker storage driver | Same |
+| `/proc/1/cgroup` contains `docker` | Written by kernel | Use `--runtime runsc` |
+| `/proc/self/mountinfo` contains `overlay` | Docker storage driver | Use `--runtime runsc` |
 
 ---
 

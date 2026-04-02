@@ -36,6 +36,10 @@ type probeFileEvent struct {
 type probeObjects struct {
 	KprobeConnect *ebpf.Program `ebpf:"kprobe_connect"`
 	KprobeSendto  *ebpf.Program `ebpf:"kprobe_sendto"`
+	KprobeSendmsg *ebpf.Program `ebpf:"kprobe_sendmsg"`
+	KprobeBind    *ebpf.Program `ebpf:"kprobe_bind"`
+	KprobeListen  *ebpf.Program `ebpf:"kprobe_listen"`
+	KprobeAccept  *ebpf.Program `ebpf:"kprobe_accept"`
 	KprobeExecve  *ebpf.Program `ebpf:"kprobe_execve"`
 	KprobeOpenat  *ebpf.Program `ebpf:"kprobe_openat"`
 	KprobeRename  *ebpf.Program `ebpf:"kprobe_rename"`
@@ -50,8 +54,9 @@ func loadProbeObjects(_ *probeObjects, _ *ebpf.CollectionOptions) error {
 
 func (o *probeObjects) Close() error {
 	progs := []*ebpf.Program{
-		o.KprobeConnect, o.KprobeSendto, o.KprobeExecve,
-		o.KprobeOpenat, o.KprobeRename,
+		o.KprobeConnect, o.KprobeSendto, o.KprobeSendmsg,
+		o.KprobeBind, o.KprobeListen, o.KprobeAccept,
+		o.KprobeExecve, o.KprobeOpenat, o.KprobeRename,
 	}
 	for _, p := range progs {
 		if p != nil {

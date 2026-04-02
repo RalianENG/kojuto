@@ -52,8 +52,15 @@ make sandbox-image
 # Output to file
 ./kojuto scan requests -o report.json
 
-# Explicitly use eBPF (connect, sendto, execve, openat, rename; requires root + kernel 5.8+)
+# Explicitly use eBPF (full syscall coverage; requires root or capabilities + kernel 5.8+)
 sudo ./kojuto scan requests --probe-method ebpf
+
+# Run eBPF without sudo (after granting capabilities)
+sudo ./scripts/setup-caps.sh ./kojuto
+./kojuto scan requests --probe-method ebpf
+
+# Use gVisor runtime for stronger isolation (masks /proc/1/cgroup, mountinfo)
+./kojuto scan requests --runtime runsc
 
 # Set scan timeout per package
 ./kojuto scan requests --timeout 10m
@@ -80,6 +87,7 @@ sudo ./kojuto scan requests --probe-method ebpf
 | `-f, --file` | Dependency file to scan (`requirements.txt`, `package.json`, or any `*.txt`/`*.json`) |
 | `--pin` | Output pinned dependency file after all-clean batch scan (requires `-f`) |
 | `--local` | Scan a local package file (`.whl`, `.tgz`) or directory instead of downloading |
+| `--runtime` | Container runtime: default (runc) or `runsc` (gVisor) |
 | `--probe-method` | `auto` / `ebpf` / `strace` / `strace-container` (default: `auto`) |
 | `--timeout` | Scan timeout per package (default: `5m`) |
 
@@ -158,7 +166,8 @@ sudo ./kojuto scan requests --probe-method ebpf
 - Docker
 - Go 1.25+ (build from source; required by dependencies)
 - Linux, macOS, or Windows (via Docker Desktop)
-- Root or CAP_BPF + CAP_PERFMON (only for `--probe-method=ebpf`)
+- Root or CAP_BPF + CAP_PERFMON for `--probe-method=ebpf` (use `scripts/setup-caps.sh` to avoid sudo)
+- gVisor (`runsc`) for `--runtime=runsc` (optional, stronger isolation)
 
 ## Documentation
 

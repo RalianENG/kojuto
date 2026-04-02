@@ -26,6 +26,12 @@ const SandboxImage = "kojuto-sandbox:latest"
 // SandboxPythonVersion must match the Python version in Dockerfile.sandbox.
 const SandboxPythonVersion = "3.12"
 
+// Runtime selects the container runtime.
+const (
+	RuntimeDefault = ""      // Docker default (runc).
+	RuntimeGVisor  = "runsc" // gVisor user-space kernel.
+)
+
 // Sandbox manages a Docker container for isolated package installation.
 type Sandbox struct {
 	containerID string
@@ -33,18 +39,20 @@ type Sandbox struct {
 	packageDir  string
 	pkg         string
 	ecosystem   string
+	runtime     string // container runtime (empty = default, "runsc" = gVisor).
 	mountPoint  string // set by containerArgs(), mirrors host layout
 	needsPtrace bool
 	seccompDir  string // per-instance temp dir for seccomp profile
 }
 
 // New creates a new Sandbox instance.
-func New(packageDir, pkg string, needsPtrace bool, ecosystem string) *Sandbox {
+func New(packageDir, pkg string, needsPtrace bool, ecosystem, containerRuntime string) *Sandbox {
 	return &Sandbox{
 		packageDir:  packageDir,
 		pkg:         pkg,
 		needsPtrace: needsPtrace,
 		ecosystem:   ecosystem,
+		runtime:     containerRuntime,
 	}
 }
 
@@ -79,22 +87,31 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 	// the real machine. Hard caps prevent actual resource exhaustion.
 	cpus, mem := getHostResources()
 
-	args := []string{
-		"--network=" + s.networkName,
+	args := []string{}
+
+	// Use gVisor runtime if requested. gVisor masks /proc/1/cgroup and
+	// /proc/self/mountinfo, defeating the two remaining container-detection
+	// signals that Docker cannot hide.
+	if s.runtime != "" {
+		args = append(args, "--runtime="+s.runtime)
+	}
+
+	args = append(args,
+		"--network="+s.networkName,
 		"--security-opt=no-new-privileges",
 		"--read-only",
 		"--cap-drop=ALL",
-		"--hostname=" + hostHostname,
+		"--hostname="+hostHostname,
 		"--tmpfs=/tmp:nosuid,mode=1777,size=100m",
 		"--tmpfs=/install:nosuid,mode=1777,size=300m",
-		"--tmpfs=/usr/local/lib/python" + SandboxPythonVersion + "/site-packages:nosuid,mode=1777,size=300m",
+		"--tmpfs=/usr/local/lib/python"+SandboxPythonVersion+"/site-packages:nosuid,mode=1777,size=300m",
 		"--tmpfs=/usr/local/bin:nosuid,exec,mode=0755,size=32m",
 		"--tmpfs=/run:nosuid,size=1m",
 		"--tmpfs=/home/dev:nosuid,mode=1777,size=32m",
-		"--memory=" + mem,
-		"--cpus=" + cpus,
+		"--memory="+mem,
+		"--cpus="+cpus,
 		"--pids-limit=256",
-	}
+	)
 	// Always apply the restrictive seccomp profile regardless of ptrace needs.
 	// Without it, Docker's default seccomp allows memfd_create, userfaultfd,
 	// open_by_handle_at, and other container-escape vectors.

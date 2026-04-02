@@ -55,8 +55,15 @@ kojuto scan requests --version 2.31.0
 # JSON レポートをファイルに出力
 kojuto scan requests -o report.json
 
-# eBPF を明示的に使用（connect, sendto, execve, openat, rename; root + kernel 5.8+ が必要）
+# eBPF を明示的に使用（全 syscall 対応; root または capabilities + kernel 5.8+ が必要）
 sudo kojuto scan requests --probe-method ebpf
+
+# sudo なしで eBPF を使用（capabilities 付与後）
+sudo ./scripts/setup-caps.sh ./kojuto
+./kojuto scan requests --probe-method ebpf
+
+# gVisor ランタイムで強化隔離（/proc/1/cgroup, mountinfo を隠蔽）
+kojuto scan requests --runtime runsc
 
 # パッケージごとのタイムアウトを設定
 kojuto scan requests --timeout 10m
@@ -83,6 +90,7 @@ kojuto scan --local ./samples/
 | `-f, --file` | 依存ファイルを指定してスキャン（`requirements.txt`、`package.json`、任意の `*.txt`/`*.json`） |
 | `--pin` | 全パッケージがクリーンの場合にバージョン固定ファイルを出力（`-f` 必須） |
 | `--local` | ローカルのパッケージファイル（`.whl`、`.tgz`）またはディレクトリをスキャン |
+| `--runtime` | コンテナランタイム: デフォルト（runc）または `runsc`（gVisor） |
 | `--probe-method` | `auto` / `ebpf` / `strace` / `strace-container`（デフォルト: `auto`） |
 | `--timeout` | パッケージごとのタイムアウト（デフォルト: `5m`） |
 

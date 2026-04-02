@@ -75,6 +75,10 @@ func (p *EBPFProbe) Start(targetPIDNS uint32) error {
 		prog *ebpf.Program
 	}{
 		{"__sys_sendto", objs.KprobeSendto},
+		{"__sys_sendmsg", objs.KprobeSendmsg},
+		{"__sys_bind", objs.KprobeBind},
+		{"__sys_listen", objs.KprobeListen},
+		{"__sys_accept4", objs.KprobeAccept},
 		{"do_execveat_common", objs.KprobeExecve},
 		{"do_sys_openat2", objs.KprobeOpenat},
 		{"vfs_rename", objs.KprobeRename},

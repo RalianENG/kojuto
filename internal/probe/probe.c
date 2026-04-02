@@ -132,10 +132,63 @@ SEC("kprobe/__sys_sendto")
 int kprobe_sendto(struct pt_regs *ctx) {
     if (!is_target_ns())
         return 0;
-    // sendto(fd, buf, len, flags, dest_addr, addrlen)
-    // dest_addr is the 5th argument (index 4).
     struct sockaddr *addr = (struct sockaddr *)PT_REGS_PARM5(ctx);
     return handle_sockaddr(ctx, addr);
+}
+
+SEC("kprobe/__sys_sendmsg")
+int kprobe_sendmsg(struct pt_regs *ctx) {
+    if (!is_target_ns())
+        return 0;
+    // sendmsg(fd, struct msghdr *msg, flags).
+    // Extract destination address from msghdr->msg_name.
+    struct msghdr *msg = (struct msghdr *)PT_REGS_PARM2(ctx);
+    if (!msg)
+        return 0;
+
+    struct sockaddr *addr = NULL;
+    bpf_probe_read_user(&addr, sizeof(addr), &msg->msg_name);
+    return handle_sockaddr(ctx, addr);
+}
+
+SEC("kprobe/__sys_bind")
+int kprobe_bind(struct pt_regs *ctx) {
+    if (!is_target_ns())
+        return 0;
+    struct sockaddr *addr = (struct sockaddr *)PT_REGS_PARM2(ctx);
+    return handle_sockaddr(ctx, addr);
+}
+
+SEC("kprobe/__sys_listen")
+int kprobe_listen(struct pt_regs *ctx) {
+    if (!is_target_ns())
+        return 0;
+
+    // listen(fd, backlog) has no sockaddr. Emit a minimal event
+    // so the analyzer can flag it as a backdoor indicator.
+    struct connect_event evt = {};
+    evt.timestamp_ns = bpf_ktime_get_ns();
+    evt.pid = bpf_get_current_pid_tgid() >> 32;
+    evt.uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    bpf_get_current_comm(&evt.comm, sizeof(evt.comm));
+
+    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+    return 0;
+}
+
+SEC("kprobe/__sys_accept4")
+int kprobe_accept(struct pt_regs *ctx) {
+    if (!is_target_ns())
+        return 0;
+
+    struct connect_event evt = {};
+    evt.timestamp_ns = bpf_ktime_get_ns();
+    evt.pid = bpf_get_current_pid_tgid() >> 32;
+    evt.uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    bpf_get_current_comm(&evt.comm, sizeof(evt.comm));
+
+    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+    return 0;
 }
 
 SEC("kprobe/do_execveat_common")

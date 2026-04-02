@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--local` flag for scanning local package files (`.whl`, `.tgz`) or directories without downloading from registries
 - Local npm `.tgz` scanning with automatic `node_modules` staging via `npm install --ignore-scripts`
 - axios/plain-crypto-js attack simulation package in `testdata/` for detection validation
+- `--runtime` flag for gVisor (`runsc`) container runtime support, masking `/proc/1/cgroup` and `/proc/self/mountinfo`
+- eBPF kprobes for `sendmsg`, `bind`, `listen`, `accept` — full syscall parity with strace-container mode
+- `scripts/setup-caps.sh` to grant `CAP_BPF` + `CAP_PERFMON` for sudo-free eBPF operation
 - Hostname sanitization to prevent Docker CLI argument injection
 - Test coverage for new parsers (openat, rename), analyzer (rename trusted binary, openat, bind/listen/accept), and sandbox (honeypot token generation, sanitizeDockerArg)
 

@@ -42,6 +42,7 @@ var (
 	flagFile        string
 	flagPin         string
 	flagLocal       string
+	flagRuntime     string
 	flagTimeout     time.Duration
 )
 
@@ -74,6 +75,7 @@ func init() {
 	scanCmd.Flags().StringVarP(&flagFile, "file", "f", "", "dependency file to scan (requirements.txt or package.json)")
 	scanCmd.Flags().StringVar(&flagPin, "pin", "", "output pinned dependency file after all-clean scan (requires -f)")
 	scanCmd.Flags().StringVar(&flagLocal, "local", "", "scan a local package file (.whl, .tgz) or directory instead of downloading")
+	scanCmd.Flags().StringVar(&flagRuntime, "runtime", "", "container runtime: default (runc) or runsc (gVisor)")
 	scanCmd.Flags().StringVar(&flagProbeMethod, "probe-method", methodAuto, "probe method: auto, ebpf, strace, strace-container")
 	scanCmd.Flags().DurationVar(&flagTimeout, "timeout", 5*time.Minute, "scan timeout per package")
 
@@ -572,7 +574,7 @@ func startSandbox(ctx context.Context, dlDir, pkg, method string) (*sandbox.Sand
 	}
 
 	needsPtrace := method == methodStraceContainer
-	sb := sandbox.New(dlDir, pkg, needsPtrace, flagEcosystem)
+	sb := sandbox.New(dlDir, pkg, needsPtrace, flagEcosystem, flagRuntime)
 
 	if method == methodEBPF || method == methodStrace {
 		// Create then start-paused to minimize the TOCTOU window
