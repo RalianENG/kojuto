@@ -450,14 +450,13 @@ func TestOutputReport_Inconclusive(t *testing.T) {
 	}
 }
 
-func TestGetPIDNSInode_NonLinux(t *testing.T) {
-	// On non-Linux (Windows in this case), getPIDNSInode should return an error.
+func TestGetPIDNSInode_InvalidPID(t *testing.T) {
+	// PID 0 or a non-existent PID should always return an error on any platform.
+	// On Linux: /proc/1234/ns/pid won't exist for a fake PID.
+	// On non-Linux: the function returns "requires Linux" error.
 	_, err := getPIDNSInode(1234)
 	if err == nil {
-		t.Fatal("expected error on non-Linux platform")
-	}
-	if !strings.Contains(err.Error(), "Linux") {
-		t.Errorf("expected error mentioning Linux, got: %v", err)
+		t.Fatal("expected error for non-existent PID")
 	}
 }
 
