@@ -46,6 +46,17 @@ var (
 	flagTimeout     time.Duration
 )
 
+// Replaceable dependencies for testing.
+var (
+	downloaderDownload      = downloader.Download
+	downloaderValidate      = downloader.ValidatePackage
+	downloaderDetectVersion = downloader.DetectVersion
+	sandboxNew              = sandbox.New
+	sandboxEnsureImage      = sandbox.EnsureImage
+	depfileParse            = depfile.Parse
+	execCommandCmd          = exec.CommandContext
+)
+
 var rootCmd = &cobra.Command{
 	Use:   "kojuto",
 	Short: "Supply chain attack detection tool",
@@ -53,11 +64,45 @@ var rootCmd = &cobra.Command{
 }
 
 var scanCmd = &cobra.Command{
-	Use:          "scan [package]",
-	Short:        "Scan a package or dependency file for suspicious syscall activity",
+	Use:   "scan [package]",
+	Short: "Scan a package or dependency file for suspicious syscall activity",
+	Long: `Scan a package for suspicious syscall activity during installation and import.
+
+The target package is installed inside an isolated Docker container while
+syscalls (connect, sendto, execve, openat, rename, etc.) are recorded via
+strace or eBPF. Import is then repeated under three simulated OS identities
+(Linux, Windows, macOS) with the clock shifted +30 days to trigger
+platform-gated and date-gated payloads.
+
+Prerequisites:
+  - Docker must be installed and running
+  - pip (for PyPI) or npm (for npm) must be available on the host
+  - Run 'make sandbox-image' at least once to build the sandbox image`,
+	Example: `  # Scan a PyPI package
+  kojuto scan requests
+
+  # Scan an npm package
+  kojuto scan lodash -e npm
+
+  # Scan a specific version
+  kojuto scan requests --version 2.31.0
+
+  # Scan all dependencies from a file
+  kojuto scan -f requirements.txt
+  kojuto scan -f package.json
+
+  # Output report to file
+  kojuto scan requests -o report.json
+
+  # Scan a local package file
+  kojuto scan --local ./malware-1.0.0.whl
+
+  # Use gVisor runtime for stronger isolation
+  kojuto scan requests --runtime runsc`,
 	Args:         cobra.MaximumNArgs(1),
 	RunE:         runScan,
-	SilenceUsage: true,
+	SilenceUsage:  true,
+	SilenceErrors: true,
 }
 
 var versionCmd = &cobra.Command{
@@ -105,7 +150,12 @@ func Execute() {
 		os.Exit(ve.ExitCode)
 	}
 
+	// Add actionable hints for common errors.
+	errMsg := err.Error()
 	fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+	if strings.Contains(errMsg, "context deadline exceeded") {
+		fmt.Fprintf(os.Stderr, "\nHint: scan timed out. Increase with --timeout (e.g. --timeout 10m)\n")
+	}
 	os.Exit(1)
 }
 
@@ -128,7 +178,7 @@ func runScan(_ *cobra.Command, args []string) error {
 
 	// Single package mode.
 	if len(args) == 0 {
-		return errors.New("either provide a package name or use -f <file>")
+		return errors.New("no package specified\n\nUsage:\n  kojuto scan <package>        scan a single package\n  kojuto scan -f <file>        scan all dependencies from a file\n  kojuto scan --local <path>   scan a local .whl or .tgz file\n\nRun 'kojuto scan --help' for more options")
 	}
 
 	_, err := scanSinglePackage(args[0], flagVersion, flagEcosystem)
@@ -142,7 +192,7 @@ type pinnedDep struct {
 }
 
 func scanSinglePackage(pkg, version, ecosystem string) (*pinnedDep, error) {
-	if err := downloader.ValidatePackage(pkg, version); err != nil {
+	if err := downloaderValidate(pkg, version); err != nil {
 		return nil, fmt.Errorf("invalid input: %w", err)
 	}
 
@@ -200,13 +250,13 @@ func scanSinglePackage(pkg, version, ecosystem string) (*pinnedDep, error) {
 }
 
 func runBatchScan(_ []string) error {
-	deps, ecosystem, err := depfile.Parse(flagFile)
+	deps, ecosystem, err := depfileParse(flagFile)
 	if err != nil {
 		return err
 	}
 
 	if len(deps) == 0 {
-		return fmt.Errorf("no dependencies found in %s", flagFile)
+		return fmt.Errorf("no dependencies found in %s\n\nSupported formats:\n  - requirements.txt (one package per line)\n  - package.json (reads dependencies and devDependencies)", flagFile)
 	}
 
 	// Allow ecosystem override from -e flag if explicitly set.
@@ -341,7 +391,7 @@ func runLocalScan(_ []string) error {
 
 	info, err := os.Stat(localPath)
 	if err != nil {
-		return fmt.Errorf("local path not found: %w", err)
+		return fmt.Errorf("local path not found: %s\n\nProvide a .whl (PyPI) or .tgz (npm) file, or a directory containing them", localPath)
 	}
 
 	// Determine package directory and name.
@@ -385,7 +435,7 @@ func runLocalScan(_ []string) error {
 	fmt.Fprintf(os.Stderr, "[*] Scanning local package: %s (%s)\n", pkg, ecosystem)
 
 	flagEcosystem = ecosystem
-	flagVersion = downloader.DetectVersion(dlDir, pkg)
+	flagVersion = downloaderDetectVersion(dlDir, pkg)
 
 	// For npm local packages, we need to create a node_modules structure
 	// from the .tgz so the sandbox can run npm rebuild with lifecycle scripts.
@@ -491,7 +541,7 @@ func prepareLocalNpm(sourceDir, pkg string) (string, error) {
 		}
 	}
 	if tgzPath == "" {
-		return "", errors.New("no .tgz file found in local package directory")
+		return "", fmt.Errorf("no .tgz file found in %s\n\nFor npm local scans, provide a tarball (.tgz) created by 'npm pack'", sourceDir)
 	}
 
 	// Create package.json that references the local tarball.
@@ -509,7 +559,7 @@ func prepareLocalNpm(sourceDir, pkg string) (string, error) {
 	}
 
 	// Install without scripts on host to resolve deps and create node_modules.
-	cmd := exec.CommandContext(context.Background(), "npm", "install", "--ignore-scripts")
+	cmd := execCommandCmd(context.Background(), "npm", "install", "--ignore-scripts")
 	cmd.Dir = stagingDir
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
@@ -533,12 +583,12 @@ func downloadPackage(ctx context.Context, pkg string) (string, error) {
 		return "", fmt.Errorf("creating download dir: %w", mkErr)
 	}
 
-	if _, dlErr := downloader.Download(ctx, pkg, flagVersion, dlDir, flagEcosystem); dlErr != nil {
-		return "", fmt.Errorf("downloading package: %w", dlErr)
+	if _, dlErr := downloaderDownload(ctx, pkg, flagVersion, dlDir, flagEcosystem); dlErr != nil {
+		return "", fmt.Errorf("downloading package: %w\n\n%s", dlErr, downloadHint(flagEcosystem, dlErr))
 	}
 
 	if flagVersion == "" {
-		flagVersion = downloader.DetectVersion(dlDir, pkg)
+		flagVersion = downloaderDetectVersion(dlDir, pkg)
 	}
 
 	return dlDir, nil
@@ -569,26 +619,26 @@ func startSandbox(ctx context.Context, dlDir, pkg, method string) (*sandbox.Sand
 	fmt.Fprintf(os.Stderr, "[*] Preparing sandbox...\n")
 
 	dockerfilePath := findDockerfile()
-	if err := sandbox.EnsureImage(ctx, dockerfilePath); err != nil {
-		return nil, fmt.Errorf("ensuring sandbox image: %w", err)
+	if err := sandboxEnsureImage(ctx, dockerfilePath); err != nil {
+		return nil, fmt.Errorf("ensuring sandbox image: %w%s", err, dockerHint(err))
 	}
 
 	needsPtrace := method == methodStraceContainer
-	sb := sandbox.New(dlDir, pkg, needsPtrace, flagEcosystem, flagRuntime)
+	sb := sandboxNew(dlDir, pkg, needsPtrace, flagEcosystem, flagRuntime)
 
 	if method == methodEBPF || method == methodStrace {
 		// Create then start-paused to minimize the TOCTOU window
 		// between container start and probe attachment.
 		if err := sb.Create(ctx); err != nil {
-			return nil, fmt.Errorf("creating sandbox: %w", err)
+			return nil, fmt.Errorf("creating sandbox: %w%s", err, dockerHint(err))
 		}
 		if err := sb.StartPaused(ctx); err != nil {
-			return nil, fmt.Errorf("starting sandbox paused: %w", err)
+			return nil, fmt.Errorf("starting sandbox paused: %w%s", err, dockerHint(err))
 		}
 	} else {
 		// strace-container mode doesn't need the pause-before-probe pattern.
 		if err := sb.Start(ctx); err != nil {
-			return nil, fmt.Errorf("starting sandbox: %w", err)
+			return nil, fmt.Errorf("starting sandbox: %w%s", err, dockerHint(err))
 		}
 	}
 
@@ -794,6 +844,39 @@ func openOutput() (*os.File, error) {
 	}
 
 	return f, nil
+}
+
+// downloadHint returns actionable guidance when a package download fails.
+func downloadHint(ecosystem string, err error) string {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "executable file not found") || strings.Contains(msg, "not found in"):
+		if ecosystem == types.EcosystemNpm {
+			return "Hint: npm is not installed or not in PATH. Install Node.js from https://nodejs.org/"
+		}
+		return "Hint: pip is not installed or not in PATH. Install it with: python3 -m ensurepip"
+	case strings.Contains(msg, "No matching distribution"):
+		return "Hint: package or version not found. Check the name and version on pypi.org"
+	case strings.Contains(msg, "404") || strings.Contains(msg, "not found"):
+		return "Hint: package not found in the registry. Verify the package name and ecosystem (-e pypi or -e npm)"
+	default:
+		return ""
+	}
+}
+
+// dockerHint returns actionable guidance when a Docker operation fails.
+func dockerHint(err error) string {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "executable file not found") || strings.Contains(msg, "not found in"):
+		return "\n\nHint: Docker is not installed or not in PATH. Install Docker from https://docs.docker.com/get-docker/"
+	case strings.Contains(msg, "Cannot connect to the Docker daemon") || strings.Contains(msg, "docker daemon") || strings.Contains(msg, "Is the docker daemon running"):
+		return "\n\nHint: Docker daemon is not running. Start it with: sudo systemctl start docker (Linux) or open Docker Desktop (macOS/Windows)"
+	case strings.Contains(msg, "permission denied") && strings.Contains(msg, "docker.sock"):
+		return "\n\nHint: permission denied accessing Docker. Add your user to the docker group: sudo usermod -aG docker $USER (then re-login)"
+	default:
+		return ""
+	}
 }
 
 func findDockerfile() string {
