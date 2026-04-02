@@ -1,25 +1,50 @@
 name: 'Kojuto Supply Chain Scanner'
-description: 'Detect suspicious network activity during package installation'
+description: 'Detect suspicious syscall activity during package installation'
 branding:
   icon: 'shield'
   color: 'red'
 
 inputs:
   package:
-    description: 'Package name to scan'
-    required: true
+    description: 'Package name to scan (mutually exclusive with file and local)'
+    required: false
+    default: ''
   version:
     description: 'Package version (default: latest)'
+    required: false
+    default: ''
+  ecosystem:
+    description: 'Ecosystem: pypi or npm (default: pypi)'
+    required: false
+    default: 'pypi'
+  file:
+    description: 'Dependency file to scan (requirements.txt or package.json)'
+    required: false
+    default: ''
+  pin:
+    description: 'Output pinned dependency file after all-clean scan (requires file)'
+    required: false
+    default: ''
+  local:
+    description: 'Scan a local package file (.whl, .tgz) or directory'
+    required: false
+    default: ''
+  runtime:
+    description: 'Container runtime: default (runc) or runsc (gVisor)'
     required: false
     default: ''
   probe-method:
     description: 'Probe method: auto, ebpf, strace, strace-container'
     required: false
     default: 'auto'
+  timeout:
+    description: 'Scan timeout per package (e.g. 5m, 10m)'
+    required: false
+    default: '5m'
 
 outputs:
   verdict:
-    description: 'Scan verdict: clean or suspicious'
+    description: 'Scan verdict: clean, suspicious, or inconclusive'
   report:
     description: 'Path to JSON report'
 
@@ -44,17 +69,47 @@ runs:
       env:
         KOJUTO_PACKAGE: ${{ inputs.package }}
         KOJUTO_VERSION: ${{ inputs.version }}
+        KOJUTO_ECOSYSTEM: ${{ inputs.ecosystem }}
+        KOJUTO_FILE: ${{ inputs.file }}
+        KOJUTO_PIN: ${{ inputs.pin }}
+        KOJUTO_LOCAL: ${{ inputs.local }}
+        KOJUTO_RUNTIME: ${{ inputs.runtime }}
         KOJUTO_PROBE_METHOD: ${{ inputs.probe-method }}
+        KOJUTO_TIMEOUT: ${{ inputs.timeout }}
       run: |
-        VERSION_FLAG=""
-        if [ -n "$KOJUTO_VERSION" ]; then
-          VERSION_FLAG="--version $KOJUTO_VERSION"
+        ARGS=()
+
+        # Determine scan mode: single package, file, or local.
+        if [ -n "$KOJUTO_FILE" ]; then
+          ARGS+=("-f" "$KOJUTO_FILE")
+          ARGS+=("-e" "$KOJUTO_ECOSYSTEM")
+          if [ -n "$KOJUTO_PIN" ]; then
+            ARGS+=("--pin" "$KOJUTO_PIN")
+          fi
+        elif [ -n "$KOJUTO_LOCAL" ]; then
+          ARGS+=("--local" "$KOJUTO_LOCAL")
+        else
+          if [ -z "$KOJUTO_PACKAGE" ]; then
+            echo "::error::Either 'package', 'file', or 'local' input is required"
+            exit 1
+          fi
+          ARGS+=("$KOJUTO_PACKAGE")
+          ARGS+=("-e" "$KOJUTO_ECOSYSTEM")
+          if [ -n "$KOJUTO_VERSION" ]; then
+            ARGS+=("--version" "$KOJUTO_VERSION")
+          fi
         fi
-        sudo "${{ github.action_path }}/kojuto" scan \
-          "$KOJUTO_PACKAGE" \
-          $VERSION_FLAG \
-          --probe-method "$KOJUTO_PROBE_METHOD" \
+
+        # Common flags.
+        ARGS+=("--probe-method" "$KOJUTO_PROBE_METHOD")
+        ARGS+=("--timeout" "$KOJUTO_TIMEOUT")
+        if [ -n "$KOJUTO_RUNTIME" ]; then
+          ARGS+=("--runtime" "$KOJUTO_RUNTIME")
+        fi
+
+        sudo "${{ github.action_path }}/kojuto" scan "${ARGS[@]}" \
           -o /tmp/kojuto-report.json
+
         echo "report=/tmp/kojuto-report.json" >> "$GITHUB_OUTPUT"
         VERDICT=$(jq -r '.verdict' /tmp/kojuto-report.json)
         echo "verdict=$VERDICT" >> "$GITHUB_OUTPUT"

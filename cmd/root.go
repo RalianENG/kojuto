@@ -105,11 +105,24 @@ Prerequisites:
 	SilenceErrors: true,
 }
 
+var (
+	appVersion = "dev"
+	appCommit  = "none"
+	appDate    = "unknown"
+)
+
+// SetVersionInfo is called from main to inject build-time version info.
+func SetVersionInfo(version, commit, date string) {
+	appVersion = version
+	appCommit = commit
+	appDate = date
+}
+
 var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Print version information",
 	Run: func(_ *cobra.Command, _ []string) {
-		fmt.Println("kojuto v0.3.0")
+		fmt.Printf("kojuto %s (commit: %s, built: %s)\n", appVersion, appCommit, appDate)
 	},
 }
 

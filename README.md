@@ -167,11 +167,25 @@ sudo ./scripts/setup-caps.sh ./kojuto
 ## GitHub Actions
 
 ```yaml
+# Scan a single package
 - uses: RalianENG/kojuto@v0
   with:
     package: your-dependency
     version: '2.31.0'        # optional
+    ecosystem: pypi           # optional: pypi, npm (default: pypi)
     probe-method: auto        # optional: auto, ebpf, strace, strace-container
+    timeout: 5m               # optional (default: 5m)
+
+# Scan all dependencies from a file
+- uses: RalianENG/kojuto@v0
+  with:
+    file: requirements.txt    # or package.json
+    pin: locked.txt           # optional: generate pinned file if all clean
+
+# Scan a local package file
+- uses: RalianENG/kojuto@v0
+  with:
+    local: ./suspicious-1.0.0.whl
 ```
 
 ## Requirements
