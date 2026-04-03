@@ -13,15 +13,18 @@ import (
 
 // ContainerStrace monitors connect(2) syscalls by running strace inside the Docker container.
 // This works on all platforms where Docker is available (Linux, macOS, Windows).
+// ContainerStrace monitors connect(2) syscalls by running strace inside the Docker container.
+// This works on all platforms where Docker is available (Linux, macOS, Windows).
 type ContainerStrace struct {
-	events chan types.SyscallEvent
-	done   chan struct{}
+	events  chan types.SyscallEvent
+	done    chan struct{}
+	dropped uint64 // events dropped due to full buffer
 }
 
 // NewContainerStrace creates a new in-container strace probe.
 func NewContainerStrace() *ContainerStrace {
 	return &ContainerStrace{
-		events: make(chan types.SyscallEvent, 256),
+		events: make(chan types.SyscallEvent, 8192),
 		done:   make(chan struct{}),
 	}
 }
@@ -93,6 +96,10 @@ func (c *ContainerStrace) parseStraceOutput(stderr io.ReadCloser, done chan<- st
 		case c.events <- evt:
 		case <-c.done:
 			return
+		default:
+			// Buffer full — drop event to prevent deadlock.
+			// The caller should treat this as inconclusive.
+			c.dropped++
 		}
 	}
 }

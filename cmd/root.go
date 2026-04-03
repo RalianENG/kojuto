@@ -281,8 +281,159 @@ func runBatchScan(_ []string) error {
 		return errors.New("--pin requires -f <file>")
 	}
 
-	fmt.Fprintf(os.Stderr, "[*] Scanning %d packages from %s (%s)...\n", len(deps), flagFile, ecosystem)
+	// Phase 1: Fast batch screening — install all packages in a single sandbox.
+	fmt.Fprintf(os.Stderr, "[*] Phase 1: Batch screening %d packages from %s (%s)...\n", len(deps), flagFile, ecosystem)
 
+	verdict, batchErr := runBatchScreening(deps, ecosystem)
+	if batchErr != nil {
+		// Batch screening failed (download/sandbox error). Fall back to per-package scan.
+		fmt.Fprintf(os.Stderr, "[!] Batch screening failed: %v\n", batchErr)
+		fmt.Fprintf(os.Stderr, "[*] Falling back to per-package scan...\n")
+		return runPerPackageScan(deps, ecosystem)
+	}
+
+	if verdict == types.VerdictClean {
+		fmt.Fprintf(os.Stderr, "[+] CLEAN: All %d packages passed batch screening\n", len(deps))
+
+		if flagPin != "" {
+			pinned := make([]pinnedDep, 0, len(deps))
+			for _, dep := range deps {
+				pinned = append(pinned, pinnedDep{Name: dep.Name, Version: dep.Version})
+			}
+			if err := writePinnedFile(flagPin, pinned, ecosystem); err != nil {
+				return fmt.Errorf("writing pinned file: %w", err)
+			}
+			fmt.Fprintf(os.Stderr, "[+] Pinned %d packages to %s\n", len(pinned), flagPin)
+		}
+		return nil
+	}
+
+	// Phase 2: Suspicious activity detected — re-scan individually to find the culprit.
+	fmt.Fprintf(os.Stderr, "[!] Suspicious activity in batch scan — starting per-package attribution...\n")
+	return runPerPackageScan(deps, ecosystem)
+}
+
+// runBatchScreening installs all packages in a single sandbox and monitors for suspicious activity.
+func runBatchScreening(deps []depfile.Dep, ecosystem string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), flagTimeout)
+	defer cancel()
+
+	// Download all packages into one directory.
+	tmpDir, err := os.MkdirTemp("", "kojuto-batch-*")
+	if err != nil {
+		return "", fmt.Errorf("creating temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dlDir := filepath.Join(tmpDir, "packages")
+	if mkErr := os.MkdirAll(dlDir, 0o755); mkErr != nil {
+		return "", fmt.Errorf("creating download dir: %w", mkErr)
+	}
+
+	var pkgNames []string
+	var targets []string // pip download targets (name or name==version)
+	for _, dep := range deps {
+		pkgNames = append(pkgNames, dep.Name)
+		if dep.Version != "" {
+			targets = append(targets, dep.Name+"=="+dep.Version)
+		} else {
+			targets = append(targets, dep.Name)
+		}
+	}
+
+	flagEcosystem = ecosystem
+	fmt.Fprintf(os.Stderr, "[*] Downloading %d packages...\n", len(pkgNames))
+	downloadBatchPackages(ctx, deps, targets, dlDir, ecosystem)
+
+	// Start a single sandbox with all packages.
+	method := selectProbeMethod()
+	// Use the first package name as the sandbox label.
+	sb, err := startSandbox(ctx, dlDir, pkgNames[0], method)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		if cleanupErr := sb.Cleanup(cleanupCtx); cleanupErr != nil {
+			fmt.Fprintf(os.Stderr, "[!] Cleanup warning: %v\n", cleanupErr)
+		}
+	}()
+
+	// Install all packages at once with strace.
+	fmt.Fprintf(os.Stderr, "[*] Installing %d packages in sandbox...\n", len(pkgNames))
+	cp := probe.NewContainerStrace()
+	installOut, installErr := cp.StartAndInstall(ctx, sb.ContainerID(), sb.InstallAllCommand(pkgNames))
+	if installErr != nil {
+		fmt.Fprintf(os.Stderr, "[!] Install output:\n%s\n", string(installOut))
+		return "", fmt.Errorf("batch install failed: %w", installErr)
+	}
+
+	var events []types.SyscallEvent
+	for evt := range cp.Events() {
+		events = append(events, evt)
+	}
+
+	// Import all packages under simulated OS identities (3 scripts total).
+	sb.WriteProbeScriptsMulti(ctx, pkgNames)
+	importCmds := sb.ImportCommandsMulti(pkgNames)
+	osNames := []string{"Linux", "Windows", "macOS"}
+
+	for i, cmd := range importCmds {
+		fmt.Fprintf(os.Stderr, "[*] Importing %d packages (simulating %s)...\n", len(pkgNames), osNames[i])
+
+		ip := probe.NewContainerStrace()
+		importOut, importErr := ip.StartAndInstall(ctx, sb.ContainerID(), cmd)
+		if importErr != nil {
+			fmt.Fprintf(os.Stderr, "[!] Import (%s) failed (non-fatal): %v\n", osNames[i], importErr)
+			_ = importOut
+		}
+		for evt := range ip.Events() {
+			events = append(events, evt)
+		}
+	}
+
+	verdict, filtered := analyzer.Analyze(events)
+	fmt.Fprintf(os.Stderr, "[*] Batch screening: %s (%d events)\n", verdict, len(filtered))
+
+	return verdict, nil
+}
+
+// downloadBatchPackages downloads all packages using the appropriate batch method.
+// Falls back to individual downloads if the batch method fails.
+func downloadBatchPackages(ctx context.Context, deps []depfile.Dep, pipTargets []string, dlDir, ecosystem string) {
+	if ecosystem == types.EcosystemNpm {
+		npmDeps := make(map[string]string, len(deps))
+		for _, dep := range deps {
+			if dep.Version != "" {
+				npmDeps[dep.Name] = dep.Version
+			} else {
+				npmDeps[dep.Name] = "*"
+			}
+		}
+		if dlErr := downloader.DownloadAllNpm(ctx, npmDeps, dlDir); dlErr != nil {
+			fmt.Fprintf(os.Stderr, "[!] Batch npm download failed, downloading individually...\n")
+			downloadIndividually(ctx, deps, dlDir, ecosystem)
+		}
+		return
+	}
+
+	if dlErr := downloader.DownloadAll(ctx, pipTargets, dlDir); dlErr != nil {
+		fmt.Fprintf(os.Stderr, "[!] Batch pip download failed, downloading individually...\n")
+		downloadIndividually(ctx, deps, dlDir, ecosystem)
+	}
+}
+
+func downloadIndividually(ctx context.Context, deps []depfile.Dep, dlDir, ecosystem string) {
+	for _, dep := range deps {
+		if _, dlErr := downloaderDownload(ctx, dep.Name, dep.Version, dlDir, ecosystem); dlErr != nil {
+			fmt.Fprintf(os.Stderr, "[!] Failed to download %s: %v\n", dep.Name, dlErr)
+		}
+	}
+}
+
+// runPerPackageScan falls back to the original per-package scanning approach.
+func runPerPackageScan(deps []depfile.Dep, ecosystem string) error {
 	var suspicious []string
 	var scanErrors []string
 	var pinned []pinnedDep
@@ -330,7 +481,6 @@ func runBatchScan(_ []string) error {
 		return fmt.Errorf("scan failed for: %s", strings.Join(scanErrors, ", "))
 	}
 
-	// All clean — generate pinned dependency file if requested.
 	if flagPin != "" {
 		if err := writePinnedFile(flagPin, pinned, ecosystem); err != nil {
 			return fmt.Errorf("writing pinned file: %w", err)
@@ -436,11 +586,13 @@ func runLocalScan(_ []string) error {
 		pkg = detectPackageName(filepath.Base(localPath))
 	}
 
-	// Auto-detect ecosystem from file extension if not explicitly set.
+	// Auto-detect ecosystem from file extension, but only if -e was not explicitly set.
+	// .tgz is always npm; .tar.gz is ambiguous (could be PyPI sdist), so only
+	// override to npm for .tgz, not .tar.gz.
 	ecosystem := flagEcosystem
 	if !info.IsDir() {
 		name := filepath.Base(localPath)
-		if strings.HasSuffix(name, ".tgz") || strings.HasSuffix(name, ".tar.gz") {
+		if strings.HasSuffix(name, ".tgz") {
 			ecosystem = types.EcosystemNpm
 		}
 	}
@@ -470,6 +622,7 @@ func runLocalScan(_ []string) error {
 	if err != nil {
 		return err
 	}
+	sb.SetLocalMode(true)
 	defer func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cleanupCancel()

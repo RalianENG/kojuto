@@ -47,7 +47,13 @@ type Sandbox struct {
 	runtime     string // container runtime (empty = default, "runsc" = gVisor).
 	mountPoint  string // set by containerArgs(), mirrors host layout
 	needsPtrace bool
+	localMode   bool   // when true, install from local files (sdist/wheel) directly
 	seccompDir  string // per-instance temp dir for seccomp profile
+}
+
+// SetLocalMode enables local package installation mode (sdist support).
+func (s *Sandbox) SetLocalMode(local bool) {
+	s.localMode = local
 }
 
 // New creates a new Sandbox instance.
@@ -108,7 +114,6 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 		"--cap-drop=ALL",
 		"--hostname="+hostHostname,
 		"--tmpfs=/tmp:nosuid,mode=1777,size=100m",
-		"--tmpfs=/install:nosuid,mode=1777,size=300m",
 		"--tmpfs=/usr/local/lib/python"+SandboxPythonVersion+"/site-packages:nosuid,mode=1777,size=300m",
 		"--tmpfs=/usr/local/bin:nosuid,exec,mode=0755,size=32m",
 		"--tmpfs=/run:nosuid,size=1m",
@@ -117,6 +122,14 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 		"--cpus="+cpus,
 		"--pids-limit=256",
 	)
+
+	// npm: mount packageDir directly as writable /install (skip the copy step).
+	// PyPI: use tmpfs for /install and mount packages read-only at the mirror path.
+	if s.ecosystem == types.EcosystemNpm {
+		args = append(args, "-v", s.packageDir+":/install")
+	} else {
+		args = append(args, "--tmpfs=/install:nosuid,mode=1777,size=300m")
+	}
 	// Always apply the restrictive seccomp profile regardless of ptrace needs.
 	// Without it, Docker's default seccomp allows memfd_create, userfaultfd,
 	// open_by_handle_at, and other container-escape vectors.
@@ -138,11 +151,13 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 		args = append(args, "--env="+env)
 	}
 
-	args = append(args,
-		"-v", s.packageDir+":"+s.mountPoint+":ro",
-		SandboxImage,
-		"sleep", "3600",
-	)
+	// npm already has packageDir mounted as /install above.
+	// PyPI needs the read-only mount for --find-links.
+	if s.ecosystem != types.EcosystemNpm {
+		args = append(args, "-v", s.packageDir+":"+s.mountPoint+":ro")
+	}
+
+	args = append(args, SandboxImage, "sleep", "3600")
 
 	return args, nil
 }
@@ -350,11 +365,9 @@ func (s *Sandbox) restoreLocalBin(ctx context.Context) {
 	s.dockerExecRoot(ctx, "cp", "-a", sitePackages+".bak/.", sitePackages+"/")
 	s.dockerExecRoot(ctx, "chmod", "-R", "a+rw", sitePackages)
 
-	// For npm: copy the read-only mounted node_modules into the writable
-	// /install tmpfs so npm rebuild can chmod/symlink as needed.
-	// Requires CAP_CHOWN + CAP_FOWNER to fix ownership for the dev user.
+	// npm: packageDir is mounted directly as writable /install,
+	// so no copy is needed. Just fix ownership for the dev user.
 	if s.ecosystem == types.EcosystemNpm {
-		s.dockerExecRoot(ctx, "cp", "-a", s.mountPoint+"/.", "/install/")
 		s.dockerExecRoot(ctx, "chown", "-R", "1000:1000", "/install")
 	}
 }
@@ -525,6 +538,18 @@ func (s *Sandbox) InstallCommand() []string {
 		}
 	}
 
+	// Local mode: install directly from the file in the mount point.
+	// Source distributions (.tar.gz) need build tools, so we allow
+	// pip to use pre-installed setuptools/wheel (no network needed).
+	if s.localMode {
+		// Find the actual file in the mount point and install it directly.
+		// This handles both wheels (.whl) and source distributions (.tar.gz).
+		return []string{
+			"sh", "-c",
+			"pip install --no-index --no-deps --no-build-isolation " + s.mountPoint + "/*",
+		}
+	}
+
 	// Install with dependencies — all wheels in the mount point are installed
 	// together under strace monitoring. This catches compromised transitive
 	// dependencies (e.g. supply chain attacks via trusted dep packages).
@@ -533,6 +558,88 @@ func (s *Sandbox) InstallCommand() []string {
 		"--no-index",
 		"--find-links=" + s.mountPoint,
 		"--", s.pkg,
+	}
+}
+
+// InstallAllCommand returns a pip install command that installs multiple packages at once.
+// All wheels must already be in the mount point directory.
+func (s *Sandbox) InstallAllCommand(pkgs []string) []string {
+	if s.ecosystem == types.EcosystemNpm {
+		// Rebuild only the target packages (not all transitive deps).
+		// Transitive deps without lifecycle scripts are covered by
+		// the import phase which loads them via require().
+		cmd := []string{"npm", "rebuild", "--prefix=/install"}
+		return append(cmd, pkgs...)
+	}
+
+	cmd := []string{
+		"pip", "install",
+		"--no-index",
+		"--find-links=" + s.mountPoint,
+		"--",
+	}
+	return append(cmd, pkgs...)
+}
+
+// WriteProbeScriptsMulti writes one combined import probe script per OS identity.
+// This reduces Python/Node process launches from N*3 to just 3.
+func (s *Sandbox) WriteProbeScriptsMulti(ctx context.Context, pkgs []string) {
+	if s.ecosystem == types.EcosystemNpm {
+		for _, p := range []string{"linux", "win32", "darwin"} {
+			var requires strings.Builder
+			for _, pkg := range pkgs {
+				fmt.Fprintf(&requires, "try{require('%s')}catch(e){}\n", pkg)
+			}
+			script := fmt.Sprintf(
+				"module.paths.unshift('/install/node_modules');\n"+
+					"Object.defineProperty(process,'platform',{value:'%s'});\n"+
+					"%s",
+				p, requires.String(),
+			)
+			filename := "/tmp/_kojuto_probe_all_" + p + ".js"
+			s.dockerExecRoot(ctx, "sh", "-c", "cat > "+filename+" << 'KOJUTO_EOF'\n"+script+"KOJUTO_EOF")
+		}
+		return
+	}
+
+	pyPlatforms := [][3]string{
+		{"Linux", "linux", "posix"},
+		{"Windows", "win32", "nt"},
+		{"Darwin", "darwin", "posix"},
+	}
+	for _, p := range pyPlatforms {
+		var imports strings.Builder
+		for _, pkg := range pkgs {
+			importName := strings.ReplaceAll(pkg, "-", "_")
+			fmt.Fprintf(&imports, "try:\n __import__('%s')\nexcept Exception:\n pass\n", importName)
+		}
+		script := fmt.Sprintf(
+			"import platform,sys,os\n"+
+				"platform.system=lambda:'%s'\n"+
+				"sys.platform='%s'\n"+
+				"os.name='%s'\n"+
+				"%s",
+			p[0], p[1], p[2], imports.String(),
+		)
+		filename := "/tmp/_kojuto_probe_all_" + p[1] + ".py"
+		s.dockerExecRoot(ctx, "sh", "-c", "cat > "+filename+" << 'KOJUTO_EOF'\n"+script+"KOJUTO_EOF")
+	}
+}
+
+// ImportCommandsMulti returns 3 import commands (one per OS identity) that import all packages.
+func (s *Sandbox) ImportCommandsMulti(pkgs []string) [][]string {
+	_ = pkgs // package list is already baked into the script files
+	if s.ecosystem == types.EcosystemNpm {
+		return [][]string{
+			wrapWithFaketime([]string{"node", "/tmp/_kojuto_probe_all_linux.js"}),
+			wrapWithFaketime([]string{"node", "/tmp/_kojuto_probe_all_win32.js"}),
+			wrapWithFaketime([]string{"node", "/tmp/_kojuto_probe_all_darwin.js"}),
+		}
+	}
+	return [][]string{
+		wrapWithFaketime([]string{"python3", "/tmp/_kojuto_probe_all_linux.py"}),
+		wrapWithFaketime([]string{"python3", "/tmp/_kojuto_probe_all_win32.py"}),
+		wrapWithFaketime([]string{"python3", "/tmp/_kojuto_probe_all_darwin.py"}),
 	}
 }
 

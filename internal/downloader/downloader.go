@@ -3,6 +3,7 @@ package downloader
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -51,22 +52,9 @@ func Download(ctx context.Context, pkg, version, destDir, ecosystem string) (str
 	}
 }
 
-func downloadPyPI(ctx context.Context, pkg, version, destDir string) (string, error) {
-	target := pkg
-	if version != "" {
-		target = pkg + "==" + version
-	}
-
-	// Always request Linux-compatible wheels so the sandbox container (Linux)
-	// can install them, even when the host is Windows or macOS.
-	// This does NOT introduce a new fingerprint inside the container — the
-	// container always runs Linux, so Linux wheels are the expected norm.
-	// The --platform flags are only visible in the host-side pip process,
-	// which is outside the strace monitoring scope.
-	// Download with dependencies — supply chain attacks like the axios
-	// incident show that compromised deps must be monitored too.
-	// All downloaded packages will be installed under strace in the sandbox.
-	args := []string{
+// pypiDownloadArgs returns the common pip download arguments for Linux-compatible wheels.
+func pypiDownloadArgs(destDir string) []string {
+	return []string{
 		"download", "--only-binary=:all:",
 		"--platform", "manylinux2014_x86_64",
 		"--platform", "manylinux_2_17_x86_64",
@@ -78,8 +66,31 @@ func downloadPyPI(ctx context.Context, pkg, version, destDir string) (string, er
 		"--abi", "abi3",
 		"--abi", "none",
 		"-d", destDir,
-		target,
 	}
+}
+
+// DownloadAll fetches multiple PyPI packages in a single pip invocation.
+// This is significantly faster than calling Download for each package individually.
+func DownloadAll(ctx context.Context, targets []string, destDir string) error {
+	args := pypiDownloadArgs(destDir)
+	args = append(args, targets...)
+	cmd := execCommand(ctx, "pip", args...)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("pip download failed: %w", err)
+	}
+	return nil
+}
+
+func downloadPyPI(ctx context.Context, pkg, version, destDir string) (string, error) {
+	target := pkg
+	if version != "" {
+		target = pkg + "==" + version
+	}
+
+	args := pypiDownloadArgs(destDir)
+	args = append(args, target)
 	cmd := execCommand(ctx, "pip", args...)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
@@ -89,6 +100,34 @@ func downloadPyPI(ctx context.Context, pkg, version, destDir string) (string, er
 	}
 
 	return verifyDownload(destDir, pkg)
+}
+
+// DownloadAllNpm fetches multiple npm packages in a single npm install invocation.
+func DownloadAllNpm(ctx context.Context, deps map[string]string, destDir string) error {
+	pkgData := map[string]interface{}{
+		"name":         "kojuto-staging",
+		"private":      true,
+		"dependencies": deps,
+	}
+	pkgJSON, err := json.Marshal(pkgData)
+	if err != nil {
+		return fmt.Errorf("marshaling staging package.json: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(destDir, "package.json"), pkgJSON, 0o644); err != nil {
+		return fmt.Errorf("writing staging package.json: %w", err)
+	}
+	cmd := execCommand(ctx, "npm", "install", "--ignore-scripts")
+	cmd.Dir = destDir
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("npm install (batch staging) failed: %w", err)
+	}
+	nmDir := filepath.Join(destDir, "node_modules")
+	if _, err := os.Stat(nmDir); err != nil {
+		return errors.New("node_modules not created")
+	}
+	return nil
 }
 
 func downloadNpm(ctx context.Context, pkg, version, destDir string) (string, error) {
