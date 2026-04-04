@@ -65,11 +65,6 @@ var (
 	straceRenameatRe = regexp.MustCompile(
 		`renameat2?\([^,]+,\s*"([^"]+)",\s*[^,]+,\s*"([^"]+)"`,
 	)
-
-	// dup2(3, 0) = 0 or dup3(3, 1, 0) = 1.
-	straceDupRe = regexp.MustCompile(
-		`dup[23]\((\d+),\s*(\d+)`,
-	)
 )
 
 // sensitivePathPatterns are substrings that indicate access to credential or
@@ -152,10 +147,6 @@ func parseStraceLine(line string) (types.SyscallEvent, bool) {
 		return evt, true
 	}
 
-	if evt, ok := parseDup(line); ok {
-		return evt, true
-	}
-
 	return types.SyscallEvent{}, false
 }
 
@@ -213,33 +204,6 @@ func parseRename(line string) (types.SyscallEvent, bool) {
 	}
 
 	return types.SyscallEvent{}, false
-}
-
-// parseDup detects dup2/dup3 calls that redirect stdin/stdout/stderr.
-// Pattern: dup2(fd, 0) or dup3(fd, 1, flags) — classic reverse shell setup.
-// Only emits events when the target fd is 0 (stdin), 1 (stdout), or 2 (stderr).
-func parseDup(line string) (types.SyscallEvent, bool) {
-	matches := straceDupRe.FindStringSubmatch(line)
-	if matches == nil {
-		return types.SyscallEvent{}, false
-	}
-
-	targetFD, err := strconv.ParseInt(matches[2], 10, 32)
-	if err != nil {
-		return types.SyscallEvent{}, false
-	}
-
-	// Only flag redirections of stdin/stdout/stderr (fd 0, 1, 2).
-	if targetFD > 2 {
-		return types.SyscallEvent{}, false
-	}
-
-	return types.SyscallEvent{
-		Timestamp: time.Now().UTC(),
-		PID:       extractPID(line),
-		Syscall:   types.EventDup,
-		TargetFD:  int(targetFD),
-	}, true
 }
 
 func parseConnectOrSendto(line string, re *regexp.Regexp, syscall string) (types.SyscallEvent, bool) {

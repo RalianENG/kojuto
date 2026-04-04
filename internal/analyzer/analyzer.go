@@ -77,7 +77,7 @@ func assessRisk(categories []string) string {
 	for _, c := range categories {
 		switch c {
 		case types.CategoryC2, types.CategoryDataExfil, types.CategoryCredentialAccess,
-			types.CategoryBackdoor, types.CategoryReverseShell:
+			types.CategoryBackdoor:
 			return "critical"
 		}
 	}
@@ -106,8 +106,6 @@ func buildDescription(_ []types.SyscallEvent, categories []string) string {
 			parts = append(parts, "attempted replacement of trusted system binary")
 		case types.CategoryBackdoor:
 			parts = append(parts, "server socket opened (backdoor indicator)")
-		case types.CategoryReverseShell:
-			parts = append(parts, "reverse shell detected (stdin/stdout redirected to socket)")
 		case types.CategoryPersistence:
 			parts = append(parts, "write to shell startup file (persistence mechanism)")
 		case types.CategoryDNSTunnel:
@@ -120,10 +118,6 @@ func buildDescription(_ []types.SyscallEvent, categories []string) string {
 func buildRemediation(categories []string) string {
 	for _, c := range categories {
 		switch c {
-		case types.CategoryReverseShell:
-			return "Do NOT install this package. If previously installed, the attacker may have had " +
-				"interactive shell access. Audit the host for unauthorized changes, rotate all credentials, " +
-				"and check for persistence mechanisms (.bashrc, crontab, authorized_keys)."
 		case types.CategoryC2, types.CategoryDataExfil, types.CategoryBackdoor:
 			return "Do NOT install this package. Remove it from dependencies immediately. " +
 				"If previously installed, audit the host for compromised credentials and rotate secrets."
@@ -177,12 +171,6 @@ func classify(evt *types.SyscallEvent) {
 		evt.Category = types.CategoryBinaryHijack
 		evt.Reason = "Rename " + evt.SrcPath + " -> " + evt.DstPath +
 			" — attempted replacement of trusted system binary."
-
-	case types.EventDup:
-		evt.Category = types.CategoryReverseShell
-		fdName := fdNames[evt.TargetFD]
-		evt.Reason = "dup2 redirecting " + fdName +
-			" — classic reverse shell pattern (connect → dup2 → execve /bin/sh)."
 	}
 }
 
@@ -192,13 +180,6 @@ var persistenceTargets = []string{
 	"/.bashrc", "/.bash_profile", "/.zshrc", "/.profile",
 	"/.bash_history", "/.zsh_history",
 	"/crontab",
-}
-
-// fdNames maps file descriptor numbers to human-readable names.
-var fdNames = map[int]string{
-	0: "stdin (fd 0)",
-	1: "stdout (fd 1)",
-	2: "stderr (fd 2)",
 }
 
 func classifyOpenat(evt *types.SyscallEvent) {
@@ -317,9 +298,6 @@ func isBenign(evt *types.SyscallEvent) bool {
 		return false
 	case types.EventRename:
 		return isBenignRename(evt)
-	case types.EventDup:
-		// dup2 redirecting stdin/stdout/stderr is always suspicious.
-		return false
 	default:
 		return false
 	}
