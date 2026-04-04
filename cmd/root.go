@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/RalianENG/kojuto/internal/analyzer"
+	"github.com/RalianENG/kojuto/internal/config"
 	"github.com/RalianENG/kojuto/internal/depfile"
 	"github.com/RalianENG/kojuto/internal/downloader"
 	"github.com/RalianENG/kojuto/internal/probe"
@@ -44,6 +45,7 @@ var (
 	flagLocal       string
 	flagRuntime     string
 	flagTimeout     time.Duration
+	flagConfig      string
 )
 
 // Replaceable dependencies for testing.
@@ -101,6 +103,7 @@ Prerequisites:
   kojuto scan requests --runtime runsc`,
 	Args:          cobra.MaximumNArgs(1),
 	RunE:          runScan,
+	PreRunE:       preRunLoadConfig,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 }
@@ -136,9 +139,24 @@ func init() {
 	scanCmd.Flags().StringVar(&flagRuntime, "runtime", "", "container runtime: default (runc) or runsc (gVisor)")
 	scanCmd.Flags().StringVar(&flagProbeMethod, "probe-method", methodAuto, "probe method: auto, ebpf, strace, strace-container")
 	scanCmd.Flags().DurationVar(&flagTimeout, "timeout", 5*time.Minute, "scan timeout per package")
+	scanCmd.Flags().StringVar(&flagConfig, "config", "", "config file path (default: kojuto.yml in current directory)")
 
 	rootCmd.AddCommand(scanCmd)
 	rootCmd.AddCommand(versionCmd)
+}
+
+func preRunLoadConfig(_ *cobra.Command, _ []string) error {
+	cfgPath := flagConfig
+	if cfgPath == "" {
+		cfgPath = "kojuto.yml"
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return fmt.Errorf("loading config %s: %w", cfgPath, err)
+	}
+	paths := config.MergeSensitivePaths(cfg)
+	probe.SetSensitivePaths(paths)
+	return nil
 }
 
 // VerdictError is returned when the scan verdict is not clean.
@@ -960,7 +978,8 @@ func outputReport(pkg string, result *scanResult) error {
 		verdict = types.VerdictInconclusive
 	}
 
-	r := report.Generate(pkg, flagVersion, flagEcosystem, verdict, result.method, filtered, result.lostSamples)
+	summary := analyzer.GenerateSummary(verdict, filtered)
+	r := report.Generate(pkg, flagVersion, flagEcosystem, verdict, result.method, filtered, result.lostSamples, summary)
 	printVerdict(verdict, len(filtered), result.lostSamples)
 
 	w, err := openOutput()

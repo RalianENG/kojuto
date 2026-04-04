@@ -380,3 +380,85 @@ func TestDownload_Npm_Mock(t *testing.T) {
 		t.Errorf("Download npm = %q, want %q", got, dir)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// DownloadAll — mocked exec
+// ---------------------------------------------------------------------------
+
+func TestDownloadAll_Mock(t *testing.T) {
+	origCmd := execCommand
+	execCommand = fakeExecCommand
+	defer func() { execCommand = origCmd }()
+
+	dir := t.TempDir()
+	targets := []string{"requests==2.31.0", "flask==3.0.0"}
+
+	err := DownloadAll(context.Background(), targets, dir)
+	if err != nil {
+		t.Fatalf("DownloadAll error: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DownloadAllNpm — mocked exec
+// ---------------------------------------------------------------------------
+
+func TestDownloadAllNpm_Mock(t *testing.T) {
+	origCmd := execCommand
+	execCommand = fakeExecCommand
+	defer func() { execCommand = origCmd }()
+
+	dir := t.TempDir()
+	// Create node_modules so the post-install check passes.
+	if err := os.MkdirAll(filepath.Join(dir, "node_modules"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	deps := map[string]string{
+		"lodash":  "4.17.21",
+		"express": "4.18.2",
+	}
+
+	err := DownloadAllNpm(context.Background(), deps, dir)
+	if err != nil {
+		t.Fatalf("DownloadAllNpm error: %v", err)
+	}
+
+	// Verify package.json was created.
+	pkgJSON := filepath.Join(dir, "package.json")
+	data, err := os.ReadFile(pkgJSON)
+	if err != nil {
+		t.Fatalf("reading package.json: %v", err)
+	}
+
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("package.json is not valid JSON: %v", err)
+	}
+
+	if parsed["name"] != "kojuto-staging" {
+		t.Errorf("package.json name = %v, want %q", parsed["name"], "kojuto-staging")
+	}
+
+	depsMap, ok := parsed["dependencies"].(map[string]interface{})
+	if !ok {
+		t.Fatal("package.json dependencies is not a map")
+	}
+	if depsMap["lodash"] != "4.17.21" {
+		t.Errorf("dependencies[lodash] = %v, want %q", depsMap["lodash"], "4.17.21")
+	}
+}
+
+func TestDownloadAllNpm_NoNodeModules(t *testing.T) {
+	origCmd := execCommand
+	execCommand = fakeExecCommand
+	defer func() { execCommand = origCmd }()
+
+	dir := t.TempDir()
+	deps := map[string]string{"lodash": "*"}
+
+	err := DownloadAllNpm(context.Background(), deps, dir)
+	if err == nil {
+		t.Error("expected error when node_modules not created, got nil")
+	}
+}

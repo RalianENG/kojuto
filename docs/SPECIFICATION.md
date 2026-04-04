@@ -42,8 +42,9 @@ An OSS tool that detects suspicious syscalls during package installation and imp
 | `listen(2)` | Listen for incoming connections | Backdoor listener setup |
 | `accept(2)` / `accept4(2)` | Accept incoming connections | Active backdoor operation |
 | `execve(2)` | Process creation | Malware binary execution, reverse shell |
-| `openat(2)` | File access (sensitive paths only) | Credential theft (`.ssh/`, `.aws/`, `/etc/shadow`) |
+| `openat(2)` | File access (sensitive paths only) | Credential theft (`.ssh/`, `.aws/`, `.env`, browser data, cloud CLI configs — ~40 paths) |
 | `rename(2)` / `renameat(2)` / `renameat2(2)` | File rename / move | Trusted binary hijacking (`/usr/local/bin/python3`) |
+| `dup2(2)` / `dup3(2)` | File descriptor redirection (stdin/stdout/stderr only) | Reverse shell detection (`connect → dup2 → execve /bin/sh`) |
 | `sendfile(2)` | Zero-copy file-to-socket transfer | Forensic trace (not parsed into events) |
 
 ### execve Analysis Logic

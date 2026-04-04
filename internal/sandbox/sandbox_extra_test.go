@@ -1,6 +1,8 @@
 package sandbox
 
 import (
+	"context"
+	"strings"
 	"testing"
 
 	"github.com/RalianENG/kojuto/internal/types"
@@ -9,6 +11,8 @@ import (
 const (
 	testMountPoint = "/home/dev/projects"
 	envCmd         = "env"
+	python3Bin     = "python3"
+	nodeBin        = "node"
 )
 
 func TestNew(t *testing.T) {
@@ -107,12 +111,12 @@ func TestImportCommands_PyPI(t *testing.T) {
 		// Should contain python3.
 		hasPython := false
 		for _, arg := range cmd {
-			if arg == "python3" {
+			if arg == python3Bin {
 				hasPython = true
 			}
 		}
 		if !hasPython {
-			t.Errorf("cmd[%d] should contain 'python3'", i)
+			t.Errorf("cmd[%d] should contain python3", i)
 		}
 	}
 }
@@ -131,12 +135,12 @@ func TestImportCommands_Npm(t *testing.T) {
 		}
 		hasNode := false
 		for _, arg := range cmd {
-			if arg == "node" {
+			if arg == nodeBin {
 				hasNode = true
 			}
 		}
 		if !hasNode {
-			t.Errorf("cmd[%d] should contain 'node'", i)
+			t.Errorf("cmd[%d] should contain node", i)
 		}
 	}
 }
@@ -240,5 +244,160 @@ func TestSandboxImage(t *testing.T) {
 func TestSandboxPythonVersion(t *testing.T) {
 	if SandboxPythonVersion != "3.12" {
 		t.Errorf("SandboxPythonVersion = %q, want '3.12'", SandboxPythonVersion)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SetLocalMode + InstallCommand
+// ---------------------------------------------------------------------------
+
+func TestSetLocalMode_InstallCommand(t *testing.T) {
+	sb := New("/mnt/packages", "requests", false, types.EcosystemPyPI, "")
+	sb.mountPoint = testMountPoint
+	sb.SetLocalMode(true)
+
+	cmd := sb.InstallCommand()
+	if len(cmd) == 0 {
+		t.Fatal("InstallCommand returned empty")
+	}
+
+	// Local mode uses "sh -c pip install ..."
+	if cmd[0] != "sh" {
+		t.Errorf("expected sh, got %s", cmd[0])
+	}
+	if cmd[1] != "-c" {
+		t.Errorf("expected -c, got %s", cmd[1])
+	}
+	if !strings.Contains(cmd[2], "pip install") {
+		t.Errorf("expected pip install in command, got %q", cmd[2])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// InstallAllCommand
+// ---------------------------------------------------------------------------
+
+func TestInstallAllCommand_PyPI(t *testing.T) {
+	sb := New("/mnt/packages", "requests", false, types.EcosystemPyPI, "")
+	sb.mountPoint = testMountPoint
+
+	pkgs := []string{"requests", "flask", "numpy"}
+	cmd := sb.InstallAllCommand(pkgs)
+
+	if len(cmd) == 0 {
+		t.Fatal("InstallAllCommand returned empty")
+	}
+	if cmd[0] != "pip" {
+		t.Errorf("expected pip, got %s", cmd[0])
+	}
+	if cmd[1] != "install" {
+		t.Errorf("expected install, got %s", cmd[1])
+	}
+	// The last 3 args should be the package names.
+	tail := cmd[len(cmd)-3:]
+	for i, want := range pkgs {
+		if tail[i] != want {
+			t.Errorf("arg[%d] = %q, want %q", i, tail[i], want)
+		}
+	}
+}
+
+func TestInstallAllCommand_Npm(t *testing.T) {
+	sb := New("/mnt/packages", "lodash", false, types.EcosystemNpm, "")
+
+	pkgs := []string{"lodash", "express"}
+	cmd := sb.InstallAllCommand(pkgs)
+
+	if len(cmd) == 0 {
+		t.Fatal("InstallAllCommand returned empty")
+	}
+	if cmd[0] != "npm" {
+		t.Errorf("expected npm, got %s", cmd[0])
+	}
+	if cmd[1] != "rebuild" {
+		t.Errorf("expected rebuild, got %s", cmd[1])
+	}
+	// Last 2 args should be package names.
+	tail := cmd[len(cmd)-2:]
+	for i, want := range pkgs {
+		if tail[i] != want {
+			t.Errorf("arg[%d] = %q, want %q", i, tail[i], want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// WriteProbeScriptsMulti
+// ---------------------------------------------------------------------------
+
+func TestWriteProbeScriptsMulti_PyPI(t *testing.T) {
+	withFakeExec(t)
+	sb := newTestSandbox(t, types.EcosystemPyPI)
+	sb.containerID = fakeContainerID
+
+	// Should not panic.
+	sb.WriteProbeScriptsMulti(context.Background(), []string{"requests", "flask"})
+}
+
+func TestWriteProbeScriptsMulti_Npm(t *testing.T) {
+	withFakeExec(t)
+	sb := New(t.TempDir(), "lodash", false, types.EcosystemNpm, "")
+	sb.containerID = fakeContainerID
+
+	// Should not panic.
+	sb.WriteProbeScriptsMulti(context.Background(), []string{"lodash", "express"})
+}
+
+// ---------------------------------------------------------------------------
+// ImportCommandsMulti
+// ---------------------------------------------------------------------------
+
+func TestImportCommandsMulti_PyPI(t *testing.T) {
+	sb := New("/tmp/pkg", "requests", false, types.EcosystemPyPI, "")
+	pkgs := []string{"requests", "flask"}
+	cmds := sb.ImportCommandsMulti(pkgs)
+
+	if len(cmds) != 3 {
+		t.Fatalf("expected 3 import commands, got %d", len(cmds))
+	}
+
+	for i, cmd := range cmds {
+		if cmd[0] != envCmd {
+			t.Errorf("cmd[%d] should start with 'env', got %q", i, cmd[0])
+		}
+		hasPython := false
+		for _, arg := range cmd {
+			if arg == python3Bin {
+				hasPython = true
+			}
+		}
+		if !hasPython {
+			t.Errorf("cmd[%d] should contain python3", i)
+		}
+	}
+}
+
+func TestImportCommandsMulti_Npm(t *testing.T) {
+	sb := New("/tmp/pkg", "lodash", false, types.EcosystemNpm, "")
+	pkgs := []string{"lodash", "express"}
+	cmds := sb.ImportCommandsMulti(pkgs)
+
+	if len(cmds) != 3 {
+		t.Fatalf("expected 3 import commands, got %d", len(cmds))
+	}
+
+	for i, cmd := range cmds {
+		if cmd[0] != envCmd {
+			t.Errorf("cmd[%d] should start with 'env', got %q", i, cmd[0])
+		}
+		hasNode := false
+		for _, arg := range cmd {
+			if arg == nodeBin {
+				hasNode = true
+			}
+		}
+		if !hasNode {
+			t.Errorf("cmd[%d] should contain node", i)
+		}
 	}
 }

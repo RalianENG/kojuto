@@ -460,6 +460,76 @@ func TestGetPIDNSInode_InvalidPID(t *testing.T) {
 	}
 }
 
+func TestSetVersionInfo(t *testing.T) {
+	SetVersionInfo("1.2.3", "abc", "2026-01-01")
+	if appVersion != "1.2.3" {
+		t.Errorf("appVersion = %q, want 1.2.3", appVersion)
+	}
+	if appCommit != "abc" {
+		t.Errorf("appCommit = %q, want abc", appCommit)
+	}
+	if appDate != "2026-01-01" {
+		t.Errorf("appDate = %q, want 2026-01-01", appDate)
+	}
+	// Reset
+	SetVersionInfo("dev", "none", "unknown")
+}
+
+func TestDownloadHint(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"pip not found", errors.New("executable file not found"), "pip is not installed"},
+		{"npm not found", errors.New("executable file not found"), "pip is not installed"},
+		{"no matching", errors.New("No matching distribution found"), "Check the name"},
+		{"404", errors.New("404 not found"), "package not found"},
+		{"other", errors.New("some random error"), ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := downloadHint(types.EcosystemPyPI, tc.err)
+			if tc.want != "" && !strings.Contains(got, tc.want) {
+				t.Errorf("downloadHint = %q, want containing %q", got, tc.want)
+			}
+			if tc.want == "" && got != "" {
+				t.Errorf("downloadHint = %q, want empty", got)
+			}
+		})
+	}
+
+	// npm ecosystem
+	got := downloadHint(types.EcosystemNpm, errors.New("executable file not found"))
+	if !strings.Contains(got, "npm is not installed") {
+		t.Errorf("npm hint = %q, want containing 'npm is not installed'", got)
+	}
+}
+
+func TestDockerHint(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"not found", errors.New("executable file not found"), "Docker is not installed"},
+		{"daemon", errors.New("Cannot connect to the Docker daemon"), "Docker daemon is not running"},
+		{"permission", errors.New("permission denied docker.sock"), "permission denied"},
+		{"other", errors.New("something else"), ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := dockerHint(tc.err)
+			if tc.want != "" && !strings.Contains(got, tc.want) {
+				t.Errorf("dockerHint = %q, want containing %q", got, tc.want)
+			}
+			if tc.want == "" && got != "" {
+				t.Errorf("dockerHint = %q, want empty", got)
+			}
+		})
+	}
+}
+
 func TestRunProbeAndInstall_UnknownMethod(t *testing.T) {
 	_, err := runProbeAndInstall(context.TODO(), nil, "test-pkg", "unknown-method")
 	if err == nil {

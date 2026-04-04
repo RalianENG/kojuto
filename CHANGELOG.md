@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0]
+
+### Added
+- **Configurable sensitive paths** — `kojuto.yml` config file with `include`/`exclude` for user-customizable sensitive path monitoring; `--config` flag to specify config location
+- **Sensitive path expansion (9 → ~40 patterns)** — cloud CLI (`.azure/`, `.config/gcloud/`, `.kube/config`), environment files (`.env`, `.env.local`), browser data (`google-chrome/`, `firefox/`), shell startup files (`.bashrc`, `.zshrc`, `.profile`), keyrings, app tokens (Slack, Discord, Terraform, Vault)
+- **DoH tunneling detection** — connections to known DNS-over-HTTPS servers (Google, Cloudflare, Quad9, OpenDNS, NextDNS) on port 443 classified as `dns_tunneling`
+- **Fileless execution detection** — `execve` from `/dev/shm/` and `/proc/self/fd/` paths always flagged as suspicious regardless of binary name
+- **Persistence monitoring** — `openat` with `O_WRONLY`/`O_RDWR` to shell startup files (`.bashrc`, `.zshrc`, `.profile`, `crontab`) classified as `persistence` (risk: high)
+- **Attack category classification** — each suspicious event enriched with `category` and `reason` fields: `c2_communication`, `credential_access`, `code_execution`, `binary_hijacking`, `backdoor`, `persistence`, `dns_tunneling`, `data_exfiltration`
+- **Report summary** — `summary` field with `risk_level` (critical/high/medium/none), `categories`, human-readable `description`, and actionable `remediation` guidance
+- **Batch screening mode** — `scan -f` now installs all packages in a single sandbox for fast screening; falls back to per-package scan only when suspicious activity detected. 50 PyPI packages in ~30s (was ~3 hours)
+- **Batch download** — `DownloadAll` (PyPI) and `DownloadAllNpm` for single-invocation batch downloads
+- **Combined import scripts** — one import probe script per OS identity instead of per-package, reducing Python/Node launches from N×3 to 3
+- **npm direct mount** — npm `node_modules` mounted writable directly (skip `cp -a` copy step), cutting npm batch scan time in half
+- `kojuto.example.yml` — sample config file with all default paths documented
+
+### Changed
+- Sensitive path detection expanded from 9 hardcoded patterns to ~40 configurable defaults covering credentials, cloud configs, browser data, shell startup files, and application tokens
+- `openat` events now distinguished by access mode: `O_RDONLY` → `credential_access`, `O_WRONLY`/`O_RDWR` to startup files → `persistence`
+- Default batch mode (`-f`) changed from per-package to single-sandbox screening with automatic fallback
+- npm `InstallAllCommand` targets only specified packages (not all transitive deps) for faster rebuild
+- `.tar.gz` auto-detection no longer overrides explicit `-e pypi` (fixes PyPI source distribution scanning)
+- Event buffer increased from 256 to 8192 with non-blocking overflow to prevent deadlock in large batch scans
+- Detection benchmarks updated: 300 randomly sampled malicious packages from Datadog dataset (61/61 detected, 0/70 FP)
+
+### Fixed
+- Local scan (`--local`) with source distributions (`.tar.gz`) now uses `--no-build-isolation` for sdist support
+
 ## [0.3.0]
 
 ### Added

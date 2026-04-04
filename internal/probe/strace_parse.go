@@ -71,6 +71,9 @@ var (
 // secret files. Only openat calls matching these patterns are emitted as events
 // to avoid flooding the event channel with thousands of benign file opens
 // during package installation.
+//
+// This is initialized to a minimal fallback. Call SetSensitivePaths to load
+// the full set from config (including user customizations).
 var sensitivePathPatterns = []string{
 	"/.ssh/",
 	"/.gnupg/",
@@ -81,9 +84,13 @@ var sensitivePathPatterns = []string{
 	"/.git-credentials",
 	"/.docker/config.json",
 	"/.config/gh/",
-	// .npmrc and .pypirc are intentionally excluded: npm and pip read these
-	// as part of their normal operation (registry config, auth tokens).
-	// Monitoring them would cause false positives on every scan.
+}
+
+// SetSensitivePaths replaces the sensitive path patterns used by the parser.
+// Must be called exactly once at startup (from PreRunE) before any parsing
+// begins. Not safe for concurrent use.
+func SetSensitivePaths(patterns []string) {
+	sensitivePathPatterns = patterns
 }
 
 func isSensitivePath(filePath string) bool {

@@ -269,3 +269,23 @@ func TestParseDNSName_LabelTooLong(t *testing.T) {
 		t.Errorf("expected empty for oversized label, got %q", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// SetSensitivePaths
+// ---------------------------------------------------------------------------
+
+func TestSetSensitivePaths(t *testing.T) {
+	orig := make([]string, len(sensitivePathPatterns))
+	copy(orig, sensitivePathPatterns)
+	defer SetSensitivePaths(orig)
+
+	custom := []string{"/.custom/secret", "/.my/key"}
+	SetSensitivePaths(custom)
+
+	if !isSensitivePath("/home/dev/.custom/secret/file") {
+		t.Error("expected custom path to be sensitive")
+	}
+	if isSensitivePath("/home/dev/.ssh/id_rsa") {
+		t.Error("expected .ssh to NOT be sensitive after override")
+	}
+}

@@ -12,7 +12,7 @@ If you discover a security vulnerability in kojuto, please report it responsibly
 
 **Do NOT open a public issue.**
 
-Instead, please email: **security@kojuto.dev** (or use GitHub's private vulnerability reporting feature).
+Instead, please use [GitHub's private vulnerability reporting](https://github.com/RalianENG/kojuto/security/advisories/new) feature.
 
 Include:
 - Description of the vulnerability
