@@ -4,6 +4,7 @@ import (
 	"math"
 	"net"
 	"path"
+	"strconv"
 	"strings"
 
 	"github.com/RalianENG/kojuto/internal/types"
@@ -11,6 +12,7 @@ import (
 
 // Analyze determines a verdict based on captured events.
 // Events matching known-benign patterns are filtered out first.
+// Suspicious events are enriched with Category and Reason fields.
 func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
 	var suspicious []types.SyscallEvent
 
@@ -19,6 +21,7 @@ func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
 			continue
 		}
 
+		classify(&events[i])
 		suspicious = append(suspicious, events[i])
 	}
 
@@ -27,6 +30,178 @@ func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
 	}
 
 	return types.VerdictClean, nil
+}
+
+// GenerateSummary creates a human-readable summary from analyzed events.
+func GenerateSummary(verdict string, events []types.SyscallEvent) *types.ReportSummary {
+	if verdict == types.VerdictClean {
+		return &types.ReportSummary{
+			RiskLevel:   "none",
+			Description: "No suspicious activity detected during install or import.",
+		}
+	}
+
+	if verdict == types.VerdictInconclusive {
+		return &types.ReportSummary{
+			RiskLevel:   "medium",
+			Description: "Probe data was lost (buffer overflow). Some events may have been missed.",
+			Remediation: "Re-scan with --probe-method=strace-container or increase timeout.",
+		}
+	}
+
+	// Collect unique categories.
+	catSet := make(map[string]bool)
+	for i := range events {
+		if events[i].Category != "" {
+			catSet[events[i].Category] = true
+		}
+	}
+	var categories []string
+	for c := range catSet {
+		categories = append(categories, c)
+	}
+
+	risk := assessRisk(categories)
+	desc := buildDescription(events, categories)
+	remediation := buildRemediation(categories)
+
+	return &types.ReportSummary{
+		RiskLevel:   risk,
+		Categories:  categories,
+		Description: desc,
+		Remediation: remediation,
+	}
+}
+
+func assessRisk(categories []string) string {
+	for _, c := range categories {
+		switch c {
+		case types.CategoryC2, types.CategoryDataExfil, types.CategoryCredentialAccess, types.CategoryBackdoor:
+			return "critical"
+		}
+	}
+	for _, c := range categories {
+		switch c {
+		case types.CategoryBinaryHijack, types.CategoryDNSTunnel:
+			return "high"
+		}
+	}
+	return "medium"
+}
+
+func buildDescription(_ []types.SyscallEvent, categories []string) string {
+	parts := make([]string, 0, len(categories))
+	for _, c := range categories {
+		switch c {
+		case types.CategoryC2:
+			parts = append(parts, "outbound connection to external server (possible C2)")
+		case types.CategoryDataExfil:
+			parts = append(parts, "data exfiltration via DNS tunneling")
+		case types.CategoryCredentialAccess:
+			parts = append(parts, "access to credential/secret files")
+		case types.CategoryCodeExecution:
+			parts = append(parts, "suspicious code execution during install")
+		case types.CategoryBinaryHijack:
+			parts = append(parts, "attempted replacement of trusted system binary")
+		case types.CategoryBackdoor:
+			parts = append(parts, "server socket opened (backdoor indicator)")
+		case types.CategoryDNSTunnel:
+			parts = append(parts, "DNS tunneling detected (high-entropy subdomain queries)")
+		}
+	}
+	return strings.Join(parts, "; ") + "."
+}
+
+func buildRemediation(categories []string) string {
+	for _, c := range categories {
+		switch c {
+		case types.CategoryC2, types.CategoryDataExfil, types.CategoryBackdoor:
+			return "Do NOT install this package. Remove it from dependencies immediately. " +
+				"If previously installed, audit the host for compromised credentials and rotate secrets."
+		case types.CategoryCredentialAccess:
+			return "Do NOT install this package. If previously installed, rotate all credentials " +
+				"that were present on the machine (SSH keys, AWS tokens, Git credentials, etc.)."
+		}
+	}
+	return "Do NOT install this package. Review the events list for details."
+}
+
+// classify assigns Category and Reason to a suspicious event.
+func classify(evt *types.SyscallEvent) {
+	switch evt.Syscall {
+	case types.EventConnect:
+		evt.Category = types.CategoryC2
+		evt.Reason = "Outbound connection to " + evt.DstAddr + ":" + portStr(evt.DstPort) +
+			" — packages should not make network connections during install or import."
+
+	case types.EventSendto, types.EventSendmsg, types.EventSendmmsg:
+		if evt.DNSQuery != "" {
+			evt.Category = types.CategoryDNSTunnel
+			evt.Reason = "DNS query to " + evt.DNSQuery +
+				" contains high-entropy subdomains, indicating data exfiltration via DNS tunneling."
+		} else {
+			evt.Category = types.CategoryC2
+			evt.Reason = "Network data sent to " + evt.DstAddr + ":" + portStr(evt.DstPort) + "."
+		}
+
+	case types.EventBind, types.EventListen, types.EventAccept:
+		evt.Category = types.CategoryBackdoor
+		evt.Reason = "Server socket operation (" + evt.Syscall + ") detected — " +
+			"indicates a backdoor listener or reverse shell."
+
+	case types.EventExecve:
+		classifyExecve(evt)
+
+	case types.EventOpenat:
+		evt.Category = types.CategoryCredentialAccess
+		evt.Reason = "Access to sensitive file: " + evt.FilePath +
+			" — legitimate packages do not read credential files during install."
+
+	case types.EventRename:
+		evt.Category = types.CategoryBinaryHijack
+		evt.Reason = "Rename " + evt.SrcPath + " -> " + evt.DstPath +
+			" — attempted replacement of trusted system binary."
+	}
+}
+
+func classifyExecve(evt *types.SyscallEvent) {
+	cmdline := evt.Cmdline
+	base := path.Base(evt.Comm)
+
+	// Inline code execution.
+	if hasInlineExecFlag(cmdline, interpreterExecFlags[base]) {
+		evt.Category = types.CategoryCodeExecution
+		evt.Reason = base + " executed with inline code flag (-c/-e). " +
+			"Legitimate packages use script files, not inline code injection."
+		return
+	}
+
+	// Shell command analysis.
+	if shells[base] && hasInlineExecFlag(cmdline, []string{" -c "}) {
+		evt.Category = types.CategoryCodeExecution
+		evt.Reason = "Shell command: " + truncate(cmdline, 200) +
+			" — contains suspicious commands not expected during package installation."
+		return
+	}
+
+	// Unknown binary.
+	evt.Category = types.CategoryCodeExecution
+	evt.Reason = "Unexpected process execution: " + truncate(cmdline, 200) +
+		" — binary not in the allowed list for package installation."
+}
+
+func portStr(port uint16) string {
+	if port == 0 {
+		return "?"
+	}
+	return strconv.FormatUint(uint64(port), 10)
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 func isBenign(evt *types.SyscallEvent) bool {

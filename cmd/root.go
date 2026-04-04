@@ -960,7 +960,8 @@ func outputReport(pkg string, result *scanResult) error {
 		verdict = types.VerdictInconclusive
 	}
 
-	r := report.Generate(pkg, flagVersion, flagEcosystem, verdict, result.method, filtered, result.lostSamples)
+	summary := analyzer.GenerateSummary(verdict, filtered)
+	r := report.Generate(pkg, flagVersion, flagEcosystem, verdict, result.method, filtered, result.lostSamples, summary)
 	printVerdict(verdict, len(filtered), result.lostSamples)
 
 	w, err := openOutput()
