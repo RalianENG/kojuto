@@ -763,3 +763,107 @@ func TestGenerateSummary_Persistence(t *testing.T) {
 		t.Errorf("remediation should mention .bashrc, got %q", s.Remediation)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// DoH detection
+// ---------------------------------------------------------------------------
+
+func TestClassify_DoH_Cloudflare(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventConnect, DstAddr: "1.1.1.1", DstPort: 443, Family: 2},
+	}
+	_, filtered := Analyze(events)
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(filtered))
+	}
+	if filtered[0].Category != types.CategoryDNSTunnel {
+		t.Errorf("category = %q, want %q", filtered[0].Category, types.CategoryDNSTunnel)
+	}
+	if !strings.Contains(filtered[0].Reason, "DNS-over-HTTPS") {
+		t.Errorf("reason should mention DNS-over-HTTPS, got %q", filtered[0].Reason)
+	}
+}
+
+func TestClassify_DoH_Google(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventConnect, DstAddr: "8.8.8.8", DstPort: 443, Family: 2},
+	}
+	_, filtered := Analyze(events)
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(filtered))
+	}
+	if filtered[0].Category != types.CategoryDNSTunnel {
+		t.Errorf("category = %q, want %q", filtered[0].Category, types.CategoryDNSTunnel)
+	}
+}
+
+func TestClassify_DoH_NotPort443(t *testing.T) {
+	// DoH server on port 53 = regular DNS, not DoH.
+	events := []types.SyscallEvent{
+		{Syscall: types.EventConnect, DstAddr: "1.1.1.1", DstPort: 53, Family: 2},
+	}
+	_, filtered := Analyze(events)
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(filtered))
+	}
+	// Should be C2, not DNS tunnel (port 53 connect is already suspicious).
+	if filtered[0].Category != types.CategoryC2 {
+		t.Errorf("category = %q, want %q", filtered[0].Category, types.CategoryC2)
+	}
+}
+
+func TestIsKnownDoHServer(t *testing.T) {
+	known := []string{"1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222"}
+	for _, ip := range known {
+		if !isKnownDoHServer(ip) {
+			t.Errorf("expected %s to be known DoH server", ip)
+		}
+	}
+	if isKnownDoHServer("203.0.113.50") {
+		t.Error("random IP should not be DoH server")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// /dev/shm execution detection
+// ---------------------------------------------------------------------------
+
+func TestAnalyze_DevShmExecution(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventExecve, Comm: "/dev/shm/payload", Cmdline: "/dev/shm/payload --exfil"},
+	}
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictSuspicious {
+		t.Errorf("expected suspicious for /dev/shm exec, got %s", verdict)
+	}
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(filtered))
+	}
+	if !strings.Contains(filtered[0].Reason, "fileless") {
+		t.Errorf("reason should mention fileless, got %q", filtered[0].Reason)
+	}
+}
+
+func TestAnalyze_ProcSelfFdExecution(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventExecve, Comm: "/proc/self/fd/3", Cmdline: "/proc/self/fd/3"},
+	}
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictSuspicious {
+		t.Errorf("expected suspicious for /proc/self/fd exec, got %s", verdict)
+	}
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(filtered))
+	}
+}
+
+func TestAnalyze_DevShmBenignBinaryName(t *testing.T) {
+	// Even if the binary is named "python3", /dev/shm is never allowed.
+	events := []types.SyscallEvent{
+		{Syscall: types.EventExecve, Comm: "/dev/shm/python3", Cmdline: "python3 setup.py"},
+	}
+	verdict, _ := Analyze(events)
+	if verdict != types.VerdictSuspicious {
+		t.Errorf("expected suspicious for /dev/shm/python3, got %s", verdict)
+	}
+}

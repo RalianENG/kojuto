@@ -142,9 +142,15 @@ func buildRemediation(categories []string) string {
 func classify(evt *types.SyscallEvent) {
 	switch evt.Syscall {
 	case types.EventConnect:
-		evt.Category = types.CategoryC2
-		evt.Reason = "Outbound connection to " + evt.DstAddr + ":" + portStr(evt.DstPort) +
-			" — packages should not make network connections during install or import."
+		if isKnownDoHServer(evt.DstAddr) && evt.DstPort == 443 {
+			evt.Category = types.CategoryDNSTunnel
+			evt.Reason = "Connection to known DNS-over-HTTPS server " + evt.DstAddr + ":443" +
+				" — may be used for DNS tunneling to bypass port-53 monitoring."
+		} else {
+			evt.Category = types.CategoryC2
+			evt.Reason = "Outbound connection to " + evt.DstAddr + ":" + portStr(evt.DstPort) +
+				" — packages should not make network connections during install or import."
+		}
 
 	case types.EventSendto, types.EventSendmsg, types.EventSendmmsg:
 		if evt.DNSQuery != "" {
@@ -225,6 +231,17 @@ func classifyOpenat(evt *types.SyscallEvent) {
 func classifyExecve(evt *types.SyscallEvent) {
 	cmdline := evt.Cmdline
 	base := path.Base(evt.Comm)
+	dir := path.Dir(evt.Comm) + "/"
+
+	// Execution from suspicious directories (fileless attack).
+	for _, d := range suspiciousExecDirs {
+		if strings.HasPrefix(dir, d) {
+			evt.Category = types.CategoryCodeExecution
+			evt.Reason = "Execution from suspicious path: " + evt.Comm +
+				" — indicates fileless attack or payload staged in memory-backed filesystem."
+			return
+		}
+	}
 
 	// Inline code execution.
 	if hasInlineExecFlag(cmdline, interpreterExecFlags[base]) {
@@ -246,6 +263,28 @@ func classifyExecve(evt *types.SyscallEvent) {
 	evt.Category = types.CategoryCodeExecution
 	evt.Reason = "Unexpected process execution: " + truncate(cmdline, 200) +
 		" — binary not in the allowed list for package installation."
+}
+
+// knownDoHServers are IP addresses of public DNS-over-HTTPS providers.
+// Connections to these on port 443 may indicate DNS tunneling that
+// bypasses traditional port-53 monitoring.
+var knownDoHServers = map[string]bool{
+	// Google
+	"8.8.8.8": true, "8.8.4.4": true,
+	"2001:4860:4860::8888": true, "2001:4860:4860::8844": true,
+	// Cloudflare
+	"1.1.1.1": true, "1.0.0.1": true,
+	"2606:4700:4700::1111": true, "2606:4700:4700::1001": true,
+	// Quad9
+	"9.9.9.9": true, "149.112.112.112": true,
+	// OpenDNS
+	"208.67.222.222": true, "208.67.220.220": true,
+	// NextDNS
+	"45.90.28.0": true, "45.90.30.0": true,
+}
+
+func isKnownDoHServer(addr string) bool {
+	return knownDoHServers[addr]
 }
 
 func portStr(port uint16) string {
@@ -400,11 +439,25 @@ var shellSafeCommands = map[string]bool{
 // isBenignExec filters out expected subprocess calls during pip/npm install.
 // It validates the binary name, its directory, and (for shells/interpreters)
 // the content of the command being executed.
+// suspiciousExecDirs are directories where legitimate binaries should never run from.
+// Execution from these paths indicates fileless attacks or payload drops.
+var suspiciousExecDirs = []string{
+	"/dev/shm/",      // tmpfs — fileless execution
+	"/proc/self/fd/", // fd-based execution bypass
+}
+
 func isBenignExec(evt *types.SyscallEvent) bool {
 	// Use path (not filepath) because these are Linux container paths,
 	// and kojuto may run on Windows or macOS.
 	base := path.Base(evt.Comm)
 	dir := path.Dir(evt.Comm) + "/"
+
+	// Execution from suspicious directories is always malicious.
+	for _, d := range suspiciousExecDirs {
+		if strings.HasPrefix(dir, d) {
+			return false
+		}
+	}
 
 	// Python/node with inline code execution flags → always suspicious.
 	if flags, ok := interpreterExecFlags[base]; ok && hasInlineExecFlag(evt.Cmdline, flags) {
