@@ -73,7 +73,7 @@ func (c *ContainerStrace) buildCommand(ctx context.Context, containerID string, 
 	args := []string{
 		"exec", containerID,
 		"strace", "-f",
-		"-e", "trace=connect,sendto,sendmsg,sendmmsg,bind,listen,accept,accept4,execve,openat,rename,renameat,renameat2,sendfile",
+		"-e", "trace=connect,sendto,sendmsg,sendmmsg,bind,listen,accept,accept4,execve,openat,rename,renameat,renameat2,sendfile,dup2,dup3",
 		"-e", "signal=none",
 		"--",
 	}

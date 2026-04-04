@@ -14,6 +14,7 @@ const (
 	EventExecve   = "execve"
 	EventOpenat   = "openat"
 	EventRename   = "rename"
+	EventDup      = "dup2"
 )
 
 // SyscallEvent represents a suspicious syscall captured by the probe.
@@ -27,6 +28,7 @@ type SyscallEvent struct {
 	SrcPath   string    `json:"src_path,omitempty"`
 	DstPath   string    `json:"dst_path,omitempty"`
 	DNSQuery  string    `json:"dns_query,omitempty"`
+	TargetFD  int       `json:"target_fd,omitempty"` // dup2: target file descriptor (0=stdin, 1=stdout, 2=stderr)
 	Syscall   string    `json:"syscall"`
 	Category  string    `json:"category,omitempty"`
 	Reason    string    `json:"reason,omitempty"`
@@ -44,6 +46,8 @@ const (
 	CategoryCodeExecution    = "code_execution"
 	CategoryBinaryHijack     = "binary_hijacking"
 	CategoryBackdoor         = "backdoor"
+	CategoryReverseShell     = "reverse_shell"
+	CategoryPersistence      = "persistence"
 	CategoryDNSTunnel        = "dns_tunneling"
 )
 

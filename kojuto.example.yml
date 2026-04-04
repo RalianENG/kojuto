@@ -1,0 +1,15 @@
+# kojuto configuration file
+# Copy to kojuto.yml and customize as needed.
+
+sensitive_paths:
+  # Additional paths to monitor (added to the ~40 built-in defaults).
+  # Use substring patterns — any openat call whose path contains
+  # the pattern will be flagged as suspicious.
+  include:
+    # - "/.config/custom-app/"
+    # - "/my/secret/path"
+
+  # Paths to exclude from monitoring (removes from defaults).
+  # Useful if a default pattern causes false positives in your environment.
+  exclude:
+    # - "/.bashrc"   # uncomment if install scripts legitimately read shell config

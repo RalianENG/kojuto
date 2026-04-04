@@ -642,3 +642,124 @@ func TestGenerateSummary_DataExfil(t *testing.T) {
 		t.Errorf("risk_level = %q, want %q", s.RiskLevel, riskCritical)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// classifyOpenat (via Analyze)
+// ---------------------------------------------------------------------------
+
+func TestClassify_OpenatRead(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventOpenat, FilePath: "/home/dev/.aws/credentials", OpenFlags: "O_RDONLY"},
+	}
+	_, filtered := Analyze(events)
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(filtered))
+	}
+	if filtered[0].Category != types.CategoryCredentialAccess {
+		t.Errorf("category = %q, want %q", filtered[0].Category, types.CategoryCredentialAccess)
+	}
+	if !strings.Contains(filtered[0].Reason, "Read") {
+		t.Errorf("reason should mention Read, got %q", filtered[0].Reason)
+	}
+}
+
+func TestClassify_OpenatWriteSensitive(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventOpenat, FilePath: "/home/dev/.ssh/id_rsa", OpenFlags: "O_WRONLY"},
+	}
+	_, filtered := Analyze(events)
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(filtered))
+	}
+	if filtered[0].Category != types.CategoryCredentialAccess {
+		t.Errorf("category = %q, want %q", filtered[0].Category, types.CategoryCredentialAccess)
+	}
+	if !strings.Contains(filtered[0].Reason, "Write") {
+		t.Errorf("reason should mention Write, got %q", filtered[0].Reason)
+	}
+}
+
+func TestClassify_OpenatWriteBashrc(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventOpenat, FilePath: "/home/dev/.bashrc", OpenFlags: "O_WRONLY"},
+	}
+	_, filtered := Analyze(events)
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(filtered))
+	}
+	if filtered[0].Category != types.CategoryPersistence {
+		t.Errorf("category = %q, want %q", filtered[0].Category, types.CategoryPersistence)
+	}
+}
+
+func TestClassify_OpenatWriteZshrc(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventOpenat, FilePath: "/home/dev/.zshrc", OpenFlags: "O_RDWR"},
+	}
+	_, filtered := Analyze(events)
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(filtered))
+	}
+	if filtered[0].Category != types.CategoryPersistence {
+		t.Errorf("category = %q, want %q", filtered[0].Category, types.CategoryPersistence)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// dup2 / reverse shell
+// ---------------------------------------------------------------------------
+
+func TestClassify_Dup2_Stdin(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventDup, TargetFD: 0},
+	}
+	_, filtered := Analyze(events)
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(filtered))
+	}
+	if filtered[0].Category != types.CategoryReverseShell {
+		t.Errorf("category = %q, want %q", filtered[0].Category, types.CategoryReverseShell)
+	}
+	if !strings.Contains(filtered[0].Reason, "stdin") {
+		t.Errorf("reason should mention stdin, got %q", filtered[0].Reason)
+	}
+}
+
+func TestClassify_Dup2_Stdout(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventDup, TargetFD: 1},
+	}
+	_, filtered := Analyze(events)
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(filtered))
+	}
+	if !strings.Contains(filtered[0].Reason, "stdout") {
+		t.Errorf("reason should mention stdout, got %q", filtered[0].Reason)
+	}
+}
+
+func TestGenerateSummary_ReverseShell(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventDup, Category: types.CategoryReverseShell},
+	}
+	s := GenerateSummary(types.VerdictSuspicious, events)
+	if s.RiskLevel != riskCritical {
+		t.Errorf("risk_level = %q, want %q", s.RiskLevel, riskCritical)
+	}
+	if !strings.Contains(s.Remediation, "interactive shell") {
+		t.Errorf("remediation should mention interactive shell, got %q", s.Remediation)
+	}
+}
+
+func TestGenerateSummary_Persistence(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventOpenat, Category: types.CategoryPersistence},
+	}
+	s := GenerateSummary(types.VerdictSuspicious, events)
+	if s.RiskLevel != riskHigh {
+		t.Errorf("risk_level = %q, want %q", s.RiskLevel, riskHigh)
+	}
+	if !strings.Contains(s.Remediation, ".bashrc") {
+		t.Errorf("remediation should mention .bashrc, got %q", s.Remediation)
+	}
+}

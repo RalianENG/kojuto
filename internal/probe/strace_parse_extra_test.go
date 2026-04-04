@@ -269,3 +269,72 @@ func TestParseDNSName_LabelTooLong(t *testing.T) {
 		t.Errorf("expected empty for oversized label, got %q", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// parseDup
+// ---------------------------------------------------------------------------
+
+func TestParseStraceLine_Dup2_Stdin(t *testing.T) {
+	line := `[pid 500] dup2(5, 0) = 0`
+	evt, ok := parseStraceLine(line)
+	if !ok {
+		t.Fatal("expected dup2 parse to succeed")
+	}
+	if evt.Syscall != types.EventDup {
+		t.Errorf("expected dup2, got %s", evt.Syscall)
+	}
+	if evt.TargetFD != 0 {
+		t.Errorf("expected target fd 0, got %d", evt.TargetFD)
+	}
+}
+
+func TestParseStraceLine_Dup2_Stdout(t *testing.T) {
+	line := `[pid 600] dup2(5, 1) = 1`
+	evt, ok := parseStraceLine(line)
+	if !ok {
+		t.Fatal("expected dup2 parse to succeed")
+	}
+	if evt.TargetFD != 1 {
+		t.Errorf("expected target fd 1, got %d", evt.TargetFD)
+	}
+}
+
+func TestParseStraceLine_Dup3(t *testing.T) {
+	line := `[pid 700] dup3(5, 2, O_CLOEXEC) = 2`
+	evt, ok := parseStraceLine(line)
+	if !ok {
+		t.Fatal("expected dup3 parse to succeed")
+	}
+	if evt.TargetFD != 2 {
+		t.Errorf("expected target fd 2, got %d", evt.TargetFD)
+	}
+}
+
+func TestParseStraceLine_Dup2_HighFD_Ignored(t *testing.T) {
+	// dup2 to fd > 2 is not suspicious (normal pipe/fd management).
+	line := `[pid 800] dup2(3, 10) = 10`
+	_, ok := parseStraceLine(line)
+	if ok {
+		t.Error("expected dup2 to high fd to be ignored")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SetSensitivePaths
+// ---------------------------------------------------------------------------
+
+func TestSetSensitivePaths(t *testing.T) {
+	orig := make([]string, len(sensitivePathPatterns))
+	copy(orig, sensitivePathPatterns)
+	defer SetSensitivePaths(orig)
+
+	custom := []string{"/.custom/secret", "/.my/key"}
+	SetSensitivePaths(custom)
+
+	if !isSensitivePath("/home/dev/.custom/secret/file") {
+		t.Error("expected custom path to be sensitive")
+	}
+	if isSensitivePath("/home/dev/.ssh/id_rsa") {
+		t.Error("expected .ssh to NOT be sensitive after override")
+	}
+}

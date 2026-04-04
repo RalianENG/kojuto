@@ -76,13 +76,14 @@ func GenerateSummary(verdict string, events []types.SyscallEvent) *types.ReportS
 func assessRisk(categories []string) string {
 	for _, c := range categories {
 		switch c {
-		case types.CategoryC2, types.CategoryDataExfil, types.CategoryCredentialAccess, types.CategoryBackdoor:
+		case types.CategoryC2, types.CategoryDataExfil, types.CategoryCredentialAccess,
+			types.CategoryBackdoor, types.CategoryReverseShell:
 			return "critical"
 		}
 	}
 	for _, c := range categories {
 		switch c {
-		case types.CategoryBinaryHijack, types.CategoryDNSTunnel:
+		case types.CategoryBinaryHijack, types.CategoryDNSTunnel, types.CategoryPersistence:
 			return "high"
 		}
 	}
@@ -105,6 +106,10 @@ func buildDescription(_ []types.SyscallEvent, categories []string) string {
 			parts = append(parts, "attempted replacement of trusted system binary")
 		case types.CategoryBackdoor:
 			parts = append(parts, "server socket opened (backdoor indicator)")
+		case types.CategoryReverseShell:
+			parts = append(parts, "reverse shell detected (stdin/stdout redirected to socket)")
+		case types.CategoryPersistence:
+			parts = append(parts, "write to shell startup file (persistence mechanism)")
 		case types.CategoryDNSTunnel:
 			parts = append(parts, "DNS tunneling detected (high-entropy subdomain queries)")
 		}
@@ -115,12 +120,19 @@ func buildDescription(_ []types.SyscallEvent, categories []string) string {
 func buildRemediation(categories []string) string {
 	for _, c := range categories {
 		switch c {
+		case types.CategoryReverseShell:
+			return "Do NOT install this package. If previously installed, the attacker may have had " +
+				"interactive shell access. Audit the host for unauthorized changes, rotate all credentials, " +
+				"and check for persistence mechanisms (.bashrc, crontab, authorized_keys)."
 		case types.CategoryC2, types.CategoryDataExfil, types.CategoryBackdoor:
 			return "Do NOT install this package. Remove it from dependencies immediately. " +
 				"If previously installed, audit the host for compromised credentials and rotate secrets."
 		case types.CategoryCredentialAccess:
 			return "Do NOT install this package. If previously installed, rotate all credentials " +
 				"that were present on the machine (SSH keys, AWS tokens, Git credentials, etc.)."
+		case types.CategoryPersistence:
+			return "Do NOT install this package. If previously installed, inspect shell startup files " +
+				"(.bashrc, .zshrc, .profile) and crontab for injected malicious code."
 		}
 	}
 	return "Do NOT install this package. Review the events list for details."
@@ -153,14 +165,60 @@ func classify(evt *types.SyscallEvent) {
 		classifyExecve(evt)
 
 	case types.EventOpenat:
-		evt.Category = types.CategoryCredentialAccess
-		evt.Reason = "Access to sensitive file: " + evt.FilePath +
-			" — legitimate packages do not read credential files during install."
+		classifyOpenat(evt)
 
 	case types.EventRename:
 		evt.Category = types.CategoryBinaryHijack
 		evt.Reason = "Rename " + evt.SrcPath + " -> " + evt.DstPath +
 			" — attempted replacement of trusted system binary."
+
+	case types.EventDup:
+		evt.Category = types.CategoryReverseShell
+		fdName := fdNames[evt.TargetFD]
+		evt.Reason = "dup2 redirecting " + fdName +
+			" — classic reverse shell pattern (connect → dup2 → execve /bin/sh)."
+	}
+}
+
+// persistenceTargets are path substrings that indicate shell startup files.
+// Writing to these means the attacker is injecting persistent code.
+var persistenceTargets = []string{
+	"/.bashrc", "/.bash_profile", "/.zshrc", "/.profile",
+	"/.bash_history", "/.zsh_history",
+	"/crontab",
+}
+
+// fdNames maps file descriptor numbers to human-readable names.
+var fdNames = map[int]string{
+	0: "stdin (fd 0)",
+	1: "stdout (fd 1)",
+	2: "stderr (fd 2)",
+}
+
+func classifyOpenat(evt *types.SyscallEvent) {
+	isWrite := strings.Contains(evt.OpenFlags, "O_WRONLY") ||
+		strings.Contains(evt.OpenFlags, "O_RDWR")
+
+	// Check if this is a write to a persistence target (e.g. .bashrc).
+	if isWrite {
+		for _, target := range persistenceTargets {
+			if strings.Contains(evt.FilePath, target) {
+				evt.Category = types.CategoryPersistence
+				evt.Reason = "Write to shell startup file: " + evt.FilePath +
+					" — attacker may be injecting persistent backdoor code."
+				return
+			}
+		}
+	}
+
+	// Default: credential/secret file access.
+	evt.Category = types.CategoryCredentialAccess
+	if isWrite {
+		evt.Reason = "Write to sensitive file: " + evt.FilePath +
+			" — legitimate packages do not modify credential files."
+	} else {
+		evt.Reason = "Read of sensitive file: " + evt.FilePath +
+			" — legitimate packages do not access credential files during install."
 	}
 }
 
@@ -220,6 +278,9 @@ func isBenign(evt *types.SyscallEvent) bool {
 		return false
 	case types.EventRename:
 		return isBenignRename(evt)
+	case types.EventDup:
+		// dup2 redirecting stdin/stdout/stderr is always suspicious.
+		return false
 	default:
 		return false
 	}

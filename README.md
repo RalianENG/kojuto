@@ -17,7 +17,7 @@ An EDR for package installations — monitors syscalls during install and import
 
 1. **Download** — Fetch the target package to the host (network allowed)
 2. **Isolate** — Run installation inside a hardened Docker container with network isolation
-3. **Install + Monitor** — Record `connect`, `sendto`, `sendmsg`, `sendmmsg`, `bind`, `listen`, `accept`, `execve`, `openat`, `rename`, and `sendfile` syscalls via strace (or eBPF)
+3. **Install + Monitor** — Record `connect`, `sendto`, `sendmsg`, `sendmmsg`, `bind`, `listen`, `accept`, `execve`, `openat`, `rename`, `dup2`, and `sendfile` syscalls via strace (or eBPF)
 4. **Import + Monitor** — Import/require the package under 3 simulated OS identities (Linux, Windows, macOS) with time shifted +30 days via `libfaketime` to trigger platform-gated and date-gated payloads
 5. **Report** — Output findings as JSON
 
@@ -95,6 +95,7 @@ sudo ./scripts/setup-caps.sh ./kojuto
 | `--runtime` | Container runtime: default (runc) or `runsc` (gVisor) |
 | `--probe-method` | `auto` / `ebpf` / `strace` / `strace-container` (default: `auto`) |
 | `--timeout` | Scan timeout per package (default: `5m`) |
+| `--config` | Config file path (default: `kojuto.yml` in current directory) |
 
 ### Exit Codes
 
@@ -229,10 +230,24 @@ Of the 300 malicious samples, 238 failed to install (dependencies already remove
 | Category | Examples | Detection method |
 |----------|----------|-----------------|
 | C2 communication | `aiogram-types-v3` → `147.45.124.42:80`, `airio` → DNS exfil | `connect`/`sendto` to external IPs |
-| Credential theft | `axios-attack-demo` → `.ssh/id_rsa`, `.aws/credentials`, `.git-credentials` | `openat` on sensitive paths |
+| Credential theft | `axios-attack-demo` → `.ssh/id_rsa`, `.aws/credentials`, `.git-credentials` | `openat` on ~40 sensitive paths |
+| Reverse shell | `connect → dup2(fd, 0) → dup2(fd, 1) → execve /bin/sh` | `dup2` redirecting stdin/stdout |
+| Persistence | Write to `.bashrc`, `.zshrc`, `.profile`, `crontab` | `openat` with `O_WRONLY`/`O_RDWR` |
 | Data exfiltration | `a1rn` → `curl -F a=@/flag <IP>` | `execve` with `curl`/`wget` |
 | Code execution | `advpruebitaa` → `type nul > prueba11.txt`, `aio3` → `start python3` | `execve` with inline `-c`/`-e` flags |
 | Payload drop | `axios-attack-demo` → `python3 /tmp/ld.py` | `execve` of `/tmp` binaries |
+
+### Configuration
+
+Sensitive path patterns are customizable via `kojuto.yml` (see [`kojuto.example.yml`](kojuto.example.yml)):
+
+```yaml
+sensitive_paths:
+  include:
+    - "/.config/custom-app/"
+  exclude:
+    - "/.bashrc"   # if your packages legitimately read shell config
+```
 
 ### False positive verification
 
