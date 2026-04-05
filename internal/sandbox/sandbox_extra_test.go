@@ -193,10 +193,10 @@ func TestFaketimeEnv(t *testing.T) {
 	hasPreload := false
 	hasFaketime := false
 	for _, e := range env {
-		if e == "FAKETIME=+30d" {
+		if strings.HasPrefix(e, "FAKETIME=+") && strings.HasSuffix(e, "d") {
 			hasFaketime = true
 		}
-		if len(e) > 10 && e[:10] == "LD_PRELOAD" {
+		if strings.HasPrefix(e, "LD_PRELOAD") {
 			hasPreload = true
 		}
 	}
@@ -205,7 +205,16 @@ func TestFaketimeEnv(t *testing.T) {
 		t.Error("expected LD_PRELOAD in faketimeEnv")
 	}
 	if !hasFaketime {
-		t.Error("expected FAKETIME=+30d in faketimeEnv")
+		t.Error("expected FAKETIME=+Nd in faketimeEnv")
+	}
+}
+
+func TestFaketimeShiftDays(t *testing.T) {
+	for range 100 {
+		d := faketimeShiftDays()
+		if d < 30 || d > 180 {
+			t.Errorf("faketimeShiftDays() = %d, want [30, 180]", d)
+		}
 	}
 }
 
