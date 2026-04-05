@@ -44,13 +44,14 @@ An OSS tool that detects suspicious syscalls during package installation and imp
 | `execve(2)` | Process creation | Malware binary execution, reverse shell |
 | `openat(2)` | File access (sensitive paths only) | Credential theft (`.ssh/`, `.aws/`, `.env`, browser data, cloud CLI configs — ~40 paths) |
 | `rename(2)` / `renameat(2)` / `renameat2(2)` | File rename / move | Trusted binary hijacking (`/usr/local/bin/python3`) |
-| `dup2(2)` / `dup3(2)` | File descriptor redirection (stdin/stdout/stderr only) | Reverse shell detection (`connect → dup2 → execve /bin/sh`) |
+| `ptrace(2)` | `PTRACE_TRACEME` self-check | Anti-debugging evasion (detects tracing to suppress malicious behavior) |
 | `sendfile(2)` | Zero-copy file-to-socket transfer | Forensic trace (not parsed into events) |
 
 ### execve Analysis Logic
 
 - Validates full binary path (directory + basename), not just basename
 - For `sh -c` / `bash -c`: inspects the first token of the command against `shellSafeCommands`
+- Shell commands whose arguments reference sensitive paths are flagged (e.g. `cat ~/.ssh/id_rsa`)
 - `python3 -c` / `node -e` flagged as suspicious (inline code execution)
 - `sed` excluded from benign list (GNU sed `e` command can execute shell)
 
@@ -138,7 +139,7 @@ CLI (cobra)
 
 ### Time-Shifted Import (libfaketime)
 
-- Import probes run with `LD_PRELOAD=libfaketime.so` and `FAKETIME=+30d`
+- Import probes run with `LD_PRELOAD=libfaketime.so` and `FAKETIME=+Nd` where N is randomized between 30 and 180
 - Triggers date-gated payloads (e.g. `if datetime.now() > datetime(2026, 5, 1): attack()`)
 - Intercepts `gettimeofday`/`clock_gettime` at libc level — covers Python `datetime.now()`, Node `Date.now()`
 - Install phase uses real time to avoid breaking pip/npm
