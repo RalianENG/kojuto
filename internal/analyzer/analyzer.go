@@ -10,6 +10,17 @@ import (
 	"github.com/RalianENG/kojuto/internal/types"
 )
 
+// sensitivePathPatterns mirrors the probe-layer patterns so that the analyzer
+// can flag shell commands whose arguments reference credential files.
+// Initialized to a minimal fallback; call SetSensitivePaths at startup.
+var sensitivePathPatterns []string
+
+// SetSensitivePaths configures the sensitive path patterns used by the analyzer
+// to detect credential access via shell commands (e.g. "cat ~/.ssh/id_rsa").
+func SetSensitivePaths(patterns []string) {
+	sensitivePathPatterns = patterns
+}
+
 // Analyze determines a verdict based on captured events.
 // Events matching known-benign patterns are filtered out first.
 // Suspicious events are enriched with Category and Reason fields.
@@ -513,6 +524,12 @@ func isShellCmdBenign(cmdline string) bool {
 		if isFileOpTargetingTrustedDir(firstBase, seg) {
 			return false
 		}
+
+		// Block commands whose arguments reference sensitive paths.
+		// e.g. "cat ~/.ssh/id_rsa", "grep -r . ~/.aws/", "head ~/.git-credentials"
+		if argsTouchSensitivePath(seg) {
+			return false
+		}
 	}
 
 	return true
@@ -634,6 +651,23 @@ func isFileOpTargetingTrustedDir(base, segment string) bool {
 		}
 	}
 
+	return false
+}
+
+// argsTouchSensitivePath returns true if any non-flag argument in the shell
+// segment contains a sensitive path pattern (e.g. "/.ssh/", "/.aws/").
+func argsTouchSensitivePath(segment string) bool {
+	fields := strings.Fields(segment)
+	for _, f := range fields[1:] { // skip the command itself
+		if strings.HasPrefix(f, "-") {
+			continue
+		}
+		for _, pattern := range sensitivePathPatterns {
+			if strings.Contains(f, pattern) {
+				return true
+			}
+		}
+	}
 	return false
 }
 

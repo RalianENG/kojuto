@@ -156,6 +156,7 @@ func preRunLoadConfig(_ *cobra.Command, _ []string) error {
 	}
 	paths := config.MergeSensitivePaths(cfg)
 	probe.SetSensitivePaths(paths)
+	analyzer.SetSensitivePaths(paths)
 	return nil
 }
 
