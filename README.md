@@ -183,7 +183,7 @@ sudo ./scripts/setup-caps.sh ./kojuto
 
 ```yaml
 # Scan a single package
-- uses: RalianENG/kojuto@39cea4e39ddda9f30613be36a22dcc9ec475f7f6  # v0.4.0
+- uses: RalianENG/kojuto@b4ddd5dd4e0980695e938800f2a88f3b090bba63  # v0.5.0
   with:
     package: your-dependency
     version: '2.31.0'        # optional
@@ -192,13 +192,13 @@ sudo ./scripts/setup-caps.sh ./kojuto
     timeout: 5m               # optional (default: 5m)
 
 # Scan all dependencies from a file
-- uses: RalianENG/kojuto@39cea4e39ddda9f30613be36a22dcc9ec475f7f6  # v0.4.0
+- uses: RalianENG/kojuto@b4ddd5dd4e0980695e938800f2a88f3b090bba63  # v0.5.0
   with:
     file: requirements.txt    # or package.json
     pin: locked.txt           # optional: generate pinned file if all clean
 
 # Scan a local package file
-- uses: RalianENG/kojuto@39cea4e39ddda9f30613be36a22dcc9ec475f7f6  # v0.4.0
+- uses: RalianENG/kojuto@b4ddd5dd4e0980695e938800f2a88f3b090bba63  # v0.5.0
   with:
     local: ./suspicious-1.0.0.whl
 ```
