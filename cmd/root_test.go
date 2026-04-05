@@ -530,6 +530,56 @@ func TestDockerHint(t *testing.T) {
 	}
 }
 
+func TestPreRunLoadConfig_Default(t *testing.T) {
+	// No config file, no strict — should use defaults without error.
+	origConfig := flagConfig
+	origStrict := flagStrict
+	defer func() { flagConfig = origConfig; flagStrict = origStrict }()
+
+	flagConfig = "nonexistent-config-file.yml"
+	flagStrict = false
+
+	if err := preRunLoadConfig(nil, nil); err != nil {
+		t.Fatalf("preRunLoadConfig failed: %v", err)
+	}
+}
+
+func TestPreRunLoadConfig_StrictIgnoresExclude(t *testing.T) {
+	origConfig := flagConfig
+	origStrict := flagStrict
+	defer func() { flagConfig = origConfig; flagStrict = origStrict }()
+
+	// Write a temp config with excludes.
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "kojuto.yml")
+	os.WriteFile(cfgPath, []byte("sensitive_paths:\n  exclude:\n    - \"/.ssh/\"\n"), 0644)
+
+	flagConfig = cfgPath
+	flagStrict = true
+
+	if err := preRunLoadConfig(nil, nil); err != nil {
+		t.Fatalf("preRunLoadConfig with --strict failed: %v", err)
+	}
+}
+
+func TestPreRunLoadConfig_InvalidConfig(t *testing.T) {
+	origConfig := flagConfig
+	origStrict := flagStrict
+	defer func() { flagConfig = origConfig; flagStrict = origStrict }()
+
+	// Write invalid YAML.
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "bad.yml")
+	os.WriteFile(cfgPath, []byte("{{invalid yaml"), 0644)
+
+	flagConfig = cfgPath
+	flagStrict = false
+
+	if err := preRunLoadConfig(nil, nil); err == nil {
+		t.Fatal("expected error for invalid config")
+	}
+}
+
 func TestRunProbeAndInstall_UnknownMethod(t *testing.T) {
 	_, err := runProbeAndInstall(context.TODO(), nil, "test-pkg", "unknown-method")
 	if err == nil {
