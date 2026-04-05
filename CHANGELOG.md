@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0]
+
+### Added
+- **Anti-debugging evasion detection** — `ptrace(PTRACE_TRACEME)` calls parsed from strace output and classified as `evasion` category (risk: high)
+- **`--strict` flag** — ignores `sensitive_paths.exclude` from `kojuto.yml`, preventing config-based detection bypass; enabled by default in the GitHub Action
+- **Known Limitations** section in README and SECURITY.md documenting out-of-scope attack vectors (memory-only execution, low-entropy DNS tunneling, environment variable reads)
+
+### Changed
+- **Dockerfile hardening** — replaced NodeSource `curl | bash` with multi-stage `COPY` from digest-pinned `node:20-slim` official image; removed unpinned `pip install pip setuptools wheel` (base image versions used as-is)
+- **GitHub Action SHA pinning** — usage examples reference full commit SHA instead of mutable `@v0` tag, with Dependabot config for automated updates
+- **Randomized faketime offset** — `libfaketime` shift randomized to +30–180 days per scan (was fixed +30d) to prevent hardcoded bypass; upper bound avoids TLS certificate expiry
+- **Shell command sensitive path check** — `isShellCmdBenign` now flags commands whose arguments reference sensitive paths (e.g. `cat ~/.ssh/id_rsa`, `grep -r . ~/.aws/`), closing a gap where `shellSafeCommands` allowed credential reads via benign binaries
+- GitHub Action `strict` input defaults to `true` (breaking: existing `sensitive_paths.exclude` configs are ignored in CI unless `strict: false` is set)
+
+### Fixed
+- `shellSafeCommands` bypass: `cat`, `grep`, `head`, `tail` could read credential files without triggering execve-level detection
+
+### Security
+- Low-entropy DNS tunneling evasion documented as design tradeoff (entropy threshold vs false positive rate; network isolation limits practical impact)
+- Memory-only execution (`mmap` + `PROT_EXEC`) documented as known limitation (network isolation and read-only rootfs limit impact; `--runtime runsc` recommended for additional protection)
+
 ## [0.4.0]
 
 ### Added

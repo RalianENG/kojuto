@@ -65,6 +65,11 @@ var (
 	straceRenameatRe = regexp.MustCompile(
 		`renameat2?\([^,]+,\s*"([^"]+)",\s*[^,]+,\s*"([^"]+)"`,
 	)
+
+	// ptrace(PTRACE_TRACEME, ...) = -1 EPERM — anti-debugging evasion attempt.
+	stracePtraceTracemeRe = regexp.MustCompile(
+		`ptrace\(PTRACE_TRACEME`,
+	)
 )
 
 // sensitivePathPatterns are substrings that indicate access to credential or
@@ -147,6 +152,10 @@ func parseStraceLine(line string) (types.SyscallEvent, bool) {
 		return evt, true
 	}
 
+	if evt, ok := parsePtraceTraceme(line); ok {
+		return evt, true
+	}
+
 	return types.SyscallEvent{}, false
 }
 
@@ -204,6 +213,23 @@ func parseRename(line string) (types.SyscallEvent, bool) {
 	}
 
 	return types.SyscallEvent{}, false
+}
+
+// parsePtraceTraceme detects ptrace(PTRACE_TRACEME) calls in strace output.
+// Under strace, the traced process's own PTRACE_TRACEME returns EPERM because
+// it is already being traced. Malware uses this to detect tracing and suppress
+// malicious behavior. Any PTRACE_TRACEME call during install/import is suspicious.
+func parsePtraceTraceme(line string) (types.SyscallEvent, bool) {
+	if !stracePtraceTracemeRe.MatchString(line) {
+		return types.SyscallEvent{}, false
+	}
+
+	return types.SyscallEvent{
+		Timestamp: time.Now().UTC(),
+		PID:       extractPID(line),
+		Syscall:   types.EventPtrace,
+		Comm:      "ptrace(PTRACE_TRACEME)",
+	}, true
 }
 
 func parseConnectOrSendto(line string, re *regexp.Regexp, syscall string) (types.SyscallEvent, bool) {

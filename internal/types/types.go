@@ -14,6 +14,7 @@ const (
 	EventExecve   = "execve"
 	EventOpenat   = "openat"
 	EventRename   = "rename"
+	EventPtrace   = "ptrace"
 )
 
 // SyscallEvent represents a suspicious syscall captured by the probe.
@@ -46,6 +47,7 @@ const (
 	CategoryBackdoor         = "backdoor"
 	CategoryPersistence      = "persistence"
 	CategoryDNSTunnel        = "dns_tunneling"
+	CategoryEvasion          = "evasion"
 )
 
 // Scan phases.
