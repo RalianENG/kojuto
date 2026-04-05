@@ -94,7 +94,8 @@ func assessRisk(categories []string) string {
 	}
 	for _, c := range categories {
 		switch c {
-		case types.CategoryBinaryHijack, types.CategoryDNSTunnel, types.CategoryPersistence:
+		case types.CategoryBinaryHijack, types.CategoryDNSTunnel, types.CategoryPersistence,
+			types.CategoryEvasion:
 			return "high"
 		}
 	}
@@ -121,6 +122,8 @@ func buildDescription(_ []types.SyscallEvent, categories []string) string {
 			parts = append(parts, "write to shell startup file (persistence mechanism)")
 		case types.CategoryDNSTunnel:
 			parts = append(parts, "DNS tunneling detected (high-entropy subdomain queries)")
+		case types.CategoryEvasion:
+			parts = append(parts, "anti-debugging evasion detected (ptrace self-check)")
 		}
 	}
 	return strings.Join(parts, "; ") + "."
@@ -182,6 +185,11 @@ func classify(evt *types.SyscallEvent) {
 		evt.Category = types.CategoryBinaryHijack
 		evt.Reason = "Rename " + evt.SrcPath + " -> " + evt.DstPath +
 			" — attempted replacement of trusted system binary."
+
+	case types.EventPtrace:
+		evt.Category = types.CategoryEvasion
+		evt.Reason = "ptrace(PTRACE_TRACEME) detected — anti-debugging technique " +
+			"used to detect tracing and suppress malicious behavior."
 	}
 }
 
