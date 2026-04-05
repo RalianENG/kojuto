@@ -289,3 +289,60 @@ func TestSetSensitivePaths(t *testing.T) {
 		t.Error("expected .ssh to NOT be sensitive after override")
 	}
 }
+
+func TestParsePtraceTraceme(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		want bool
+	}{
+		{
+			name: "PTRACE_TRACEME failure",
+			line: `[pid 123] ptrace(PTRACE_TRACEME) = -1 EPERM (Operation not permitted)`,
+			want: true,
+		},
+		{
+			name: "PTRACE_TRACEME success",
+			line: `[pid 456] ptrace(PTRACE_TRACEME) = 0`,
+			want: true,
+		},
+		{
+			name: "PTRACE_ATTACH not matched",
+			line: `[pid 789] ptrace(PTRACE_ATTACH, 100) = 0`,
+			want: false,
+		},
+		{
+			name: "unrelated syscall",
+			line: `[pid 100] openat(AT_FDCWD, "/etc/hosts", O_RDONLY) = 3`,
+			want: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			evt, ok := parsePtraceTraceme(tc.line)
+			if ok != tc.want {
+				t.Errorf("parsePtraceTraceme(%q) = _, %v; want %v", tc.line, ok, tc.want)
+			}
+			if ok {
+				if evt.Syscall != types.EventPtrace {
+					t.Errorf("expected syscall %q, got %q", types.EventPtrace, evt.Syscall)
+				}
+			}
+		})
+	}
+}
+
+func TestParseStraceLine_PtraceTraceme(t *testing.T) {
+	line := `[pid 500] ptrace(PTRACE_TRACEME) = -1 EPERM (Operation not permitted)`
+	evt, ok := parseStraceLine(line)
+	if !ok {
+		t.Fatal("expected parseStraceLine to match ptrace line")
+	}
+	if evt.Syscall != types.EventPtrace {
+		t.Errorf("expected syscall %q, got %q", types.EventPtrace, evt.Syscall)
+	}
+	if evt.PID != 500 {
+		t.Errorf("expected PID 500, got %d", evt.PID)
+	}
+}
