@@ -167,9 +167,22 @@ sudo ./scripts/setup-caps.sh ./kojuto
 
 ## GitHub Actions
 
+> **Security**: Pin to a full commit SHA to prevent tag-tampering attacks.
+> Use [Dependabot](https://docs.github.com/en/code-security/dependabot) to keep the SHA up to date automatically:
+>
+> ```yaml
+> # .github/dependabot.yml
+> version: 2
+> updates:
+>   - package-ecosystem: "github-actions"
+>     directory: "/"
+>     schedule:
+>       interval: "weekly"
+> ```
+
 ```yaml
 # Scan a single package
-- uses: RalianENG/kojuto@v0
+- uses: RalianENG/kojuto@39cea4e39ddda9f30613be36a22dcc9ec475f7f6  # v0.4.0
   with:
     package: your-dependency
     version: '2.31.0'        # optional
@@ -178,13 +191,13 @@ sudo ./scripts/setup-caps.sh ./kojuto
     timeout: 5m               # optional (default: 5m)
 
 # Scan all dependencies from a file
-- uses: RalianENG/kojuto@v0
+- uses: RalianENG/kojuto@39cea4e39ddda9f30613be36a22dcc9ec475f7f6  # v0.4.0
   with:
     file: requirements.txt    # or package.json
     pin: locked.txt           # optional: generate pinned file if all clean
 
 # Scan a local package file
-- uses: RalianENG/kojuto@v0
+- uses: RalianENG/kojuto@39cea4e39ddda9f30613be36a22dcc9ec475f7f6  # v0.4.0
   with:
     local: ./suspicious-1.0.0.whl
 ```
