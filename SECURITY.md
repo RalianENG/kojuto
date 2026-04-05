@@ -63,6 +63,17 @@ kojuto is a security tool that intentionally runs untrusted code in an isolated 
 - Package mount path mirrors host directory layout
 - Isolated bridge network provides real network interfaces (connect returns `ETIMEDOUT`, not `ENETUNREACH`)
 
+### Known Limitations
+
+kojuto detects malicious behavior at the syscall level. The following attack vectors are outside its current detection scope:
+
+- **Memory-only execution** (`mmap` + `PROT_EXEC`): Shellcode executed via JIT-style memory mapping without `execve`. Network isolation and read-only filesystem limit the practical impact. Use `--runtime runsc` (gVisor) for additional kernel-level protection against container escape via kernel exploits.
+- **Legitimate-host exfiltration**: Stolen data sent via connections to benign hosts (e.g. `pypi.org:443`) cannot be distinguished from normal traffic at the syscall level, as kojuto does not inspect packet payloads.
+- **Environment variable reads**: `os.environ` / `process.env` access does not generate syscalls (values are in process memory at startup). Honeypot environment variables are set, but reads are detected only indirectly when the values are exfiltrated via network connections.
+- **Import-time delayed execution**: kojuto imports packages but does not call their functions. Payloads that activate only when specific functions are called (e.g. `pkg.connect()`) will not trigger during scanning.
+- **Timing beyond +180 days**: `libfaketime` shifts the clock by a random offset between +30 and +180 days. Payloads gated on dates further in the future may not activate. The upper bound avoids TLS certificate expiry issues.
+- **Low-entropy DNS tunneling**: DNS tunneling detection relies on Shannon entropy (> 3.5 bits/char) and label length heuristics. Dictionary-based encoding schemes that produce low-entropy subdomain labels can evade detection. This is a deliberate design tradeoff: lowering the entropy threshold would cause false positives on legitimate package registry queries. Network isolation prevents DNS queries from reaching external servers, limiting the practical impact.
+
 ### Host Protection
 
 - Packages are never executed on the host system

@@ -821,3 +821,94 @@ func TestAnalyze_DevShmBenignBinaryName(t *testing.T) {
 		t.Errorf("expected suspicious for /dev/shm/python3, got %s", verdict)
 	}
 }
+
+func TestSetSensitivePaths(t *testing.T) {
+	orig := sensitivePathPatterns
+	defer func() { sensitivePathPatterns = orig }()
+
+	SetSensitivePaths([]string{"/.custom-secret/"})
+	if len(sensitivePathPatterns) != 1 || sensitivePathPatterns[0] != "/.custom-secret/" {
+		t.Errorf("SetSensitivePaths did not update patterns: %v", sensitivePathPatterns)
+	}
+}
+
+func TestArgsTouchSensitivePath(t *testing.T) {
+	orig := sensitivePathPatterns
+	defer func() { sensitivePathPatterns = orig }()
+	SetSensitivePaths([]string{"/.ssh/", "/.aws/"})
+
+	cases := []struct {
+		name    string
+		segment string
+		want    bool
+	}{
+		{"cat ssh key", "cat /home/dev/.ssh/id_rsa", true},
+		{"grep aws creds", "grep -r . /home/dev/.aws/credentials", true},
+		{"head git creds", "head /home/dev/.aws/config", true},
+		{"benign cat", "cat /etc/hosts", false},
+		{"flag only", "ls -la", false},
+		{"no args", "ls", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := argsTouchSensitivePath(tc.segment)
+			if got != tc.want {
+				t.Errorf("argsTouchSensitivePath(%q) = %v, want %v", tc.segment, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAnalyze_ShellCmdSensitivePath(t *testing.T) {
+	orig := sensitivePathPatterns
+	defer func() { sensitivePathPatterns = orig }()
+	SetSensitivePaths([]string{"/.ssh/", "/.aws/"})
+
+	events := []types.SyscallEvent{
+		{
+			Syscall: types.EventExecve,
+			Comm:    "/bin/sh",
+			Cmdline: "sh -c cat /home/dev/.ssh/id_rsa",
+		},
+	}
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictSuspicious {
+		t.Errorf("expected suspicious for shell cmd accessing .ssh, got %s", verdict)
+	}
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(filtered))
+	}
+	if filtered[0].Category != types.CategoryCodeExecution {
+		t.Errorf("expected category %q, got %q", types.CategoryCodeExecution, filtered[0].Category)
+	}
+}
+
+func TestAnalyze_PtraceTraceme(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventPtrace, Comm: "ptrace(PTRACE_TRACEME)"},
+	}
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictSuspicious {
+		t.Errorf("expected suspicious for ptrace, got %s", verdict)
+	}
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(filtered))
+	}
+	if filtered[0].Category != types.CategoryEvasion {
+		t.Errorf("expected category %q, got %q", types.CategoryEvasion, filtered[0].Category)
+	}
+}
+
+func TestGenerateSummary_Evasion(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventPtrace, Category: types.CategoryEvasion},
+	}
+	summary := GenerateSummary(types.VerdictSuspicious, events)
+	if summary.RiskLevel != riskHigh {
+		t.Errorf("expected risk %q for evasion, got %q", riskHigh, summary.RiskLevel)
+	}
+	if !strings.Contains(summary.Description, "anti-debugging") {
+		t.Errorf("expected description to mention anti-debugging, got %q", summary.Description)
+	}
+}

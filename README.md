@@ -28,7 +28,7 @@ The sandbox is intentionally seeded with realistic artifacts to provoke maliciou
 
 All values are randomly generated per scan to prevent signature-based evasion and ensure unique execution environments.
 
-`openat` detects credential access (`.ssh/`, `.gnupg/`, `.aws/`, `/etc/shadow`, `/proc/self/environ`, `.netrc`, `.git-credentials`, `.docker/config.json`, `.config/gh/`), `rename` detects trusted binary replacement, `bind`/`listen`/`accept` detect backdoor server setup, and DNS tunneling detection extracts query domains from `sendto` payloads to flag high-entropy subdomains used for data exfiltration. `sendfile` is traced for forensic purposes but not parsed into structured events.
+`openat` detects credential access (`.ssh/`, `.gnupg/`, `.aws/`, `/etc/shadow`, `/proc/self/environ`, `.netrc`, `.git-credentials`, `.docker/config.json`, `.config/gh/`), `rename` detects trusted binary replacement, `bind`/`listen`/`accept` detect backdoor server setup, and DNS tunneling detection extracts query domains from `sendto` payloads to flag high-entropy subdomains used for data exfiltration. `ptrace(PTRACE_TRACEME)` detects anti-debugging evasion where malware checks if it is being traced. `sendfile` is traced for forensic purposes but not parsed into structured events.
 
 Well-behaved packages typically do not make unexpected network connections, spawn unrelated processes, access credential files, or modify trusted binaries during install or import. Any such activity is treated as suspicious and surfaced for review.
 
@@ -168,9 +168,22 @@ sudo ./scripts/setup-caps.sh ./kojuto
 
 ## GitHub Actions
 
+> **Security**: Pin to a full commit SHA to prevent tag-tampering attacks.
+> Use [Dependabot](https://docs.github.com/en/code-security/dependabot) to keep the SHA up to date automatically:
+>
+> ```yaml
+> # .github/dependabot.yml
+> version: 2
+> updates:
+>   - package-ecosystem: "github-actions"
+>     directory: "/"
+>     schedule:
+>       interval: "weekly"
+> ```
+
 ```yaml
 # Scan a single package
-- uses: RalianENG/kojuto@v0
+- uses: RalianENG/kojuto@39cea4e39ddda9f30613be36a22dcc9ec475f7f6  # v0.4.0
   with:
     package: your-dependency
     version: '2.31.0'        # optional
@@ -179,13 +192,13 @@ sudo ./scripts/setup-caps.sh ./kojuto
     timeout: 5m               # optional (default: 5m)
 
 # Scan all dependencies from a file
-- uses: RalianENG/kojuto@v0
+- uses: RalianENG/kojuto@39cea4e39ddda9f30613be36a22dcc9ec475f7f6  # v0.4.0
   with:
     file: requirements.txt    # or package.json
     pin: locked.txt           # optional: generate pinned file if all clean
 
 # Scan a local package file
-- uses: RalianENG/kojuto@v0
+- uses: RalianENG/kojuto@39cea4e39ddda9f30613be36a22dcc9ec475f7f6  # v0.4.0
   with:
     local: ./suspicious-1.0.0.whl
 ```
@@ -254,6 +267,10 @@ sensitive_paths:
 ### False positive verification
 
 50 popular PyPI packages (flask, django, requests, cryptography, pydantic, etc.) and 20 npm packages (lodash, express, axios, etc.) scanned with zero false positives.
+
+## Known Limitations
+
+kojuto detects malicious behavior at the syscall level. Some attack vectors are outside its detection scope, including memory-only execution (`mmap` + `PROT_EXEC`), data exfiltration via legitimate hosts, and environment variable reads without network exfiltration. See [SECURITY.md](SECURITY.md) for full details.
 
 ## Security
 

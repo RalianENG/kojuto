@@ -10,6 +10,17 @@ import (
 	"github.com/RalianENG/kojuto/internal/types"
 )
 
+// sensitivePathPatterns mirrors the probe-layer patterns so that the analyzer
+// can flag shell commands whose arguments reference credential files.
+// Initialized to a minimal fallback; call SetSensitivePaths at startup.
+var sensitivePathPatterns []string
+
+// SetSensitivePaths configures the sensitive path patterns used by the analyzer
+// to detect credential access via shell commands (e.g. "cat ~/.ssh/id_rsa").
+func SetSensitivePaths(patterns []string) {
+	sensitivePathPatterns = patterns
+}
+
 // Analyze determines a verdict based on captured events.
 // Events matching known-benign patterns are filtered out first.
 // Suspicious events are enriched with Category and Reason fields.
@@ -83,7 +94,8 @@ func assessRisk(categories []string) string {
 	}
 	for _, c := range categories {
 		switch c {
-		case types.CategoryBinaryHijack, types.CategoryDNSTunnel, types.CategoryPersistence:
+		case types.CategoryBinaryHijack, types.CategoryDNSTunnel, types.CategoryPersistence,
+			types.CategoryEvasion:
 			return "high"
 		}
 	}
@@ -110,6 +122,8 @@ func buildDescription(_ []types.SyscallEvent, categories []string) string {
 			parts = append(parts, "write to shell startup file (persistence mechanism)")
 		case types.CategoryDNSTunnel:
 			parts = append(parts, "DNS tunneling detected (high-entropy subdomain queries)")
+		case types.CategoryEvasion:
+			parts = append(parts, "anti-debugging evasion detected (ptrace self-check)")
 		}
 	}
 	return strings.Join(parts, "; ") + "."
@@ -171,6 +185,11 @@ func classify(evt *types.SyscallEvent) {
 		evt.Category = types.CategoryBinaryHijack
 		evt.Reason = "Rename " + evt.SrcPath + " -> " + evt.DstPath +
 			" — attempted replacement of trusted system binary."
+
+	case types.EventPtrace:
+		evt.Category = types.CategoryEvasion
+		evt.Reason = "ptrace(PTRACE_TRACEME) detected — anti-debugging technique " +
+			"used to detect tracing and suppress malicious behavior."
 	}
 }
 
@@ -513,6 +532,12 @@ func isShellCmdBenign(cmdline string) bool {
 		if isFileOpTargetingTrustedDir(firstBase, seg) {
 			return false
 		}
+
+		// Block commands whose arguments reference sensitive paths.
+		// e.g. "cat ~/.ssh/id_rsa", "grep -r . ~/.aws/", "head ~/.git-credentials"
+		if argsTouchSensitivePath(seg) {
+			return false
+		}
 	}
 
 	return true
@@ -634,6 +659,23 @@ func isFileOpTargetingTrustedDir(base, segment string) bool {
 		}
 	}
 
+	return false
+}
+
+// argsTouchSensitivePath returns true if any non-flag argument in the shell
+// segment contains a sensitive path pattern (e.g. "/.ssh/", "/.aws/").
+func argsTouchSensitivePath(segment string) bool {
+	fields := strings.Fields(segment)
+	for _, f := range fields[1:] { // skip the command itself
+		if strings.HasPrefix(f, "-") {
+			continue
+		}
+		for _, pattern := range sensitivePathPatterns {
+			if strings.Contains(f, pattern) {
+				return true
+			}
+		}
+	}
 	return false
 }
 

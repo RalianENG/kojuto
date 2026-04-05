@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"math/big"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -696,22 +697,35 @@ func (s *Sandbox) WriteProbeScripts(ctx context.Context) {
 }
 
 // faketimeEnv returns environment variable prefix that activates libfaketime.
-// The clock is advanced +30 days and runs at 100x speed so that:
+// The clock is advanced by a random offset between 30 and 180 days so that:
 // - Absolute date checks (e.g. "if date > May 1st: attack()") trigger immediately
 // - Relative sleeps (e.g. sleep(300)) complete in ~3 seconds
+// - The random offset prevents malware from hardcoding a bypass for a fixed shift
+// The upper bound of 180 days avoids TLS certificate expiry issues that could
+// break pip/npm operations (certificates are valid for up to 398 days).
 // libfaketime intercepts gettimeofday/clock_gettime at the libc level, which
 // covers Python's datetime.now(), time.time(), and Node's Date.now().
 func faketimeEnv() []string {
+	days := faketimeShiftDays()
 	return []string{
 		"LD_PRELOAD=/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1",
-		"FAKETIME=+30d",
+		fmt.Sprintf("FAKETIME=+%dd", days),
 		"FAKETIME_NO_CACHE=1",
 		"FAKETIME_TIMESTAMP_FILE=",
 	}
 }
 
+// faketimeShiftDays returns a random number of days between 30 and 180.
+func faketimeShiftDays() int {
+	n, err := rand.Int(rand.Reader, big.NewInt(151)) // [0, 150]
+	if err != nil {
+		return 30 // fallback to minimum on error
+	}
+	return int(n.Int64()) + 30 // [30, 180]
+}
+
 // wrapWithFaketime prepends env command with faketime environment variables
-// to the given command, so the process sees a clock advanced +30 days.
+// to the given command, so the process sees a clock advanced by a random offset.
 func wrapWithFaketime(cmd []string) []string {
 	envArgs := []string{"env"}
 	envArgs = append(envArgs, faketimeEnv()...)

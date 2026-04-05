@@ -46,6 +46,7 @@ var (
 	flagRuntime     string
 	flagTimeout     time.Duration
 	flagConfig      string
+	flagStrict      bool
 )
 
 // Replaceable dependencies for testing.
@@ -140,6 +141,7 @@ func init() {
 	scanCmd.Flags().StringVar(&flagProbeMethod, "probe-method", methodAuto, "probe method: auto, ebpf, strace, strace-container")
 	scanCmd.Flags().DurationVar(&flagTimeout, "timeout", 5*time.Minute, "scan timeout per package")
 	scanCmd.Flags().StringVar(&flagConfig, "config", "", "config file path (default: kojuto.yml in current directory)")
+	scanCmd.Flags().BoolVar(&flagStrict, "strict", false, "ignore sensitive_paths.exclude from config (recommended for CI)")
 
 	rootCmd.AddCommand(scanCmd)
 	rootCmd.AddCommand(versionCmd)
@@ -154,8 +156,16 @@ func preRunLoadConfig(_ *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("loading config %s: %w", cfgPath, err)
 	}
+
+	if flagStrict && len(cfg.SensitivePaths.Exclude) > 0 {
+		fmt.Fprintf(os.Stderr, "warning: --strict ignoring %d excluded path(s) from config: %v\n",
+			len(cfg.SensitivePaths.Exclude), cfg.SensitivePaths.Exclude)
+		cfg.SensitivePaths.Exclude = nil
+	}
+
 	paths := config.MergeSensitivePaths(cfg)
 	probe.SetSensitivePaths(paths)
+	analyzer.SetSensitivePaths(paths)
 	return nil
 }
 
