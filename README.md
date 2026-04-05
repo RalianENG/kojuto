@@ -267,6 +267,10 @@ sensitive_paths:
 
 50 popular PyPI packages (flask, django, requests, cryptography, pydantic, etc.) and 20 npm packages (lodash, express, axios, etc.) scanned with zero false positives.
 
+## Known Limitations
+
+kojuto detects malicious behavior at the syscall level. Some attack vectors are outside its detection scope, including memory-only execution (`mmap` + `PROT_EXEC`), data exfiltration via legitimate hosts, and environment variable reads without network exfiltration. See [SECURITY.md](SECURITY.md) for full details.
+
 ## Security
 
 See [SECURITY.md](SECURITY.md).
