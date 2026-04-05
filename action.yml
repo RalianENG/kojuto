@@ -41,6 +41,10 @@ inputs:
     description: 'Scan timeout per package (e.g. 5m, 10m)'
     required: false
     default: '5m'
+  strict:
+    description: 'Ignore sensitive_paths.exclude from config (recommended for CI)'
+    required: false
+    default: 'true'
 
 outputs:
   verdict:
@@ -76,6 +80,7 @@ runs:
         KOJUTO_RUNTIME: ${{ inputs.runtime }}
         KOJUTO_PROBE_METHOD: ${{ inputs.probe-method }}
         KOJUTO_TIMEOUT: ${{ inputs.timeout }}
+        KOJUTO_STRICT: ${{ inputs.strict }}
       run: |
         ARGS=()
 
@@ -105,6 +110,9 @@ runs:
         ARGS+=("--timeout" "$KOJUTO_TIMEOUT")
         if [ -n "$KOJUTO_RUNTIME" ]; then
           ARGS+=("--runtime" "$KOJUTO_RUNTIME")
+        fi
+        if [ "$KOJUTO_STRICT" = "true" ]; then
+          ARGS+=("--strict")
         fi
 
         sudo "${{ github.action_path }}/kojuto" scan "${ARGS[@]}" \
