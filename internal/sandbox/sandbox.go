@@ -110,6 +110,11 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 
 	args = append(args,
 		"--network="+s.networkName,
+		// Fake DNS: RFC 5737 TEST-NET-2 address, guaranteed unreachable.
+		// Prevents fingerprinting via empty /etc/resolv.conf while ensuring
+		// DNS resolution attempts generate a connect:53 event in strace
+		// (connect returns ENETUNREACH — no packets leave the host).
+		"--dns=198.51.100.1",
 		"--security-opt=no-new-privileges",
 		"--read-only",
 		"--cap-drop=ALL",
@@ -240,27 +245,25 @@ func getHostUsername() string {
 	return "user"
 }
 
-// createIsolatedNetwork creates a Docker bridge network with iptables rules
-// that DROP all outbound traffic. This replaces --network=none so that:
-// - /proc/net/tcp shows a real network interface (anti-fingerprint)
-// - connect() returns ETIMEDOUT instead of ENETUNREACH (anti-fingerprint)
-// - No actual data can leave the container.
-func (s *Sandbox) createIsolatedNetwork(ctx context.Context) error {
-	s.networkName = "kojuto-jail-" + strconv.Itoa(os.Getpid())
-
-	// Create an internal bridge network (no external gateway).
-	cmd := execCommand(ctx, "docker", "network", "create",
-		"--internal",
-		"--subnet=172.30.0.0/24",
-		s.networkName)
-	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
-
-	if err := cmd.Run(); err != nil {
-		// Fallback to --network=none if network creation fails.
-		s.networkName = networkNone
-	}
-
+// createIsolatedNetwork configures complete network isolation for the sandbox.
+//
+// Security design: --network=none ensures ZERO external communication.
+// No DNS resolver, no TCP/UDP sockets, no bridge interface. The kernel
+// rejects all connect()/sendto() syscalls with ENETUNREACH — there is
+// no network stack to exploit.
+//
+// Anti-fingerprinting countermeasures (applied post-start via eraseFingerprints):
+//   - Fake /etc/resolv.conf with a plausible nameserver IP
+//   - connect() returning ENETUNREACH is indistinguishable from a firewalled
+//     host for most malware (only sophisticated actors check errno values)
+//   - /proc/net/tcp emptiness is mitigated by gVisor (--runtime runsc)
+//
+// Previous design used --internal bridge networks, which left Docker's
+// embedded DNS resolver (127.0.0.11) active inside the container. While
+// DNS queries couldn't reach the internet, the resolver process itself
+// was a potential attack surface.
+func (s *Sandbox) createIsolatedNetwork(_ context.Context) error {
+	s.networkName = networkNone
 	return nil
 }
 
@@ -318,6 +321,9 @@ func (s *Sandbox) StartPaused(ctx context.Context) error {
 	// Restore /usr/local/bin contents that were hidden by the tmpfs overlay.
 	s.restoreLocalBin(ctx)
 
+	// Erase container fingerprints that sandbox-detection code looks for.
+	s.eraseFingerprints(ctx)
+
 	// Plant fake credential files to trigger credential-harvesting malware.
 	s.plantHoneypotFiles(ctx)
 
@@ -373,31 +379,55 @@ func (s *Sandbox) restoreLocalBin(ctx context.Context) {
 	}
 }
 
-// randHex returns n random hex characters.
+// base62Chars is the character set used by real AWS/GitHub/npm tokens.
+// Using hex-only characters makes honeypot tokens statistically detectable
+// (hex has 16 chars, base62 has 62 — entropy per character differs).
+const base62Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+
+// randBase62 returns n random base62 characters, matching the character
+// distribution of real cloud tokens and API keys.
+func randBase62(n int) string {
+	b := make([]byte, n)
+	for i := range b {
+		idx, err := rand.Int(rand.Reader, big.NewInt(int64(len(base62Chars))))
+		if err != nil {
+			b[i] = base62Chars[0]
+			continue
+		}
+		b[i] = base62Chars[idx.Int64()]
+	}
+	return string(b)
+}
+
+// randHex returns n random hex characters (still used for non-token values).
 func randHex(n int) string {
 	b := make([]byte, (n+1)/2)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)[:n]
 }
 
-// fakeAWSKeyID generates a realistic AWS access key ID (always starts with AKIA, 20 chars total).
+// fakeAWSKeyID generates a realistic AWS access key ID.
+// Real format: AKIA + 16 base62 chars (not hex-only).
 func fakeAWSKeyID() string {
-	return "AKIA" + strings.ToUpper(randHex(16))
+	return "AKIA" + randBase62(16)
 }
 
-// fakeAWSSecret generates a realistic AWS secret access key (40 chars, base64-like).
+// fakeAWSSecret generates a realistic AWS secret access key.
+// Real format: 40 base64-like chars (mixed case + digits + /+).
 func fakeAWSSecret() string {
-	return randHex(40)
+	return randBase62(40)
 }
 
-// fakeGitHubToken generates a realistic GitHub PAT (ghp_ prefix + 36 alphanum).
+// fakeGitHubToken generates a realistic GitHub PAT.
+// Real format: ghp_ + 36 base62 chars.
 func fakeGitHubToken() string {
-	return "ghp_" + randHex(36)
+	return "ghp_" + randBase62(36)
 }
 
-// fakeNpmToken generates a realistic npm token (npm_ prefix + 36 hex).
+// fakeNpmToken generates a realistic npm token.
+// Real format: npm_ + 36 base62 chars.
 func fakeNpmToken() string {
-	return "npm_" + randHex(36)
+	return "npm_" + randBase62(36)
 }
 
 // honeypotEnvVars returns environment variables that simulate a CI/developer
@@ -483,22 +513,18 @@ func (s *Sandbox) plantHoneypotFiles(ctx context.Context) {
 }
 
 // eraseFingerprints removes or masks signals that reveal the container
-// environment to sandox-aware malware.
+// environment to sandbox-aware malware.
 func (s *Sandbox) eraseFingerprints(ctx context.Context) {
 	// 1. Remove /.dockerenv sentinel file.
 	s.dockerExecRoot(ctx, "rm", "-f", "/.dockerenv")
 
-	// 2. Mask /proc/1/cgroup — replace "docker" references with empty cgroup.
-	//    /proc is mounted by the kernel so we can't directly modify it, but
-	//    we can create a bind-mount overlay if needed. For now, we mask the
-	//    most common check by using --cgroupns=private (if supported).
-	//    The /proc/self/cgroup check is harder to defeat without gVisor.
+	// 2. /etc/resolv.conf is injected via --dns=198.51.100.1 at container
+	//    creation time (RFC 5737 TEST-NET-2, guaranteed unreachable).
+	//    This works on --read-only rootfs and prevents fingerprinting.
 
-	// 3. Drop the network isolation and replace with iptables DROP.
-	//    This makes /proc/net/tcp non-empty and connect() returns ETIMEDOUT
-	//    instead of ENETUNREACH.
-	//    NOTE: --network=none is removed from containerArgs above.
-	//    Network is blocked via setupNetworkBlock() instead.
+	// 3. /proc/1/cgroup and /proc/self/mountinfo are kernel-managed and
+	//    cannot be modified without gVisor. Use --runtime=runsc to mask
+	//    these remaining signals.
 }
 
 func (s *Sandbox) dockerExecRoot(ctx context.Context, args ...string) {
@@ -603,10 +629,14 @@ func (s *Sandbox) WriteProbeScriptsMulti(ctx context.Context, pkgs []string) {
 		return
 	}
 
-	pyPlatforms := [][3]string{
-		{"Linux", "linux", "posix"},
-		{"Windows", "win32", "nt"},
-		{"Darwin", "darwin", "posix"},
+	type pyPlatform struct {
+		system, sysplatform, osname string
+		sep, pathsep, linesep      string
+	}
+	pyPlatforms := []pyPlatform{
+		{"Linux", "linux", "posix", "/", ":", "\n"},
+		{"Windows", "win32", "nt", "\\\\", ";", "\\r\\n"},
+		{"Darwin", "darwin", "posix", "/", ":", "\n"},
 	}
 	for _, p := range pyPlatforms {
 		var imports strings.Builder
@@ -615,14 +645,23 @@ func (s *Sandbox) WriteProbeScriptsMulti(ctx context.Context, pkgs []string) {
 			fmt.Fprintf(&imports, "try:\n __import__('%s')\nexcept Exception:\n pass\n", importName)
 		}
 		script := fmt.Sprintf(
-			"import platform,sys,os\n"+
+			"import platform,sys,os,collections\n"+
+				"for _k in ['LD_PRELOAD','FAKETIME','FAKETIME_NO_CACHE','FAKETIME_TIMESTAMP_FILE']:\n"+
+				" os.environ.pop(_k,None)\n"+
 				"platform.system=lambda:'%s'\n"+
+				"_real_uname=platform.uname()\n"+
+				"_UnameTuple=collections.namedtuple('uname_result',['system','node','release','version','machine','processor'])\n"+
+				"platform.uname=lambda:_UnameTuple('%s',_real_uname.node,_real_uname.release,_real_uname.version,_real_uname.machine,_real_uname.processor)\n"+
 				"sys.platform='%s'\n"+
 				"os.name='%s'\n"+
+				"os.sep='%s'\n"+
+				"os.pathsep='%s'\n"+
+				"os.linesep='%s'\n"+
 				"%s",
-			p[0], p[1], p[2], imports.String(),
+			p.system, p.system, p.sysplatform, p.osname,
+			p.sep, p.pathsep, p.linesep, imports.String(),
 		)
-		filename := "/tmp/_kojuto_probe_all_" + p[1] + ".py"
+		filename := "/tmp/_kojuto_probe_all_" + p.sysplatform + ".py"
 		s.dockerExecRoot(ctx, "sh", "-c", "cat > "+filename+" << 'KOJUTO_EOF'\n"+script+"KOJUTO_EOF")
 	}
 }
@@ -665,21 +704,45 @@ func (s *Sandbox) ImportCommands() [][]string {
 func (s *Sandbox) WriteProbeScripts(ctx context.Context) {
 	importName := strings.ReplaceAll(s.pkg, "-", "_")
 
-	pyPlatforms := [][3]string{
-		{"Linux", "linux", "posix"},
-		{"Windows", "win32", "nt"},
-		{"Darwin", "darwin", "posix"},
+	// Each simulated OS must be consistent across ALL platform detection APIs.
+	// Malware checks platform.system() vs platform.uname().system, os.sep vs
+	// sys.platform, etc. Any inconsistency reveals the spoofing.
+	type pyPlatform struct {
+		system, sysplatform, osname string
+		sep, pathsep, linesep      string
+	}
+	pyPlatforms := []pyPlatform{
+		{"Linux", "linux", "posix", "/", ":", "\n"},
+		{"Windows", "win32", "nt", "\\\\", ";", "\\r\\n"},
+		{"Darwin", "darwin", "posix", "/", ":", "\n"},
 	}
 	for _, p := range pyPlatforms {
 		script := fmt.Sprintf(
-			"import platform,sys,os\n"+
+			"import platform,sys,os,collections\n"+
+				// Erase faketime traces from the environment BEFORE importing
+				// the target package. libfaketime is already loaded via LD_PRELOAD
+				// and continues to work even after we remove these variables.
+				"for _k in ['LD_PRELOAD','FAKETIME','FAKETIME_NO_CACHE','FAKETIME_TIMESTAMP_FILE']:\n"+
+				" os.environ.pop(_k,None)\n"+
+				// Patch platform.system() — the obvious one.
 				"platform.system=lambda:'%s'\n"+
+				// Patch platform.uname() — returns a named tuple.
+				// Must match platform.system() or the spoof is detectable.
+				"_real_uname=platform.uname()\n"+
+				"_UnameTuple=collections.namedtuple('uname_result',['system','node','release','version','machine','processor'])\n"+
+				"platform.uname=lambda:_UnameTuple('%s',_real_uname.node,_real_uname.release,_real_uname.version,_real_uname.machine,_real_uname.processor)\n"+
+				// Patch sys.platform and os.name.
 				"sys.platform='%s'\n"+
 				"os.name='%s'\n"+
+				// Patch os.sep, os.pathsep, os.linesep for consistency.
+				"os.sep='%s'\n"+
+				"os.pathsep='%s'\n"+
+				"os.linesep='%s'\n"+
 				"try:\n import %s\nexcept Exception:\n pass\n",
-			p[0], p[1], p[2], importName,
+			p.system, p.system, p.sysplatform, p.osname,
+			p.sep, p.pathsep, p.linesep, importName,
 		)
-		filename := "/tmp/_kojuto_probe_" + p[1] + ".py"
+		filename := "/tmp/_kojuto_probe_" + p.sysplatform + ".py"
 		s.dockerExecRoot(ctx, "sh", "-c", "cat > "+filename+" << 'KOJUTO_EOF'\n"+script+"KOJUTO_EOF")
 	}
 

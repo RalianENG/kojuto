@@ -207,12 +207,9 @@ func TestCreateIsolatedNetwork(t *testing.T) {
 		t.Fatalf("createIsolatedNetwork: %v", err)
 	}
 
-	if sb.networkName == "" {
-		t.Error("networkName should be set after createIsolatedNetwork")
-	}
-
-	if !strings.HasPrefix(sb.networkName, "kojuto-jail-") {
-		t.Errorf("networkName = %q, expected kojuto-jail- prefix", sb.networkName)
+	// --network=none: complete network isolation, no Docker bridge network.
+	if sb.networkName != networkNone {
+		t.Errorf("networkName = %q, expected %q (--network=none)", sb.networkName, networkNone)
 	}
 }
 

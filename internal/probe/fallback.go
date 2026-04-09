@@ -39,7 +39,8 @@ func (s *StraceFallback) Start(_ uint32) error {
 func (s *StraceFallback) StartWithPID(pid uint32) error {
 	s.cmd = exec.Command("strace",
 		"-f",
-		"-e", "trace=connect,sendto,sendmsg,sendmmsg,bind,listen,accept,accept4,execve,openat,rename,renameat,renameat2,sendfile,ptrace",
+		"-s", "256",
+		"-e", "trace=connect,sendto,sendmsg,sendmmsg,bind,listen,accept,accept4,execve,openat,rename,renameat,renameat2,sendfile,ptrace,mmap,mprotect,unlink,unlinkat",
 		"-e", "signal=none",
 		"-p", strconv.FormatUint(uint64(pid), 10),
 	)
@@ -55,9 +56,10 @@ func (s *StraceFallback) StartWithPID(pid uint32) error {
 
 	go func() {
 		defer close(s.events)
+		state := NewParseState()
 		scanner := bufio.NewScanner(stderr)
 		for scanner.Scan() {
-			evt, ok := parseStraceLine(scanner.Text())
+			evt, ok := parseStraceLine(scanner.Text(), state)
 			if ok {
 				select {
 				case s.events <- evt:

@@ -243,14 +243,17 @@ Of the 300 malicious samples, 238 failed to install (dependencies already remove
 
 | Category | Examples | Detection method |
 |----------|----------|-----------------|
-| C2 communication (`c2_communication`) | `aiogram-types-v3` → `147.45.124.42:80` | `connect`/`sendto` to external IPs |
-| Credential access (`credential_access`) | `axios-attack-demo` → `.ssh/id_rsa`, `.aws/credentials` | `openat` on ~40 sensitive paths |
+| C2 communication (`c2_communication`) | `aiogram-types-v3` → `147.45.124.42:80` | `connect`/`sendto` to non-loopback IPs |
+| Data exfiltration (`data_exfiltration`) | DNS resolution of Discord/Telegram/Pastebin | `sendto` port 53 resolving known exfil services |
+| Credential access (`credential_access`) | `axios-attack-demo` → `.ssh/id_rsa`, `.aws/credentials`, `.solana/id.json` | `openat` on ~50 sensitive paths (SSH, cloud, crypto wallets, browser data) |
 | Code execution (`code_execution`) | `advpruebitaa` → `type nul > prueba11.txt`, `/tmp/ld.py` | `execve` with inline `-c`/`-e` flags or from `/tmp`, `/dev/shm` |
+| Memory execution (`memory_execution`) | `ctypes.mmap(RWX)` shellcode injection | `mmap`/`mprotect` with simultaneous PROT_WRITE+PROT_EXEC |
 | Binary hijacking (`binary_hijacking`) | `rename /tmp/evil /usr/local/bin/python3` | `rename` targeting trusted system binaries |
 | Backdoor (`backdoor`) | `bind` + `listen` + `accept` on attacker-controlled port | Server socket operations during install |
-| Persistence (`persistence`) | Write to `.bashrc`, `.zshrc`, `.profile`, `crontab` | `openat` with `O_WRONLY`/`O_RDWR` |
+| Persistence (`persistence`) | Write to `.bashrc`, `.config/systemd/user/`, any `/home/` path | `openat` with write flags to shell startup files or user home directory |
 | DNS tunneling (`dns_tunneling`) | `airio` → high-entropy subdomain queries, DoH connections | `sendto` port 53 with entropy > 3.5, `connect` to known DoH servers |
-| Evasion (`evasion`) | `ptrace(PTRACE_TRACEME)` to detect tracing | `ptrace` self-check returns `EPERM` under strace |
+| Evasion (`evasion`) | `ptrace(PTRACE_TRACEME)`, reading `/proc/self/status`, `/sys/class/net` | `ptrace` self-check or sandbox detection via `/proc`/`/sys` introspection |
+| Anti-forensics (`anti_forensics`) | Create `/tmp/payload` → execute → delete | `unlink` correlated with prior `openat(O_CREAT)` + `execve` for same path |
 
 ### Configuration
 
@@ -270,7 +273,16 @@ sensitive_paths:
 
 ## Known Limitations
 
-kojuto detects malicious behavior at the syscall level. Some attack vectors are outside its detection scope, including memory-only execution (`mmap` + `PROT_EXEC`), data exfiltration via legitimate hosts, and environment variable reads without network exfiltration. See [SECURITY.md](SECURITY.md) for full details.
+kojuto detects malicious behavior at the syscall level. The following attack vectors are outside its detection scope:
+
+- **`eval`/`exec` in Python, `Function()` in Node.js** — interpreter-internal execution generates no `execve` syscall
+- **Environment variable reads** — `os.environ.get()` is a pure memory operation with no syscall (honeypot values are planted to mitigate impact)
+- **W^X shellcode** — `mmap(RW)` → `mprotect(RX)` is indistinguishable from V8 JIT (simultaneous RWX IS detected)
+- **Function-call-gated payloads** — import phase only executes top-level code, not function calls
+- **Low-entropy DNS tunneling** — dictionary-encoded data bypasses Shannon entropy heuristic (mitigated by `--network=none`)
+- **Strace/network-none detection** — `/proc/self/status` TracerPid and `/sys/class/net` reveal the sandbox (reads are detected as `evasion` but cannot be prevented with strace-based probing)
+
+See [SECURITY.md](SECURITY.md) for full details.
 
 ## Security
 

@@ -42,3 +42,9 @@ internal/probe/*_bpfeb.o
 
 # Cache
 .cache/
+
+# Test malware build artifacts (source is tracked, wheels are not)
+testdata/*.whl
+testdata/*.tar.gz
+testdata/*/build/
+testdata/*/*.egg-info/

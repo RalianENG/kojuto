@@ -73,7 +73,8 @@ func (c *ContainerStrace) buildCommand(ctx context.Context, containerID string, 
 	args := []string{
 		"exec", containerID,
 		"strace", "-f",
-		"-e", "trace=connect,sendto,sendmsg,sendmmsg,bind,listen,accept,accept4,execve,openat,rename,renameat,renameat2,sendfile,ptrace",
+		"-s", "256",
+		"-e", "trace=connect,sendto,sendmsg,sendmmsg,bind,listen,accept,accept4,execve,openat,rename,renameat,renameat2,sendfile,ptrace,mmap,mprotect,unlink,unlinkat",
 		"-e", "signal=none",
 		"--",
 	}
@@ -85,9 +86,10 @@ func (c *ContainerStrace) buildCommand(ctx context.Context, containerID string, 
 func (c *ContainerStrace) parseStraceOutput(stderr io.ReadCloser, done chan<- struct{}) {
 	defer close(done)
 
+	state := NewParseState()
 	scanner := bufio.NewScanner(stderr)
 	for scanner.Scan() {
-		evt, ok := parseStraceLine(scanner.Text())
+		evt, ok := parseStraceLine(scanner.Text(), state)
 		if !ok {
 			continue
 		}

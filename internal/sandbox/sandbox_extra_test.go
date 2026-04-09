@@ -410,3 +410,41 @@ func TestImportCommandsMulti_Npm(t *testing.T) {
 		}
 	}
 }
+
+func TestRandBase62(t *testing.T) {
+	for _, n := range []int{1, 16, 36, 40} {
+		s := randBase62(n)
+		if len(s) != n {
+			t.Errorf("randBase62(%d) returned len %d", n, len(s))
+		}
+		for _, c := range s {
+			if !strings.ContainsRune(base62Chars, c) {
+				t.Errorf("randBase62(%d) contains non-base62 char %q in %q", n, c, s)
+			}
+		}
+	}
+	a := randBase62(40)
+	b := randBase62(40)
+	if a == b {
+		t.Error("randBase62 returned identical values on consecutive calls")
+	}
+}
+
+func TestFakeTokens_NotHexOnly(t *testing.T) {
+	hasNonHex := false
+	for i := 0; i < 10; i++ {
+		key := fakeAWSKeyID()[4:]
+		for _, c := range key {
+			if (c >= 'G' && c <= 'Z') || (c >= 'g' && c <= 'z') {
+				hasNonHex = true
+				break
+			}
+		}
+		if hasNonHex {
+			break
+		}
+	}
+	if !hasNonHex {
+		t.Error("10 consecutive fakeAWSKeyID tokens were all hex-only")
+	}
+}

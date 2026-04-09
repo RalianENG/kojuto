@@ -46,6 +46,11 @@ func DefaultSensitivePaths() []string {
 		// /etc/passwd is intentionally excluded: many standard tools
 		// (getpwnam, uid lookups) read it during normal operation.
 		"/proc/self/environ",
+		"/proc/self/maps",      // libfaketime/sandbox detection via loaded libraries
+		"/proc/self/status",    // TracerPid detection (strace parent process)
+		"/proc/self/cgroup",    // Docker/container detection
+		"/proc/self/mountinfo", // overlay filesystem detection
+		"/sys/class/net",       // network namespace detection (no trailing slash)
 
 		// --- Git / VCS ---
 		"/.netrc",
@@ -68,7 +73,16 @@ func DefaultSensitivePaths() []string {
 		"/.config/chromium/",
 		"/.mozilla/firefox/",
 		"/.config/BraveSoftware/",
+		"/.config/opera/",
+		"/.config/vivaldi/",
+		"/.config/microsoft-edge/",
 		"/Library/Application Support/Google/Chrome/",
+		"/Library/Application Support/BraveSoftware/",
+		"/Library/Application Support/Microsoft Edge/",
+
+		// --- Browser extension / wallet DB (MetaMask, Phantom, etc.) ---
+		"/Local Storage/leveldb/",
+		"/IndexedDB/",
 
 		// --- Shell startup (persistence targets) ---
 		"/.bashrc",
@@ -81,6 +95,23 @@ func DefaultSensitivePaths() []string {
 		// --- Desktop keyrings ---
 		"/.local/share/keyrings/",
 		"/Library/Keychains/",
+
+		// --- Cryptocurrency wallets ---
+		// Primary targets for supply chain attack info-stealers.
+		"/.bitcoin/",
+		"/.ethereum/",
+		"/.solana/",
+		"/.config/solana/",
+		"/.monero/",
+		"/.electrum/",
+		"/.exodus/",
+		"/.atomic/",
+		"/.tronlink/",
+		"/.config/Ledger Live/",
+		"/Library/Application Support/Exodus/",
+		"/Library/Application Support/atomic/",
+		"/Library/Application Support/Phantom/",
+		"/.local/share/io.parity.ethereum/",
 
 		// --- Application tokens ---
 		"/.config/slack/",
