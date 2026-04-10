@@ -27,6 +27,12 @@ RUN apt-get update && \
 # Do NOT add "pip install pip setuptools wheel" here — fetching from PyPI at
 # build time would reintroduce supply chain risk that the digest pin prevents.
 
+# Audit hooks: detect eval/exec/compile/Function/vm dynamic code execution.
+# Python: sitecustomize.py is auto-loaded by the interpreter on startup.
+# Node.js: loaded via NODE_OPTIONS="--require /opt/kojuto/kojuto-require.js".
+COPY internal/sandbox/hooks/sitecustomize.py /usr/local/lib/python3.12/site-packages/sitecustomize.py
+COPY internal/sandbox/hooks/kojuto-require.js /opt/kojuto/kojuto-require.js
+
 RUN cp -a /usr/local/bin /usr/local/bin.bak && \
     cp -a /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages.bak
 

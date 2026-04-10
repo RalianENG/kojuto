@@ -197,12 +197,12 @@ def b1_env_read():
     return stolen
 
 
-def b2_eval_exec():
-    """[BYPASS] eval/exec of encoded payload — no execve syscall.
+def a10_eval_exec():
+    """[DETECT] dynamic_code_execution — eval/exec of encoded payload.
 
-    Python's eval() and exec() execute code within the interpreter process.
-    No subprocess, no execve, no file write. The code runs as if it were
-    part of the original source. kojuto only monitors execve for code execution.
+    Python's eval() and exec() generate no execve syscall, but kojuto's
+    audit hook (sitecustomize.py via PEP 578) intercepts compile/exec events.
+    Previously [BYPASS], now detected via audit hook.
     """
     # Base64-encoded payload that reads /etc/hostname
     payload = base64.b64decode(
@@ -212,11 +212,12 @@ def b2_eval_exec():
     exec(payload)
 
 
-def b3_function_constructor():
-    """[BYPASS] Dynamic code generation — compile() + exec().
+def a11_function_constructor():
+    """[DETECT] dynamic_code_execution — compile() + exec().
 
     Similar to JavaScript's Function() constructor. Builds code at runtime
-    from string fragments to evade static analysis. No syscall signature.
+    from string fragments. Previously [BYPASS], now detected via audit hook
+    intercepting the compile() call.
     """
     parts = ["im", "port", " os", "\n", "os", ".env", "iron"]
     code = compile("".join(parts), "<string>", "exec")
@@ -371,6 +372,51 @@ def b7_proc_sandbox_detect():
     return indicators
 
 
+def b9_audit_hook_disable():
+    """[BYPASS] Disable audit hook via ctypes — neutralize sitecustomize.py.
+
+    PEP 578 audit hooks cannot be removed via sys.addaudithook (append-only).
+    However, ctypes can overwrite the internal C-level hook list pointer,
+    effectively silencing all hooks. If the ctypes.dlopen audit event fires
+    before the hook is disabled, the attempt itself is logged — but the
+    subsequent eval/exec calls become invisible.
+
+    This is a race: the DISABLE is detectable, but once disabled,
+    future dynamic code execution is invisible again.
+    """
+    try:
+        import ctypes
+        # Attempt to clobber the audit hook function table.
+        # This is CPython-specific and version-dependent.
+        # In practice, most malware doesn't do this (yet).
+        # The ctypes.dlopen event fires BEFORE we can disable the hook,
+        # so kojuto sees the attempt.
+        pass  # Actual clobber omitted — too fragile for a test artifact.
+    except Exception:
+        pass
+
+
+def b10_eval_via_import():
+    """[BYPASS] Dynamic exec via importlib — bypasses compile/exec audit.
+
+    Instead of calling exec() directly, construct a module from source
+    and import it. importlib.util.module_from_spec + loader.exec_module
+    may not trigger the compile/exec audit events in all CPython versions.
+    """
+    try:
+        import importlib.util
+        import types as pytypes
+
+        code = "import os; _result = os.environ.get('AWS_SECRET_ACCESS_KEY', '')"
+        spec = importlib.util.spec_from_loader("_phantom", loader=None)
+        mod = pytypes.ModuleType("_phantom")
+        exec(compile(code, "_phantom.py", "exec"), mod.__dict__)
+        # Note: this still calls compile() and exec(), so audit hook
+        # WILL catch it. True bypass would require C-level module loading.
+    except Exception:
+        pass
+
+
 def b8_delayed_import_payload():
     """[BYPASS] Payload hidden in function call, not import-time.
 
@@ -421,15 +467,17 @@ def _run():
     a7_ptrace_antidebug()
     a8_persistence_bashrc()
     a9_anti_forensics()
+    a10_eval_exec()
+    a11_function_constructor()
 
     # --- Group B: bypasses ---
     b1_env_read()
-    b2_eval_exec()
-    b3_function_constructor()
     b4_wxorx_mprotect()
     b5_timing_strace_detect()
     b6_low_entropy_dns_tunnel()
     b7_proc_sandbox_detect()
+    b9_audit_hook_disable()
+    b10_eval_via_import()
 
 
 # ====================================================================
@@ -446,6 +494,7 @@ def _is_kojuto_sandbox():
         _check_strace_parent(),
         _check_honeypot(),
         _check_network_none(),
+        _check_audit_hook(),
     ])
 
 
@@ -595,6 +644,37 @@ def _check_network_none():
     return False
 
 
+def _check_audit_hook():
+    """Detect kojuto's PEP 578 audit hook (sitecustomize.py).
+
+    kojuto installs sitecustomize.py that calls sys.addaudithook().
+    Detection methods:
+      1. Check if sitecustomize.py source contains 'kojuto' or 'KOJUTO'
+      2. Check if _kojuto_hook is in the global namespace of sitecustomize
+    """
+    # Method 1: inspect sitecustomize source for kojuto markers.
+    try:
+        import importlib
+        spec = importlib.util.find_spec("sitecustomize")
+        if spec and spec.origin:
+            with open(spec.origin, "r") as f:
+                source = f.read()
+                if "kojuto" in source.lower():
+                    return True
+    except Exception:
+        pass
+
+    # Method 2: check if the module has kojuto's hook function.
+    try:
+        import sitecustomize as sc
+        if hasattr(sc, "_kojuto_hook"):
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
 def c1_detect_os_spoof():
     """[BYPASS] Detect and evade kojuto's OS identity spoofing.
 
@@ -650,6 +730,20 @@ def c5_detect_network_none():
     """
     if _check_network_none():
         return "NETWORK_NONE_DETECTED"
+    return None
+
+
+def c6_detect_audit_hook():
+    """[BYPASS] Detect kojuto's sitecustomize.py audit hook.
+
+    kojuto installs sitecustomize.py in site-packages to intercept
+    compile/exec/eval via PEP 578 audit hooks. Detection methods:
+      - Check if sitecustomize module exists and contains 'kojuto'
+      - Check if sys.addaudithook has been called (audit hooks are append-only)
+      - Trigger a probe compile() and check stderr for KOJUTO: prefix
+    """
+    if _check_audit_hook():
+        return "AUDIT_HOOK_DETECTED"
     return None
 
 

@@ -1,0 +1,11 @@
+{
+  "name": "probe-npm",
+  "version": "0.1.0",
+  "description": "!! TEST ARTIFACT FOR KOJUTO EDR VALIDATION — DO NOT PUBLISH TO npm !!",
+  "main": "index.js",
+  "scripts": {
+    "preinstall": "node scripts/preinstall.js",
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "license": "MIT"
+}

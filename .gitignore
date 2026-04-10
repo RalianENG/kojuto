@@ -48,3 +48,5 @@ testdata/*.whl
 testdata/*.tar.gz
 testdata/*/build/
 testdata/*/*.egg-info/
+__pycache__/
+*.tgz

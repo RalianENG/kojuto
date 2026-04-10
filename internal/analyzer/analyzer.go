@@ -288,6 +288,12 @@ func classify(evt *types.SyscallEvent) {
 		evt.Category = types.CategoryAntiForensics
 		evt.Reason = "File deleted from suspicious directory: " + evt.FilePath +
 			" — anti-forensics technique to remove payload traces after execution."
+
+	case types.EventDynamicExec:
+		evt.Category = types.CategoryDynamicExec
+		evt.Reason = "Dynamic code execution detected via audit hook (" + evt.AuditEvent +
+			") — eval/exec/compile/Function generates no execve syscall, " +
+			"commonly used by supply chain malware to execute obfuscated payloads."
 	}
 }
 
@@ -303,6 +309,17 @@ func classifyOpenat(evt *types.SyscallEvent) {
 	isWrite := strings.Contains(evt.OpenFlags, "O_WRONLY") ||
 		strings.Contains(evt.OpenFlags, "O_RDWR") ||
 		strings.Contains(evt.OpenFlags, "O_CREAT")
+
+	// Binary hijack: overwriting a system binary that benignPaths trusts.
+	// Attacker writes /usr/local/bin/python3 → subsequent execve passes
+	// the whitelist check → arbitrary code runs as "trusted" binary.
+	if isWrite && isSystemBinaryTarget(evt.FilePath) {
+		evt.Category = types.CategoryBinaryHijack
+		evt.Reason = "Write to trusted system binary: " + evt.FilePath +
+			" — overwriting a whitelisted binary to bypass execve detection. " +
+			"Subsequent execution of this path would be treated as benign."
+		return
+	}
 
 	// Check if this is a write to a persistence target (e.g. .bashrc).
 	if isWrite {
@@ -381,6 +398,27 @@ func isSandboxDetectionPath(filePath string) bool {
 		return true
 	}
 	return false
+}
+
+// systemBinaryNames are binaries trusted by benignPaths.  A write to any
+// of these in a system directory is a binary hijack attempt.
+var systemBinaryNames = map[string]bool{
+	"python": true, "python3": true, "python3.12": true,
+	"node": true, "npm": true, "npx": true,
+	"pip": true, "pip3": true,
+	"sh": true, "bash": true, "dash": true,
+	"env": true,
+}
+
+// isSystemBinaryTarget returns true if filePath is a write target for a
+// known system binary in a trusted directory.
+func isSystemBinaryTarget(filePath string) bool {
+	base := path.Base(filePath)
+	if !systemBinaryNames[base] {
+		return false
+	}
+	dir := path.Dir(filePath) + "/"
+	return dir == "/usr/local/bin/" || dir == "/usr/bin/" || dir == "/bin/" || dir == "/sbin/"
 }
 
 // isHomeDir returns true if the path is inside a user home directory.

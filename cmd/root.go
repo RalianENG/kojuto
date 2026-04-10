@@ -100,7 +100,7 @@ Prerequisites:
   # Scan a local package file
   kojuto scan --local ./malware-1.0.0.whl
 
-  # Use gVisor runtime for stronger isolation
+  # Use gVisor runtime for stronger isolation (auto-detected by default)
   kojuto scan requests --runtime runsc`,
 	Args:          cobra.MaximumNArgs(1),
 	RunE:          runScan,
@@ -137,7 +137,7 @@ func init() {
 	scanCmd.Flags().StringVarP(&flagFile, "file", "f", "", "dependency file to scan (requirements.txt or package.json)")
 	scanCmd.Flags().StringVar(&flagPin, "pin", "", "output pinned dependency file after all-clean scan (requires -f)")
 	scanCmd.Flags().StringVar(&flagLocal, "local", "", "scan a local package file (.whl, .tgz) or directory instead of downloading")
-	scanCmd.Flags().StringVar(&flagRuntime, "runtime", "", "container runtime: default (runc) or runsc (gVisor)")
+	scanCmd.Flags().StringVar(&flagRuntime, "runtime", "auto", "container runtime: auto (use gVisor if available), runsc, or runc")
 	scanCmd.Flags().StringVar(&flagProbeMethod, "probe-method", methodAuto, "probe method: auto, ebpf, strace, strace-container")
 	scanCmd.Flags().DurationVar(&flagTimeout, "timeout", 5*time.Minute, "scan timeout per package")
 	scanCmd.Flags().StringVar(&flagConfig, "config", "", "config file path (default: kojuto.yml in current directory)")

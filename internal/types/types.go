@@ -4,42 +4,45 @@ import "time"
 
 // Syscall event types.
 const (
-	EventConnect  = "connect"
-	EventSendto   = "sendto"
-	EventSendmsg  = "sendmsg"
-	EventSendmmsg = "sendmmsg"
-	EventBind     = "bind"
-	EventListen   = "listen"
-	EventAccept   = "accept"
-	EventExecve   = "execve"
-	EventOpenat   = "openat"
-	EventRename   = "rename"
-	EventPtrace   = "ptrace"
-	EventMmap     = "mmap"
-	EventMprotect = "mprotect"
-	EventUnlink   = "unlink"
+	EventConnect     = "connect"
+	EventSendto      = "sendto"
+	EventSendmsg     = "sendmsg"
+	EventSendmmsg    = "sendmmsg"
+	EventBind        = "bind"
+	EventListen      = "listen"
+	EventAccept      = "accept"
+	EventExecve      = "execve"
+	EventOpenat      = "openat"
+	EventRename      = "rename"
+	EventPtrace      = "ptrace"
+	EventMmap        = "mmap"
+	EventMprotect    = "mprotect"
+	EventUnlink      = "unlink"
+	EventDynamicExec = "dynamic_exec"
 )
 
 // SyscallEvent represents a suspicious syscall captured by the probe.
 type SyscallEvent struct {
-	Timestamp time.Time `json:"timestamp"`
-	Comm      string    `json:"comm"`
-	DstAddr   string    `json:"dst_addr,omitempty"`
-	Cmdline   string    `json:"cmdline,omitempty"`
-	FilePath  string    `json:"file_path,omitempty"`
-	OpenFlags string    `json:"open_flags,omitempty"`
-	SrcPath   string    `json:"src_path,omitempty"`
-	DstPath   string    `json:"dst_path,omitempty"`
-	DNSQuery  string    `json:"dns_query,omitempty"`
-	MemProt   string    `json:"mem_prot,omitempty"`  // mmap/mprotect protection flags (e.g. "PROT_READ|PROT_WRITE|PROT_EXEC")
-	MemFlags  string    `json:"mem_flags,omitempty"` // mmap flags (e.g. "MAP_PRIVATE|MAP_ANONYMOUS")
-	Syscall   string    `json:"syscall"`
-	Category  string    `json:"category,omitempty"`
-	Reason    string    `json:"reason,omitempty"`
-	Phase     string    `json:"phase,omitempty"`
-	PID       uint32    `json:"pid"`
-	Family    uint16    `json:"family,omitempty"`
-	DstPort   uint16    `json:"dst_port,omitempty"`
+	Timestamp   time.Time `json:"timestamp"`
+	Comm        string    `json:"comm"`
+	DstAddr     string    `json:"dst_addr,omitempty"`
+	Cmdline     string    `json:"cmdline,omitempty"`
+	FilePath    string    `json:"file_path,omitempty"`
+	OpenFlags   string    `json:"open_flags,omitempty"`
+	SrcPath     string    `json:"src_path,omitempty"`
+	DstPath     string    `json:"dst_path,omitempty"`
+	DNSQuery    string    `json:"dns_query,omitempty"`
+	MemProt     string    `json:"mem_prot,omitempty"`     // mmap/mprotect protection flags (e.g. "PROT_READ|PROT_WRITE|PROT_EXEC")
+	MemFlags    string    `json:"mem_flags,omitempty"`    // mmap flags (e.g. "MAP_PRIVATE|MAP_ANONYMOUS")
+	AuditEvent  string    `json:"audit_event,omitempty"`  // audit hook event (e.g. "compile", "eval", "Function")
+	CodeSnippet string    `json:"code_snippet,omitempty"` // truncated source from audit hook
+	Syscall     string    `json:"syscall"`
+	Category    string    `json:"category,omitempty"`
+	Reason      string    `json:"reason,omitempty"`
+	Phase       string    `json:"phase,omitempty"`
+	PID         uint32    `json:"pid"`
+	Family      uint16    `json:"family,omitempty"`
+	DstPort     uint16    `json:"dst_port,omitempty"`
 }
 
 // Attack categories.
@@ -55,6 +58,7 @@ const (
 	CategoryEvasion          = "evasion"
 	CategoryMemExec          = "memory_execution"
 	CategoryAntiForensics    = "anti_forensics"
+	CategoryDynamicExec      = "dynamic_code_execution"
 )
 
 // Scan phases.
