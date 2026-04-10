@@ -103,8 +103,9 @@ func TestBuildCommand(t *testing.T) {
 	}
 
 	// Check that "exec" and container ID are in the right positions.
-	if args[1] != "exec" {
-		t.Errorf("args[1] = %q, want %q", args[1], "exec")
+	const dockerExec = "exec"
+	if args[1] != dockerExec {
+		t.Errorf("args[1] = %q, want %q", args[1], dockerExec)
 	}
 	if args[2] != "abc123" {
 		t.Errorf("args[2] = %q, want %q", args[2], "abc123")

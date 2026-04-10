@@ -1050,3 +1050,91 @@ func TestGenerateSummary_Evasion(t *testing.T) {
 		t.Errorf("expected description to mention anti-debugging, got %q", summary.Description)
 	}
 }
+
+func TestIsSystemBinaryTarget(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{"/usr/local/bin/python3", true},
+		{"/usr/local/bin/node", true},
+		{"/usr/bin/sh", true},
+		{"/usr/local/bin/pip", true},
+		{"/bin/bash", true},
+		{"/sbin/env", true},
+		{"/usr/local/bin/black", false},
+		{"/usr/local/bin/pytest", false},
+		{"/tmp/python3", false},
+		{"/home/dev/node", false},
+	}
+	for _, tt := range tests {
+		got := isSystemBinaryTarget(tt.path)
+		if got != tt.want {
+			t.Errorf("isSystemBinaryTarget(%q) = %v, want %v", tt.path, got, tt.want)
+		}
+	}
+}
+
+func TestClassify_OpenatSystemBinaryWrite(t *testing.T) {
+	evt := types.SyscallEvent{
+		Syscall:   types.EventOpenat,
+		FilePath:  "/usr/local/bin/python3",
+		OpenFlags: "O_WRONLY|O_CREAT|O_TRUNC",
+	}
+	classify(&evt)
+	if evt.Category != types.CategoryBinaryHijack {
+		t.Errorf("category = %q, want %q", evt.Category, types.CategoryBinaryHijack)
+	}
+	if !strings.Contains(evt.Reason, "trusted system binary") {
+		t.Errorf("reason should mention trusted system binary, got %q", evt.Reason)
+	}
+}
+
+func TestClassify_OpenatSystemBinaryReadNotHijack(t *testing.T) {
+	evt := types.SyscallEvent{
+		Syscall:   types.EventOpenat,
+		FilePath:  "/usr/local/bin/python3",
+		OpenFlags: "O_RDONLY|O_CLOEXEC",
+	}
+	classify(&evt)
+	// Read should NOT be classified as binary hijack.
+	if evt.Category == types.CategoryBinaryHijack {
+		t.Error("read from system binary should not be binary_hijacking")
+	}
+}
+
+func TestClassify_DynamicExec(t *testing.T) {
+	evt := types.SyscallEvent{
+		Syscall:     types.EventDynamicExec,
+		AuditEvent:  "eval",
+		CodeSnippet: "process.env.GITHUB_TOKEN",
+	}
+	classify(&evt)
+	if evt.Category != types.CategoryDynamicExec {
+		t.Errorf("category = %q, want %q", evt.Category, types.CategoryDynamicExec)
+	}
+	if !strings.Contains(evt.Reason, "audit hook") {
+		t.Errorf("reason should mention audit hook, got %q", evt.Reason)
+	}
+}
+
+func TestAnalyze_DynamicExecNotFiltered(t *testing.T) {
+	events := []types.SyscallEvent{
+		{
+			Timestamp:   time.Now(),
+			Syscall:     types.EventDynamicExec,
+			AuditEvent:  "Function",
+			CodeSnippet: "return process.env.AWS_SECRET_ACCESS_KEY",
+		},
+	}
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictSuspicious {
+		t.Errorf("verdict = %q, want suspicious", verdict)
+	}
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(filtered))
+	}
+	if filtered[0].Category != types.CategoryDynamicExec {
+		t.Errorf("category = %q, want %q", filtered[0].Category, types.CategoryDynamicExec)
+	}
+}
