@@ -507,10 +507,10 @@ func TestParseMprotectRWX(t *testing.T) {
 
 func TestParseConnectedSendtoDNS(t *testing.T) {
 	tests := []struct {
-		name    string
-		line    string
-		want    bool
-		domain  string
+		name   string
+		line   string
+		want   bool
+		domain string
 	}{
 		{
 			"glibc resolver discord",
@@ -572,12 +572,12 @@ func TestIsSensitivePath_ProcPid(t *testing.T) {
 		path string
 		want bool
 	}{
-		{"/proc/self/status", true},   // in config patterns
-		{"/proc/self/maps", true},     // in config patterns
-		{"/proc/10/comm", true},       // numeric PID → procPidRe
-		{"/proc/12345/status", true},  // numeric PID
-		{"/proc/version", false},      // not sensitive
-		{"/proc/meminfo", false},      // not sensitive
+		{"/proc/self/status", true},  // in config patterns
+		{"/proc/self/maps", true},    // in config patterns
+		{"/proc/10/comm", true},      // numeric PID → procPidRe
+		{"/proc/12345/status", true}, // numeric PID
+		{"/proc/version", false},     // not sensitive
+		{"/proc/meminfo", false},     // not sensitive
 	}
 	saved := sensitivePathPatterns
 	defer func() { sensitivePathPatterns = saved }()

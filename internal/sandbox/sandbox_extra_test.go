@@ -432,7 +432,7 @@ func TestRandBase62(t *testing.T) {
 
 func TestFakeTokens_NotHexOnly(t *testing.T) {
 	hasNonHex := false
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		key := fakeAWSKeyID()[4:]
 		for _, c := range key {
 			if (c >= 'G' && c <= 'Z') || (c >= 'g' && c <= 'z') {

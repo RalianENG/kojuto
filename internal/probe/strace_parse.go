@@ -110,7 +110,7 @@ var (
 		`mprotect\(0x[0-9a-f]+,\s*\d+,\s*(PROT_[A-Z_|]+PROT_WRITE[A-Z_|]*PROT_EXEC[A-Z_|]*|PROT_[A-Z_|]*PROT_EXEC[A-Z_|]*PROT_WRITE[A-Z_|]*)`,
 	)
 
-	// unlink("/tmp/.ld-linux-x86-64.py") = 0
+	// unlink("/tmp/.ld-linux-x86-64.py") = 0.
 	straceUnlinkRe = regexp.MustCompile(
 		`unlink\("([^"]+)"\)`,
 	)
@@ -279,10 +279,8 @@ func parseOpenat(line string) (types.SyscallEvent, bool) {
 		strings.Contains(flags, "O_CREAT")
 
 	// Emit if: sensitive path (any access), OR write to user home.
-	if !isSensitivePath(filePath) {
-		if !(isWrite && isUserHomePath(filePath)) {
-			return types.SyscallEvent{}, false
-		}
+	if !isSensitivePath(filePath) && (!isWrite || !isUserHomePath(filePath)) {
+		return types.SyscallEvent{}, false
 	}
 
 	return types.SyscallEvent{

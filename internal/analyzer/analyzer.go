@@ -99,11 +99,11 @@ func collectExecutedPaths(events []types.SyscallEvent) map[string]bool {
 
 // isInSuspiciousDir checks if a path is in a directory associated with
 // payload staging (same dirs as the unlink detector).
-func isInSuspiciousDir(path string) bool {
-	return strings.HasPrefix(path, "/tmp/") ||
-		strings.HasPrefix(path, "/dev/shm/") ||
-		strings.HasPrefix(path, "/var/tmp/") ||
-		strings.HasPrefix(path, "/run/")
+func isInSuspiciousDir(filePath string) bool {
+	return strings.HasPrefix(filePath, "/tmp/") ||
+		strings.HasPrefix(filePath, "/dev/shm/") ||
+		strings.HasPrefix(filePath, "/var/tmp/") ||
+		strings.HasPrefix(filePath, "/run/")
 }
 
 // GenerateSummary creates a human-readable summary from analyzed events.
@@ -217,16 +217,17 @@ func buildRemediation(categories []string) string {
 func classify(evt *types.SyscallEvent) {
 	switch evt.Syscall {
 	case types.EventConnect:
-		if isKnownDoHServer(evt.DstAddr) && evt.DstPort == 443 {
+		switch {
+		case isKnownDoHServer(evt.DstAddr) && evt.DstPort == 443:
 			evt.Category = types.CategoryDNSTunnel
 			evt.Reason = "Connection to known DNS-over-HTTPS server " + evt.DstAddr + ":443" +
 				" — may be used for DNS tunneling to bypass port-53 monitoring."
-		} else if evt.DstPort == 53 {
+		case evt.DstPort == 53:
 			evt.Category = types.CategoryC2
 			evt.Reason = "DNS resolver connection to " + evt.DstAddr + ":53" +
 				" — package attempted hostname resolution, indicating intent to " +
 				"communicate with an external server."
-		} else {
+		default:
 			evt.Category = types.CategoryC2
 			evt.Reason = "Outbound connection to " + evt.DstAddr + ":" + portStr(evt.DstPort) +
 				" — packages should not make network connections during install or import."
@@ -383,8 +384,8 @@ func isSandboxDetectionPath(filePath string) bool {
 }
 
 // isHomeDir returns true if the path is inside a user home directory.
-func isHomeDir(path string) bool {
-	return strings.HasPrefix(path, "/home/") || strings.HasPrefix(path, "/root/")
+func isHomeDir(filePath string) bool {
+	return strings.HasPrefix(filePath, "/home/") || strings.HasPrefix(filePath, "/root/")
 }
 
 func classifyExecve(evt *types.SyscallEvent) {

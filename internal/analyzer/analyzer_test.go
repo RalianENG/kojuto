@@ -683,9 +683,9 @@ func TestClassify_OpenatWriteSensitive(t *testing.T) {
 
 func TestClassify_SandboxDetectionPaths(t *testing.T) {
 	tests := []struct {
-		name     string
-		path     string
-		wantCat  string
+		name    string
+		path    string
+		wantCat string
 	}{
 		{"proc self status", "/proc/self/status", types.CategoryEvasion},
 		{"proc self maps", "/proc/self/maps", types.CategoryEvasion},
@@ -721,9 +721,9 @@ func TestMatchExfilService(t *testing.T) {
 		{"pastebin.com", "Pastebin"},
 		{"webhook.site", "Webhook.site"},
 		{"ipinfo.io", "ipinfo.io"},
-		{"pypi.org", ""},      // not exfil
-		{"google.com", ""},    // not exfil
-		{"example.com", ""},   // not exfil
+		{"pypi.org", ""},    // not exfil
+		{"google.com", ""},  // not exfil
+		{"example.com", ""}, // not exfil
 	}
 	for _, tc := range tests {
 		got := matchExfilService(tc.domain)

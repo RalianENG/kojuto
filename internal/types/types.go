@@ -31,8 +31,8 @@ type SyscallEvent struct {
 	SrcPath   string    `json:"src_path,omitempty"`
 	DstPath   string    `json:"dst_path,omitempty"`
 	DNSQuery  string    `json:"dns_query,omitempty"`
-	MemProt   string    `json:"mem_prot,omitempty"`   // mmap/mprotect protection flags (e.g. "PROT_READ|PROT_WRITE|PROT_EXEC")
-	MemFlags  string    `json:"mem_flags,omitempty"`  // mmap flags (e.g. "MAP_PRIVATE|MAP_ANONYMOUS")
+	MemProt   string    `json:"mem_prot,omitempty"`  // mmap/mprotect protection flags (e.g. "PROT_READ|PROT_WRITE|PROT_EXEC")
+	MemFlags  string    `json:"mem_flags,omitempty"` // mmap flags (e.g. "MAP_PRIVATE|MAP_ANONYMOUS")
 	Syscall   string    `json:"syscall"`
 	Category  string    `json:"category,omitempty"`
 	Reason    string    `json:"reason,omitempty"`

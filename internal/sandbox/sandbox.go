@@ -631,7 +631,7 @@ func (s *Sandbox) WriteProbeScriptsMulti(ctx context.Context, pkgs []string) {
 
 	type pyPlatform struct {
 		system, sysplatform, osname string
-		sep, pathsep, linesep      string
+		sep, pathsep, linesep       string
 	}
 	pyPlatforms := []pyPlatform{
 		{"Linux", "linux", "posix", "/", ":", "\n"},
@@ -709,7 +709,7 @@ func (s *Sandbox) WriteProbeScripts(ctx context.Context) {
 	// sys.platform, etc. Any inconsistency reveals the spoofing.
 	type pyPlatform struct {
 		system, sysplatform, osname string
-		sep, pathsep, linesep      string
+		sep, pathsep, linesep       string
 	}
 	pyPlatforms := []pyPlatform{
 		{"Linux", "linux", "posix", "/", ":", "\n"},
