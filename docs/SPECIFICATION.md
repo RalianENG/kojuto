@@ -42,8 +42,11 @@ An OSS tool that detects suspicious syscalls during package installation and imp
 | `listen(2)` | Listen for incoming connections | Backdoor listener setup |
 | `accept(2)` / `accept4(2)` | Accept incoming connections | Active backdoor operation |
 | `execve(2)` | Process creation | Malware binary execution, reverse shell |
-| `openat(2)` | File access (sensitive paths only) | Credential theft (`.ssh/`, `.aws/`, `.env`, browser data, cloud CLI configs — ~40 paths) |
+| `openat(2)` | File access (sensitive paths + home dir writes) | Credential theft, persistence, sandbox detection |
 | `rename(2)` / `renameat(2)` / `renameat2(2)` | File rename / move | Trusted binary hijacking (`/usr/local/bin/python3`) |
+| `mmap(2)` | Memory mapping with PROT_WRITE\|PROT_EXEC | Shellcode injection via ctypes/ffi-napi (RWX anonymous mapping) |
+| `mprotect(2)` | Memory permission change to WRITE+EXEC | Shellcode injection (modify then execute pattern) |
+| `unlink(2)` / `unlinkat(2)` | File deletion (create→execute→delete correlation) | Anti-forensics payload self-deletion |
 | `ptrace(2)` | `PTRACE_TRACEME` self-check | Anti-debugging evasion (detects tracing to suppress malicious behavior) |
 | `sendfile(2)` | Zero-copy file-to-socket transfer | Forensic trace (not parsed into events) |
 
@@ -57,11 +60,14 @@ An OSS tool that detects suspicious syscalls during package installation and imp
 
 ### openat Analysis Logic
 
-- Only emits events for sensitive file paths (pre-filtered in parser for performance)
-- Monitored paths: `~/.ssh/`, `~/.gnupg/`, `~/.aws/`, `/etc/shadow`, `/proc/self/environ`, `~/.netrc`, `~/.git-credentials`, `~/.docker/config.json`, `~/.config/gh/`
+Two complementary detection strategies:
+
+1. **Sensitive path matching** (any access mode): ~50 path patterns including SSH/GPG keys, cloud credentials (AWS/Azure/GCP/OCI/Aliyun), crypto wallets (Bitcoin/Ethereum/Solana/Monero/Electrum/Exodus/Atomic), browser data (Chrome/Firefox/Brave/Opera/Vivaldi/Edge + extension Local Storage/IndexedDB), shell startup files, desktop keyrings, application tokens, and sandbox detection paths (`/proc/self/status`, `/proc/self/maps`, `/proc/self/cgroup`, `/sys/class/net`)
+2. **Home directory write detection** (whitelist-based): ANY write (`O_WRONLY`/`O_RDWR`/`O_CREAT`) to `/home/` or `/root/` is flagged — pip/npm only write to site-packages, `/usr/local/bin`, `/tmp`, and `/install`. This catches systemd persistence, LaunchAgent injection, and unknown attack paths without maintaining a blacklist
+3. **Sandbox detection classification**: reads to `/proc/self/status`, `/proc/<pid>/comm`, `/proc/self/maps`, `/proc/self/cgroup`, `/sys/class/net` are classified as `evasion` (not `credential_access`) to indicate environment probing
+
 - `.npmrc` and `.pypirc` are excluded (npm/pip read these during normal operation)
 - Events include `open_flags` (e.g. `O_RDONLY`) to indicate read/write intent
-- Any match is treated as suspicious — legitimate packages do not access credential files during install
 
 ### rename Analysis Logic
 

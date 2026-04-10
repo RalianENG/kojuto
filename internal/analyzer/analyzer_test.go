@@ -671,11 +671,149 @@ func TestClassify_OpenatWriteSensitive(t *testing.T) {
 	if len(filtered) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(filtered))
 	}
-	if filtered[0].Category != types.CategoryCredentialAccess {
-		t.Errorf("category = %q, want %q", filtered[0].Category, types.CategoryCredentialAccess)
+	// Write to /home/ is classified as persistence (sandbox structural
+	// whitelist: pip/npm never write to the user home directory).
+	if filtered[0].Category != types.CategoryPersistence {
+		t.Errorf("category = %q, want %q", filtered[0].Category, types.CategoryPersistence)
 	}
 	if !strings.Contains(filtered[0].Reason, "Write") {
 		t.Errorf("reason should mention Write, got %q", filtered[0].Reason)
+	}
+}
+
+func TestClassify_SandboxDetectionPaths(t *testing.T) {
+	tests := []struct {
+		name    string
+		path    string
+		wantCat string
+	}{
+		{"proc self status", "/proc/self/status", types.CategoryEvasion},
+		{"proc self maps", "/proc/self/maps", types.CategoryEvasion},
+		{"proc self cgroup", "/proc/self/cgroup", types.CategoryEvasion},
+		{"proc pid comm", "/proc/42/comm", types.CategoryEvasion},
+		{"sys class net", "/sys/class/net", types.CategoryEvasion},
+		{"ssh key read", "/home/dev/.ssh/id_rsa", types.CategoryCredentialAccess},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			events := []types.SyscallEvent{
+				{Syscall: types.EventOpenat, FilePath: tc.path, OpenFlags: "O_RDONLY"},
+			}
+			_, filtered := Analyze(events)
+			if len(filtered) != 1 {
+				t.Fatalf("expected 1 event, got %d", len(filtered))
+			}
+			if filtered[0].Category != tc.wantCat {
+				t.Errorf("category = %q, want %q", filtered[0].Category, tc.wantCat)
+			}
+		})
+	}
+}
+
+func TestMatchExfilService(t *testing.T) {
+	tests := []struct {
+		domain string
+		want   string
+	}{
+		{"discord.com", "Discord"},
+		{"cdn.discordapp.com", "Discord"},
+		{"api.telegram.org", "Telegram"},
+		{"pastebin.com", "Pastebin"},
+		{"webhook.site", "Webhook.site"},
+		{"ipinfo.io", "ipinfo.io"},
+		{"pypi.org", ""},    // not exfil
+		{"google.com", ""},  // not exfil
+		{"example.com", ""}, // not exfil
+	}
+	for _, tc := range tests {
+		got := matchExfilService(tc.domain)
+		if got != tc.want {
+			t.Errorf("matchExfilService(%q) = %q, want %q", tc.domain, got, tc.want)
+		}
+	}
+}
+
+func TestCollectExecutedPaths(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventExecve, Comm: "/tmp/.payload", Cmdline: "/tmp/.payload"},
+		{Syscall: types.EventExecve, Comm: "/usr/bin/python3", Cmdline: "python3 /tmp/dropper.py"},
+		{Syscall: types.EventOpenat, FilePath: "/home/dev/.ssh/id_rsa"},
+	}
+	paths := collectExecutedPaths(events)
+
+	if !paths["/tmp/.payload"] {
+		t.Error("expected /tmp/.payload in executed paths")
+	}
+	if !paths["/tmp/dropper.py"] {
+		t.Error("expected /tmp/dropper.py in executed paths (from cmdline)")
+	}
+	if paths["/home/dev/.ssh/id_rsa"] {
+		t.Error("/home/dev/.ssh/id_rsa should NOT be in executed paths")
+	}
+}
+
+func TestClassify_HomeDirWrite(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventOpenat, FilePath: "/home/dev/.config/systemd/user/evil.service", OpenFlags: "O_WRONLY|O_CREAT"},
+	}
+	_, filtered := Analyze(events)
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(filtered))
+	}
+	if filtered[0].Category != types.CategoryPersistence {
+		t.Errorf("category = %q, want %q", filtered[0].Category, types.CategoryPersistence)
+	}
+	if !strings.Contains(filtered[0].Reason, "home directory") {
+		t.Errorf("reason should mention home directory, got %q", filtered[0].Reason)
+	}
+}
+
+func TestClassify_MemoryExecution(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventMmap, MemProt: "PROT_READ|PROT_WRITE|PROT_EXEC", MemFlags: "MAP_PRIVATE|MAP_ANONYMOUS"},
+		{Syscall: types.EventMprotect, MemProt: "PROT_READ|PROT_WRITE|PROT_EXEC"},
+	}
+	_, filtered := Analyze(events)
+	if len(filtered) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(filtered))
+	}
+	for i, evt := range filtered {
+		if evt.Category != types.CategoryMemExec {
+			t.Errorf("event %d: category = %q, want %q", i, evt.Category, types.CategoryMemExec)
+		}
+	}
+}
+
+func TestClassify_AntiForensics(t *testing.T) {
+	// create→execute→delete should be classified as anti_forensics
+	events := []types.SyscallEvent{
+		{Syscall: types.EventExecve, Comm: "/tmp/.payload", Cmdline: "/tmp/.payload"},
+		{Syscall: types.EventUnlink, FilePath: "/tmp/.payload"},
+	}
+	_, filtered := Analyze(events)
+
+	var hasAntiForensics bool
+	for _, evt := range filtered {
+		if evt.Category == types.CategoryAntiForensics {
+			hasAntiForensics = true
+		}
+	}
+	if !hasAntiForensics {
+		t.Error("expected anti_forensics category for create→execute→delete pattern")
+	}
+}
+
+func TestClassify_AntiForensics_NoExec(t *testing.T) {
+	// delete without execute → NOT anti_forensics (filtered by analyzer)
+	events := []types.SyscallEvent{
+		{Syscall: types.EventUnlink, FilePath: "/tmp/tempfile"},
+	}
+	_, filtered := Analyze(events)
+
+	for _, evt := range filtered {
+		if evt.Category == types.CategoryAntiForensics {
+			t.Error("unlink without matching execve should NOT be anti_forensics")
+		}
 	}
 }
 

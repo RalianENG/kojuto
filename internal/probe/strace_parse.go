@@ -10,6 +10,29 @@ import (
 	"github.com/RalianENG/kojuto/internal/types"
 )
 
+// ParseState tracks cross-line state during strace output parsing.
+// Used to correlate events like file creation → deletion (anti-forensics).
+type ParseState struct {
+	// createdTmpFiles tracks files created via openat(O_CREAT) in suspicious
+	// directories (/tmp, /dev/shm). Only unlinks of files that were created
+	// during this scan are flagged as anti-forensics — pre-existing file
+	// cleanup (pip temp dirs) is ignored.
+	createdTmpFiles map[string]bool
+}
+
+// NewParseState creates a fresh parse state for a scan phase.
+func NewParseState() *ParseState {
+	return &ParseState{
+		createdTmpFiles: make(map[string]bool),
+	}
+}
+
+// straceOpenatCreateRe matches openat calls with O_CREAT flag for tracking
+// file creation in temp directories.
+var straceOpenatCreateRe = regexp.MustCompile(
+	`openat\([^,]+,\s*"([^"]+)",\s*([A-Z_|]*O_CREAT[A-Z_|]*)`,
+)
+
 var (
 	// Pattern: connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("1.2.3.4")}, 16).
 	straceConnectRe = regexp.MustCompile(
@@ -19,6 +42,13 @@ var (
 	// Pattern: sendto(3, ..., {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, 16).
 	straceSendtoRe = regexp.MustCompile(
 		`sendto\(\d+,.*\{sa_family=AF_INET6?,\s*sin6?_port=htons\((\d+)\),\s*sin6?_addr=inet6?_addr\("([^"]+)"\)`,
+	)
+
+	// Pattern: sendto(4, "...", 29, MSG_NOSIGNAL, NULL, 0) = 29
+	// Connected-socket sendto (e.g. DNS via glibc on connected UDP socket).
+	// No sockaddr — destination was set by prior connect().
+	straceSendtoConnectedRe = regexp.MustCompile(
+		`sendto\((\d+),\s*"([^"]*)",\s*\d+,\s*[^,]+,\s*NULL`,
 	)
 
 	// sendmsg(3, {msg_name={sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("1.2.3.4")}, ...}, 0).
@@ -66,6 +96,31 @@ var (
 		`renameat2?\([^,]+,\s*"([^"]+)",\s*[^,]+,\s*"([^"]+)"`,
 	)
 
+	// mmap(NULL, 4096, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f...
+	// Only match calls that include both PROT_WRITE and PROT_EXEC (RWX).
+	// Normal .so loading uses PROT_READ|PROT_EXEC (no WRITE).
+	// V8 JIT uses RW then mprotect to RX (W^X, never simultaneous RWX).
+	straceMmapRWXRe = regexp.MustCompile(
+		`mmap\([^,]*,\s*\d+,\s*(PROT_[A-Z_|]+PROT_WRITE[A-Z_|]*PROT_EXEC[A-Z_|]*|PROT_[A-Z_|]*PROT_EXEC[A-Z_|]*PROT_WRITE[A-Z_|]*),\s*([A-Z_|]+)`,
+	)
+
+	// mprotect(0x7f..., 4096, PROT_READ|PROT_WRITE|PROT_EXEC) = 0
+	// Changing memory permissions to include both WRITE and EXEC.
+	straceMprotectRWXRe = regexp.MustCompile(
+		`mprotect\(0x[0-9a-f]+,\s*\d+,\s*(PROT_[A-Z_|]+PROT_WRITE[A-Z_|]*PROT_EXEC[A-Z_|]*|PROT_[A-Z_|]*PROT_EXEC[A-Z_|]*PROT_WRITE[A-Z_|]*)`,
+	)
+
+	// unlink("/tmp/.ld-linux-x86-64.py") = 0.
+	straceUnlinkRe = regexp.MustCompile(
+		`unlink\("([^"]+)"\)`,
+	)
+
+	// unlinkat(AT_FDCWD, "/tmp/payload", 0) = 0
+	// Excludes AT_REMOVEDIR (directory removal by pip/npm is benign).
+	straceUnlinkatRe = regexp.MustCompile(
+		`unlinkat\([^,]+,\s*"([^"]+)",\s*0\)`,
+	)
+
 	// ptrace(PTRACE_TRACEME, ...) = -1 EPERM — anti-debugging evasion attempt.
 	stracePtraceTracemeRe = regexp.MustCompile(
 		`ptrace\(PTRACE_TRACEME`,
@@ -98,16 +153,37 @@ func SetSensitivePaths(patterns []string) {
 	sensitivePathPatterns = patterns
 }
 
+// isUserHomePath returns true if the path is inside a user home directory.
+// In the sandbox, /home/ is where honeypot files live. pip/npm never write
+// here — their legitimate targets are site-packages, /usr/local/bin, /tmp,
+// and /install. Any write to /home/ is malicious (persistence, credential
+// tampering, config injection, etc.) regardless of the specific filename.
+func isUserHomePath(filePath string) bool {
+	return strings.HasPrefix(filePath, "/home/") || strings.HasPrefix(filePath, "/root/")
+}
+
+// procPidRe matches /proc/<numeric-pid>/ paths (e.g. /proc/10/comm).
+// Reading other processes' /proc entries is a sandbox detection technique
+// (checking the tracer process name via /proc/<TracerPid>/comm).
+var procPidRe = regexp.MustCompile(`^/proc/\d+/`)
+
 func isSensitivePath(filePath string) bool {
 	for _, pattern := range sensitivePathPatterns {
 		if strings.Contains(filePath, pattern) {
 			return true
 		}
 	}
+	// /proc/<pid>/* (not /proc/self/*) — reading another process's info
+	// is a sandbox detection vector (tracer name lookup).
+	if procPidRe.MatchString(filePath) {
+		return true
+	}
 	return false
 }
 
-func parseStraceLine(line string) (types.SyscallEvent, bool) {
+func parseStraceLine(line string, state *ParseState) (types.SyscallEvent, bool) {
+	// Track file creation in suspicious dirs (side effect, no event emitted).
+	trackTmpFileCreation(line, state)
 	if evt, ok := parseConnectOrSendto(line, straceConnectRe, types.EventConnect); ok {
 		return evt, true
 	}
@@ -117,6 +193,13 @@ func parseStraceLine(line string) (types.SyscallEvent, bool) {
 		if evt.DstPort == 53 {
 			evt.DNSQuery = extractDNSQuery(line)
 		}
+		return evt, true
+	}
+
+	// Connected-socket sendto: sendto(fd, "buf", len, flags, NULL, 0).
+	// glibc's resolver uses connect(fd, {DNS:53}) then sendto(fd, query, ..., NULL).
+	// The sockaddr is absent, but the buffer contains the DNS wire-format query.
+	if evt, ok := parseConnectedSendtoDNS(line); ok {
 		return evt, true
 	}
 
@@ -156,12 +239,29 @@ func parseStraceLine(line string) (types.SyscallEvent, bool) {
 		return evt, true
 	}
 
+	if evt, ok := parseMmapRWX(line); ok {
+		return evt, true
+	}
+
+	if evt, ok := parseMprotectRWX(line); ok {
+		return evt, true
+	}
+
+	if evt, ok := parseUnlink(line, state); ok {
+		return evt, true
+	}
+
 	return types.SyscallEvent{}, false
 }
 
-// parseOpenat emits events only for sensitive file paths (credentials, keys, etc.).
-// Package installs generate thousands of openat calls; pre-filtering here avoids
-// overwhelming the event channel and analyzer.
+// parseOpenat emits events for:
+//  1. Sensitive file paths (credentials, keys, etc.) — any access mode.
+//  2. ANY write to the user home directory (/home/) — pip/npm never write here.
+//     This is a whitelist-based check derived from the sandbox structure:
+//     the only legitimate write targets are site-packages, /usr/local/bin,
+//     /tmp, and /install. Writes to /home/ indicate persistence, credential
+//     tampering, or other malicious file operations regardless of the
+//     specific path.
 func parseOpenat(line string) (types.SyscallEvent, bool) {
 	matches := straceOpenatRe.FindStringSubmatch(line)
 	if matches == nil {
@@ -169,13 +269,18 @@ func parseOpenat(line string) (types.SyscallEvent, bool) {
 	}
 
 	filePath := matches[1]
-	if !isSensitivePath(filePath) {
-		return types.SyscallEvent{}, false
-	}
-
 	var flags string
 	if len(matches) > 2 {
 		flags = matches[2]
+	}
+
+	isWrite := strings.Contains(flags, "O_WRONLY") ||
+		strings.Contains(flags, "O_RDWR") ||
+		strings.Contains(flags, "O_CREAT")
+
+	// Emit if: sensitive path (any access), OR write to user home.
+	if !isSensitivePath(filePath) && (!isWrite || !isUserHomePath(filePath)) {
+		return types.SyscallEvent{}, false
 	}
 
 	return types.SyscallEvent{
@@ -232,6 +337,133 @@ func parsePtraceTraceme(line string) (types.SyscallEvent, bool) {
 	}, true
 }
 
+// parseMmapRWX detects mmap calls with simultaneous PROT_WRITE and PROT_EXEC.
+// This combination (RWX) on anonymous mappings is the hallmark of shellcode
+// injection: allocate writable+executable memory, write shellcode, jump to it.
+//
+// Normal shared library loading uses PROT_READ|PROT_EXEC (no WRITE).
+// V8 JIT uses W^X: PROT_READ|PROT_WRITE first, then mprotect to PROT_READ|PROT_EXEC.
+// Neither produces simultaneous RWX.
+func parseMmapRWX(line string) (types.SyscallEvent, bool) {
+	matches := straceMmapRWXRe.FindStringSubmatch(line)
+	if matches == nil {
+		return types.SyscallEvent{}, false
+	}
+
+	// Skip failed calls.
+	if strings.Contains(line, "= -1 ") || strings.Contains(line, "MAP_FAILED") {
+		return types.SyscallEvent{}, false
+	}
+
+	prot := matches[1]
+	flags := matches[2]
+
+	return types.SyscallEvent{
+		Timestamp: time.Now().UTC(),
+		PID:       extractPID(line),
+		Syscall:   types.EventMmap,
+		MemProt:   prot,
+		MemFlags:  flags,
+	}, true
+}
+
+// parseMprotectRWX detects mprotect calls that set simultaneous WRITE+EXEC.
+// This indicates a memory region being made both writable and executable,
+// which is a classic shellcode injection pattern (modify code in place).
+func parseMprotectRWX(line string) (types.SyscallEvent, bool) {
+	matches := straceMprotectRWXRe.FindStringSubmatch(line)
+	if matches == nil {
+		return types.SyscallEvent{}, false
+	}
+
+	if strings.Contains(line, "= -1 ") {
+		return types.SyscallEvent{}, false
+	}
+
+	return types.SyscallEvent{
+		Timestamp: time.Now().UTC(),
+		PID:       extractPID(line),
+		Syscall:   types.EventMprotect,
+		MemProt:   matches[1],
+	}, true
+}
+
+// suspiciousUnlinkDirs are directories where file deletion indicates
+// anti-forensics (stage-2 payload self-deletion after execution).
+var suspiciousUnlinkDirs = []string{
+	"/tmp/",
+	"/dev/shm/",
+	"/var/tmp/",
+	"/run/",
+}
+
+// trackTmpFileCreation records file creation in suspicious directories.
+// Called as a side effect on every strace line — no event is emitted.
+// The created paths are used by parseUnlink to distinguish malware
+// payload self-deletion from pre-existing file cleanup.
+func trackTmpFileCreation(line string, state *ParseState) {
+	matches := straceOpenatCreateRe.FindStringSubmatch(line)
+	if matches == nil {
+		return
+	}
+
+	filePath := matches[1]
+
+	// Skip failed calls.
+	if strings.Contains(line, "= -1 ") {
+		return
+	}
+
+	for _, dir := range suspiciousUnlinkDirs {
+		if strings.HasPrefix(filePath, dir) {
+			state.createdTmpFiles[filePath] = true
+			return
+		}
+	}
+}
+
+// parseUnlink detects unlink/unlinkat of files that were CREATED during
+// the current scan. This is the create→delete anti-forensics pattern:
+//
+//  1. Malware drops payload:  openat("/tmp/ld.py", O_CREAT|O_WRONLY)
+//  2. Malware executes it:    execve("/tmp/ld.py", ...)
+//  3. Malware deletes it:     unlink("/tmp/ld.py")  ← detected here
+//
+// Pre-existing files cleaned up by pip/npm are NOT flagged because they
+// were not created (openat O_CREAT) during this scan.
+func parseUnlink(line string, state *ParseState) (types.SyscallEvent, bool) {
+	var filePath string
+
+	if matches := straceUnlinkRe.FindStringSubmatch(line); matches != nil {
+		filePath = matches[1]
+	} else if matches := straceUnlinkatRe.FindStringSubmatch(line); matches != nil {
+		filePath = matches[1]
+	}
+
+	if filePath == "" {
+		return types.SyscallEvent{}, false
+	}
+
+	// Skip failed calls.
+	if strings.Contains(line, "= -1 ") {
+		return types.SyscallEvent{}, false
+	}
+
+	// Only flag files that were CREATED during this scan (create→delete pair).
+	// This eliminates false positives from pip/npm cleaning up pre-existing
+	// temp files while catching malware payload self-deletion.
+	if !state.createdTmpFiles[filePath] {
+		return types.SyscallEvent{}, false
+	}
+
+	return types.SyscallEvent{
+		Timestamp: time.Now().UTC(),
+		PID:       extractPID(line),
+		Syscall:   types.EventUnlink,
+		FilePath:  filePath,
+	}, true
+}
+
 func parseConnectOrSendto(line string, re *regexp.Regexp, syscall string) (types.SyscallEvent, bool) {
 	matches := re.FindStringSubmatch(line)
 	if matches == nil {
@@ -268,10 +500,19 @@ func parseExecve(line string) (types.SyscallEvent, bool) {
 		return types.SyscallEvent{}, false
 	}
 
-	// Skip failed execve calls (ENOENT, EACCES, etc.) — they are normal
-	// PATH search attempts and produce false positives.
+	// Skip failed execve calls that are harmless PATH search attempts
+	// (ENOENT = file not found at /usr/bin/foo, then tries /bin/foo).
+	// However, KEEP failed execve from suspicious directories (/tmp, /dev/shm)
+	// — these indicate a payload execution attempt that was blocked by
+	// permissions (EACCES) or seccomp. The attempt itself is evidence.
 	if execveFailedRe.MatchString(line) {
-		return types.SyscallEvent{}, false
+		binaryPath := matches[1]
+		isSuspiciousPath := strings.HasPrefix(binaryPath, "/tmp/") ||
+			strings.HasPrefix(binaryPath, "/dev/shm/") ||
+			strings.HasPrefix(binaryPath, "/var/tmp/")
+		if !isSuspiciousPath {
+			return types.SyscallEvent{}, false
+		}
 	}
 
 	// matches[1] = binary path, matches[2] = argv list
@@ -320,6 +561,36 @@ func extractPID(line string) uint32 {
 	}
 
 	return uint32(p)
+}
+
+// parseConnectedSendtoDNS handles sendto on connected sockets (NULL dest addr).
+// glibc's DNS resolver connects a UDP socket to the nameserver, then sends
+// queries via sendto(fd, buf, len, flags, NULL, 0). The sockaddr is absent,
+// so the standard sendto regex won't match. Instead we check the buffer
+// for DNS wire-format content and extract the queried domain.
+//
+// Example strace line:
+//
+//	sendto(4, "e\27\1\0\0\1\0\0\0\0\0\0\7discord\3com\0\0\1\0\1", 29, MSG_NOSIGNAL, NULL, 0) = 29
+func parseConnectedSendtoDNS(line string) (types.SyscallEvent, bool) {
+	if !straceSendtoConnectedRe.MatchString(line) {
+		return types.SyscallEvent{}, false
+	}
+
+	// Try to extract DNS domain from the buffer.
+	domain := extractDNSQuery(line)
+	if domain == "" {
+		return types.SyscallEvent{}, false
+	}
+
+	return types.SyscallEvent{
+		Timestamp: time.Now().UTC(),
+		PID:       extractPID(line),
+		Syscall:   types.EventSendto,
+		DstAddr:   "127.0.0.11", // Docker embedded DNS (connected socket, addr not in strace)
+		DstPort:   53,
+		DNSQuery:  domain,
+	}, true
 }
 
 // straceSendtoBufRe captures the buffer content from sendto() output.

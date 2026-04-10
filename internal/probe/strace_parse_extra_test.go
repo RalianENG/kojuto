@@ -1,6 +1,7 @@
 package probe
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/RalianENG/kojuto/internal/types"
@@ -9,7 +10,7 @@ import (
 func TestParseStraceLine_Sendmsg(t *testing.T) {
 	line := `[pid 600] sendmsg(5, {msg_name={sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("10.0.0.1")}, msg_namelen=16, msg_iov=[{iov_base="...", iov_len=100}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 100`
 
-	evt, ok := parseStraceLine(line)
+	evt, ok := parseStraceLine(line, NewParseState())
 	if !ok {
 		t.Fatal("expected sendmsg parse to succeed")
 	}
@@ -34,7 +35,7 @@ func TestParseStraceLine_Sendmsg(t *testing.T) {
 func TestParseStraceLine_Sendmmsg(t *testing.T) {
 	line := `[pid 700] sendmmsg(6, [{msg_hdr={msg_name={sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.4.4")}, msg_namelen=16, msg_iov=[{...}], msg_iovlen=1}, msg_len=40}], 1, 0) = 1`
 
-	evt, ok := parseStraceLine(line)
+	evt, ok := parseStraceLine(line, NewParseState())
 	if !ok {
 		t.Fatal("expected sendmmsg parse to succeed")
 	}
@@ -55,7 +56,7 @@ func TestParseStraceLine_Sendmmsg(t *testing.T) {
 func TestParseStraceLine_Bind(t *testing.T) {
 	line := `[pid 800] bind(3, {sa_family=AF_INET, sin_port=htons(4444), sin_addr=inet_addr("0.0.0.0")}, 16) = 0`
 
-	evt, ok := parseStraceLine(line)
+	evt, ok := parseStraceLine(line, NewParseState())
 	if !ok {
 		t.Fatal("expected bind parse to succeed")
 	}
@@ -76,7 +77,7 @@ func TestParseStraceLine_Bind(t *testing.T) {
 func TestParseStraceLine_Listen(t *testing.T) {
 	line := `[pid 900] listen(3, 5) = 0`
 
-	evt, ok := parseStraceLine(line)
+	evt, ok := parseStraceLine(line, NewParseState())
 	if !ok {
 		t.Fatal("expected listen parse to succeed")
 	}
@@ -93,7 +94,7 @@ func TestParseStraceLine_Listen(t *testing.T) {
 func TestParseStraceLine_Accept(t *testing.T) {
 	line := `[pid 1000] accept(3, {sa_family=AF_INET, sin_port=htons(54321), sin_addr=inet_addr("192.168.1.100")}, [16]) = 4`
 
-	evt, ok := parseStraceLine(line)
+	evt, ok := parseStraceLine(line, NewParseState())
 	if !ok {
 		t.Fatal("expected accept parse to succeed")
 	}
@@ -114,7 +115,7 @@ func TestParseStraceLine_Accept(t *testing.T) {
 func TestParseStraceLine_Accept4(t *testing.T) {
 	line := `[pid 1100] accept4(3, {sa_family=AF_INET, sin_port=htons(12345), sin_addr=inet_addr("10.0.0.2")}, [16], SOCK_CLOEXEC) = 5`
 
-	evt, ok := parseStraceLine(line)
+	evt, ok := parseStraceLine(line, NewParseState())
 	if !ok {
 		t.Fatal("expected accept4 parse to succeed")
 	}
@@ -131,7 +132,7 @@ func TestParseStraceLine_Accept4(t *testing.T) {
 func TestParseStraceLine_Sendmsg_IPv6(t *testing.T) {
 	line := `[pid 1200] sendmsg(5, {msg_name={sa_family=AF_INET6, sin6_port=htons(443), sin6_addr=inet6_addr("2001:db8::1")}, msg_namelen=28, msg_iov=[{...}], msg_iovlen=1}, 0) = 50`
 
-	evt, ok := parseStraceLine(line)
+	evt, ok := parseStraceLine(line, NewParseState())
 	if !ok {
 		t.Fatal("expected IPv6 sendmsg parse to succeed")
 	}
@@ -148,7 +149,7 @@ func TestParseStraceLine_Sendmsg_IPv6(t *testing.T) {
 func TestParseStraceLine_Bind_IPv6(t *testing.T) {
 	line := `[pid 1300] bind(3, {sa_family=AF_INET6, sin6_port=htons(8080), sin6_addr=inet6_addr("::")}, 28) = 0`
 
-	evt, ok := parseStraceLine(line)
+	evt, ok := parseStraceLine(line, NewParseState())
 	if !ok {
 		t.Fatal("expected IPv6 bind parse to succeed")
 	}
@@ -169,7 +170,7 @@ func TestParseStraceLine_Bind_IPv6(t *testing.T) {
 func TestParseStraceLine_OpenatGnupg(t *testing.T) {
 	line := `[pid 1400] openat(AT_FDCWD, "/home/dev/.gnupg/secring.gpg", O_RDONLY) = 3`
 
-	evt, ok := parseStraceLine(line)
+	evt, ok := parseStraceLine(line, NewParseState())
 	if !ok {
 		t.Fatal("expected gnupg openat parse to succeed")
 	}
@@ -186,7 +187,7 @@ func TestParseStraceLine_OpenatGnupg(t *testing.T) {
 func TestParseStraceLine_OpenatNetrc(t *testing.T) {
 	line := `[pid 1500] openat(AT_FDCWD, "/home/dev/.netrc", O_RDONLY) = 3`
 
-	evt, ok := parseStraceLine(line)
+	evt, ok := parseStraceLine(line, NewParseState())
 	if !ok {
 		t.Fatal("expected netrc openat parse to succeed")
 	}
@@ -199,7 +200,7 @@ func TestParseStraceLine_OpenatNetrc(t *testing.T) {
 func TestParseStraceLine_OpenatConfigGh(t *testing.T) {
 	line := `[pid 1600] openat(AT_FDCWD, "/home/dev/.config/gh/hosts.yml", O_RDONLY) = 3`
 
-	evt, ok := parseStraceLine(line)
+	evt, ok := parseStraceLine(line, NewParseState())
 	if !ok {
 		t.Fatal("expected gh config openat parse to succeed")
 	}
@@ -335,7 +336,7 @@ func TestParsePtraceTraceme(t *testing.T) {
 
 func TestParseStraceLine_PtraceTraceme(t *testing.T) {
 	line := `[pid 500] ptrace(PTRACE_TRACEME) = -1 EPERM (Operation not permitted)`
-	evt, ok := parseStraceLine(line)
+	evt, ok := parseStraceLine(line, NewParseState())
 	if !ok {
 		t.Fatal("expected parseStraceLine to match ptrace line")
 	}
@@ -344,5 +345,282 @@ func TestParseStraceLine_PtraceTraceme(t *testing.T) {
 	}
 	if evt.PID != 500 {
 		t.Errorf("expected PID 500, got %d", evt.PID)
+	}
+}
+
+func TestAntiForensics_CreateExecuteDelete(t *testing.T) {
+	// Simulate: malware creates /tmp/payload, executes it, deletes it.
+	lines := []string{
+		`openat(AT_FDCWD, "/tmp/.payload", O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0666) = 3`,
+		`[pid 10] execve("/tmp/.payload", ["/tmp/.payload"], 0xfff /* 7 vars */) = -1 EACCES (Permission denied)`,
+		`unlinkat(AT_FDCWD, "/tmp/.payload", 0) = 0`,
+	}
+
+	state := NewParseState()
+	var events []types.SyscallEvent
+	for _, line := range lines {
+		evt, ok := parseStraceLine(line, state)
+		if ok {
+			events = append(events, evt)
+		}
+	}
+
+	// Should have: openat (sensitive? no, but tracked), execve, unlink
+	var hasExecve, hasUnlink bool
+	for _, e := range events {
+		if e.Syscall == types.EventExecve && e.Comm == "/tmp/.payload" {
+			hasExecve = true
+		}
+		if e.Syscall == types.EventUnlink && e.FilePath == "/tmp/.payload" {
+			hasUnlink = true
+		}
+	}
+
+	if !hasExecve {
+		t.Error("expected execve event for /tmp/.payload (even EACCES)")
+	}
+	if !hasUnlink {
+		t.Error("expected unlink event for /tmp/.payload (create→delete tracked)")
+	}
+}
+
+func TestAntiForensics_PipTempNotFlagged(t *testing.T) {
+	// pip creates and deletes temp files but never executes them.
+	// Only the delete should appear; without a matching create in state, it won't.
+	lines := []string{
+		// pip temp file deleted WITHOUT prior openat(O_CREAT) in this session
+		`unlinkat(AT_FDCWD, "/tmp/pip-build-tracker-abc123", 0) = 0`,
+	}
+
+	state := NewParseState()
+	for _, line := range lines {
+		evt, ok := parseStraceLine(line, state)
+		if ok && evt.Syscall == types.EventUnlink {
+			t.Error("unlink of file not created in this session should not be emitted")
+		}
+	}
+}
+
+func TestAntiForensics_CreateDeleteWithoutExecute(t *testing.T) {
+	// File created and deleted but NOT executed — should still emit unlink
+	// event (the execute check is in the analyzer, not the parser).
+	lines := []string{
+		`openat(AT_FDCWD, "/tmp/tempfile", O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0666) = 3`,
+		`unlinkat(AT_FDCWD, "/tmp/tempfile", 0) = 0`,
+	}
+
+	state := NewParseState()
+	var hasUnlink bool
+	for _, line := range lines {
+		evt, ok := parseStraceLine(line, state)
+		if ok && evt.Syscall == types.EventUnlink {
+			hasUnlink = true
+		}
+	}
+
+	if !hasUnlink {
+		t.Error("expected unlink event for file created in same session")
+	}
+}
+
+// --- mmap/mprotect tests ---
+
+func TestParseMmapRWX(t *testing.T) {
+	tests := []struct {
+		name string
+		line string
+		want bool
+	}{
+		{
+			"rwx anonymous",
+			`mmap(NULL, 4096, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f1234000000`,
+			true,
+		},
+		{
+			"rx only (normal .so load)",
+			`mmap(NULL, 4096, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x7f1234000000`,
+			false,
+		},
+		{
+			"rw only (normal alloc)",
+			`mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f1234000000`,
+			false,
+		},
+		{
+			"rwx failed",
+			`mmap(NULL, 4096, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = -1 ENOMEM`,
+			false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			evt, ok := parseStraceLine(tc.line, NewParseState())
+			if ok != tc.want {
+				t.Errorf("parseStraceLine(%q) = _, %v; want %v", tc.line[:60], ok, tc.want)
+			}
+			if ok && evt.Syscall != types.EventMmap {
+				t.Errorf("expected syscall %q, got %q", types.EventMmap, evt.Syscall)
+			}
+			if ok && !strings.Contains(evt.MemProt, "PROT_WRITE") {
+				t.Errorf("expected MemProt to contain PROT_WRITE, got %q", evt.MemProt)
+			}
+		})
+	}
+}
+
+func TestParseMprotectRWX(t *testing.T) {
+	tests := []struct {
+		name string
+		line string
+		want bool
+	}{
+		{
+			"rwx mprotect",
+			`mprotect(0x7f1234000000, 4096, PROT_READ|PROT_WRITE|PROT_EXEC) = 0`,
+			true,
+		},
+		{
+			"rx only (V8 JIT W^X)",
+			`mprotect(0x7f1234000000, 4096, PROT_READ|PROT_EXEC) = 0`,
+			false,
+		},
+		{
+			"rwx failed",
+			`mprotect(0x7f1234000000, 4096, PROT_READ|PROT_WRITE|PROT_EXEC) = -1 ENOMEM`,
+			false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			evt, ok := parseStraceLine(tc.line, NewParseState())
+			if ok != tc.want {
+				t.Errorf("parseStraceLine(%q) = _, %v; want %v", tc.line[:60], ok, tc.want)
+			}
+			if ok && evt.Syscall != types.EventMprotect {
+				t.Errorf("expected syscall %q, got %q", types.EventMprotect, evt.Syscall)
+			}
+		})
+	}
+}
+
+// --- connected-socket DNS tests ---
+
+func TestParseConnectedSendtoDNS(t *testing.T) {
+	tests := []struct {
+		name   string
+		line   string
+		want   bool
+		domain string
+	}{
+		{
+			"glibc resolver discord",
+			`sendto(4, "e\27\1\0\0\1\0\0\0\0\0\0\7discord\3com\0\0\1\0\1", 29, MSG_NOSIGNAL, NULL, 0) = 29`,
+			true,
+			"discord.com",
+		},
+		{
+			"glibc resolver telegram",
+			`sendto(3, "Q\26\1\0\0\1\0\0\0\0\0\0\3api\10telegram\3org\0\0\1\0\1", 34, MSG_NOSIGNAL, NULL, 0) = 34`,
+			true,
+			"api.telegram.org",
+		},
+		{
+			"non-DNS sendto with sockaddr (normal pattern)",
+			`sendto(4, "hello", 5, 0, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, 16) = 5`,
+			false, // has sockaddr → handled by straceSendtoRe, not connected pattern
+			"",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			evt, ok := parseConnectedSendtoDNS(tc.line)
+			if ok != tc.want {
+				t.Errorf("got ok=%v, want %v", ok, tc.want)
+			}
+			if ok && evt.DNSQuery != tc.domain {
+				t.Errorf("DNSQuery = %q, want %q", evt.DNSQuery, tc.domain)
+			}
+		})
+	}
+}
+
+// --- isUserHomePath tests ---
+
+func TestIsUserHomePath(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{"/home/dev/.bashrc", true},
+		{"/home/user/.config/systemd/user/evil.service", true},
+		{"/root/.ssh/id_rsa", true},
+		{"/usr/local/lib/python3.12/site-packages/foo.py", false},
+		{"/tmp/payload", false},
+		{"/etc/shadow", false},
+	}
+	for _, tc := range tests {
+		if got := isUserHomePath(tc.path); got != tc.want {
+			t.Errorf("isUserHomePath(%q) = %v, want %v", tc.path, got, tc.want)
+		}
+	}
+}
+
+// --- /proc/<pid>/ detection tests ---
+
+func TestIsSensitivePath_ProcPid(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{"/proc/self/status", true},  // in config patterns
+		{"/proc/self/maps", true},    // in config patterns
+		{"/proc/10/comm", true},      // numeric PID → procPidRe
+		{"/proc/12345/status", true}, // numeric PID
+		{"/proc/version", false},     // not sensitive
+		{"/proc/meminfo", false},     // not sensitive
+	}
+	saved := sensitivePathPatterns
+	defer func() { sensitivePathPatterns = saved }()
+	SetSensitivePaths([]string{"/proc/self/status", "/proc/self/maps"})
+	for _, tc := range tests {
+		if got := isSensitivePath(tc.path); got != tc.want {
+			t.Errorf("isSensitivePath(%q) = %v, want %v", tc.path, got, tc.want)
+		}
+	}
+}
+
+// --- openat home dir write test ---
+
+func TestParseOpenat_HomeWrite(t *testing.T) {
+	saved := sensitivePathPatterns
+	defer func() { sensitivePathPatterns = saved }()
+	SetSensitivePaths([]string{"/.ssh/"}) // minimal
+	state := NewParseState()
+
+	// Write to /home/ should be emitted even if not in sensitive paths
+	line := `openat(AT_FDCWD, "/home/dev/.config/systemd/user/evil.service", O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0644) = 3`
+	evt, ok := parseStraceLine(line, state)
+	if !ok {
+		t.Fatal("expected openat write to /home/ to be emitted")
+	}
+	if evt.Syscall != types.EventOpenat {
+		t.Errorf("expected openat, got %s", evt.Syscall)
+	}
+	if evt.FilePath != "/home/dev/.config/systemd/user/evil.service" {
+		t.Errorf("unexpected path: %s", evt.FilePath)
+	}
+}
+
+func TestParseOpenat_HomeReadNotEmitted(t *testing.T) {
+	saved := sensitivePathPatterns
+	defer func() { sensitivePathPatterns = saved }()
+	SetSensitivePaths([]string{}) // empty → only home write check applies
+	state := NewParseState()
+
+	// Read from /home/ that's not in sensitive paths → NOT emitted
+	line := `openat(AT_FDCWD, "/home/dev/somefile.txt", O_RDONLY|O_CLOEXEC) = 3`
+	_, ok := parseStraceLine(line, state)
+	if ok {
+		t.Error("read from /home/ not in sensitive paths should not be emitted")
 	}
 }

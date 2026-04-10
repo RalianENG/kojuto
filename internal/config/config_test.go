@@ -13,7 +13,17 @@ func TestDefaultSensitivePaths(t *testing.T) {
 	}
 
 	// Verify critical paths are present.
-	required := []string{"/.ssh/", "/.aws/", "/.env", "/.kube/config", "/.config/google-chrome/", "/.bashrc"}
+	required := []string{
+		// Original paths
+		"/.ssh/", "/.aws/", "/.env", "/.kube/config", "/.config/google-chrome/", "/.bashrc",
+		// Crypto wallets
+		"/.bitcoin/", "/.ethereum/", "/.solana/",
+		// Browser extensions
+		"/Local Storage/leveldb/", "/IndexedDB/",
+		// Sandbox detection paths
+		"/proc/self/maps", "/proc/self/status", "/proc/self/cgroup",
+		"/sys/class/net",
+	}
 	for _, want := range required {
 		found := false
 		for _, p := range paths {

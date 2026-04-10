@@ -25,6 +25,10 @@ func SetSensitivePaths(patterns []string) {
 // Events matching known-benign patterns are filtered out first.
 // Suspicious events are enriched with Category and Reason fields.
 func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
+	// Pre-pass: collect paths that were executed (execve) and files that
+	// were written (openat O_CREAT/O_WRONLY) to correlate with unlinks.
+	executedPaths := collectExecutedPaths(events)
+
 	var suspicious []types.SyscallEvent
 
 	for i := range events {
@@ -33,6 +37,20 @@ func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
 		}
 
 		classify(&events[i])
+
+		// Anti-forensics refinement: only keep unlink events for files
+		// that were also EXECUTED during this scan. This distinguishes
+		// malware payload self-deletion (create→execute→delete) from
+		// pip temp file cleanup (create→delete without execute).
+		if events[i].Category == types.CategoryAntiForensics {
+			if !executedPaths[events[i].FilePath] {
+				continue
+			}
+			events[i].Reason = "Payload self-deletion: " + events[i].FilePath +
+				" was created, executed, and deleted within the same scan — " +
+				"classic anti-forensics technique to remove traces after execution."
+		}
+
 		suspicious = append(suspicious, events[i])
 	}
 
@@ -41,6 +59,51 @@ func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
 	}
 
 	return types.VerdictClean, nil
+}
+
+// collectExecutedPaths builds a set of file paths that appeared as the
+// binary in execve events, including FAILED execve (EACCES, ENOENT on
+// specific paths). This also scans the RAW event stream (pre-filter)
+// because failed execve events are filtered out by isBenign.
+//
+// Additionally collects paths from code_execution events (interpreter
+// invocations like "python3 /tmp/payload.py") where the payload is an
+// argument, not the execve binary itself.
+func collectExecutedPaths(events []types.SyscallEvent) map[string]bool {
+	paths := make(map[string]bool)
+	for i := range events {
+		evt := &events[i]
+
+		if evt.Syscall == types.EventExecve {
+			// The Comm field contains the binary path.
+			if evt.Comm != "" {
+				paths[evt.Comm] = true
+			}
+			// Check cmdline for paths in suspicious dirs
+			// (e.g. "python3 /tmp/payload.py", "sh /tmp/dropper.sh").
+			for _, token := range strings.Fields(evt.Cmdline) {
+				if isInSuspiciousDir(token) {
+					paths[token] = true
+				}
+			}
+		}
+
+		// Unlink events also carry the deleted path — track the
+		// anti-forensics correlation from the other direction: if we
+		// see a path in BOTH openat(O_CREAT) and unlink, the create→delete
+		// pair is established by the parser. Here we only need to confirm
+		// execution happened between create and delete.
+	}
+	return paths
+}
+
+// isInSuspiciousDir checks if a path is in a directory associated with
+// payload staging (same dirs as the unlink detector).
+func isInSuspiciousDir(filePath string) bool {
+	return strings.HasPrefix(filePath, "/tmp/") ||
+		strings.HasPrefix(filePath, "/dev/shm/") ||
+		strings.HasPrefix(filePath, "/var/tmp/") ||
+		strings.HasPrefix(filePath, "/run/")
 }
 
 // GenerateSummary creates a human-readable summary from analyzed events.
@@ -88,14 +151,14 @@ func assessRisk(categories []string) string {
 	for _, c := range categories {
 		switch c {
 		case types.CategoryC2, types.CategoryDataExfil, types.CategoryCredentialAccess,
-			types.CategoryBackdoor:
+			types.CategoryBackdoor, types.CategoryMemExec:
 			return "critical"
 		}
 	}
 	for _, c := range categories {
 		switch c {
 		case types.CategoryBinaryHijack, types.CategoryDNSTunnel, types.CategoryPersistence,
-			types.CategoryEvasion:
+			types.CategoryEvasion, types.CategoryAntiForensics:
 			return "high"
 		}
 	}
@@ -109,7 +172,7 @@ func buildDescription(_ []types.SyscallEvent, categories []string) string {
 		case types.CategoryC2:
 			parts = append(parts, "outbound connection to external server (possible C2)")
 		case types.CategoryDataExfil:
-			parts = append(parts, "data exfiltration via DNS tunneling")
+			parts = append(parts, "data exfiltration via known exfiltration service (Discord/Telegram/Pastebin)")
 		case types.CategoryCredentialAccess:
 			parts = append(parts, "access to credential/secret files")
 		case types.CategoryCodeExecution:
@@ -124,6 +187,10 @@ func buildDescription(_ []types.SyscallEvent, categories []string) string {
 			parts = append(parts, "DNS tunneling detected (high-entropy subdomain queries)")
 		case types.CategoryEvasion:
 			parts = append(parts, "anti-debugging evasion detected (ptrace self-check)")
+		case types.CategoryMemExec:
+			parts = append(parts, "writable+executable memory allocation (shellcode injection indicator)")
+		case types.CategoryAntiForensics:
+			parts = append(parts, "file deletion in temporary directory (anti-forensics/payload self-cleanup)")
 		}
 	}
 	return strings.Join(parts, "; ") + "."
@@ -132,7 +199,7 @@ func buildDescription(_ []types.SyscallEvent, categories []string) string {
 func buildRemediation(categories []string) string {
 	for _, c := range categories {
 		switch c {
-		case types.CategoryC2, types.CategoryDataExfil, types.CategoryBackdoor:
+		case types.CategoryC2, types.CategoryDataExfil, types.CategoryBackdoor, types.CategoryMemExec:
 			return "Do NOT install this package. Remove it from dependencies immediately. " +
 				"If previously installed, audit the host for compromised credentials and rotate secrets."
 		case types.CategoryCredentialAccess:
@@ -150,11 +217,17 @@ func buildRemediation(categories []string) string {
 func classify(evt *types.SyscallEvent) {
 	switch evt.Syscall {
 	case types.EventConnect:
-		if isKnownDoHServer(evt.DstAddr) && evt.DstPort == 443 {
+		switch {
+		case isKnownDoHServer(evt.DstAddr) && evt.DstPort == 443:
 			evt.Category = types.CategoryDNSTunnel
 			evt.Reason = "Connection to known DNS-over-HTTPS server " + evt.DstAddr + ":443" +
 				" — may be used for DNS tunneling to bypass port-53 monitoring."
-		} else {
+		case evt.DstPort == 53:
+			evt.Category = types.CategoryC2
+			evt.Reason = "DNS resolver connection to " + evt.DstAddr + ":53" +
+				" — package attempted hostname resolution, indicating intent to " +
+				"communicate with an external server."
+		default:
 			evt.Category = types.CategoryC2
 			evt.Reason = "Outbound connection to " + evt.DstAddr + ":" + portStr(evt.DstPort) +
 				" — packages should not make network connections during install or import."
@@ -162,9 +235,16 @@ func classify(evt *types.SyscallEvent) {
 
 	case types.EventSendto, types.EventSendmsg, types.EventSendmmsg:
 		if evt.DNSQuery != "" {
-			evt.Category = types.CategoryDNSTunnel
-			evt.Reason = "DNS query to " + evt.DNSQuery +
-				" contains high-entropy subdomains, indicating data exfiltration via DNS tunneling."
+			if svc := matchExfilService(evt.DNSQuery); svc != "" {
+				evt.Category = types.CategoryDataExfil
+				evt.Reason = "DNS resolution of known exfiltration service (" + svc +
+					"): " + evt.DNSQuery +
+					" — commonly used by threat actors to exfiltrate stolen data."
+			} else {
+				evt.Category = types.CategoryDNSTunnel
+				evt.Reason = "DNS query to " + evt.DNSQuery +
+					" contains high-entropy subdomains, indicating data exfiltration via DNS tunneling."
+			}
 		} else {
 			evt.Category = types.CategoryC2
 			evt.Reason = "Network data sent to " + evt.DstAddr + ":" + portStr(evt.DstPort) + "."
@@ -190,6 +270,24 @@ func classify(evt *types.SyscallEvent) {
 		evt.Category = types.CategoryEvasion
 		evt.Reason = "ptrace(PTRACE_TRACEME) detected — anti-debugging technique " +
 			"used to detect tracing and suppress malicious behavior."
+
+	case types.EventMmap:
+		evt.Category = types.CategoryMemExec
+		evt.Reason = "mmap with PROT_WRITE|PROT_EXEC (" + evt.MemProt + ", " + evt.MemFlags +
+			") — writable+executable memory allocation. " +
+			"Used by shellcode injection (ctypes/ffi-napi) to execute arbitrary " +
+			"native code without touching the filesystem."
+
+	case types.EventMprotect:
+		evt.Category = types.CategoryMemExec
+		evt.Reason = "mprotect with PROT_WRITE|PROT_EXEC (" + evt.MemProt +
+			") — memory permissions changed to writable+executable. " +
+			"Classic shellcode injection pattern: write payload, then make it executable."
+
+	case types.EventUnlink:
+		evt.Category = types.CategoryAntiForensics
+		evt.Reason = "File deleted from suspicious directory: " + evt.FilePath +
+			" — anti-forensics technique to remove payload traces after execution."
 	}
 }
 
@@ -203,7 +301,8 @@ var persistenceTargets = []string{
 
 func classifyOpenat(evt *types.SyscallEvent) {
 	isWrite := strings.Contains(evt.OpenFlags, "O_WRONLY") ||
-		strings.Contains(evt.OpenFlags, "O_RDWR")
+		strings.Contains(evt.OpenFlags, "O_RDWR") ||
+		strings.Contains(evt.OpenFlags, "O_CREAT")
 
 	// Check if this is a write to a persistence target (e.g. .bashrc).
 	if isWrite {
@@ -217,7 +316,35 @@ func classifyOpenat(evt *types.SyscallEvent) {
 		}
 	}
 
-	// Default: credential/secret file access.
+	// Write to user home directory — sandbox structural whitelist check.
+	// pip/npm write to site-packages, /usr/local/bin, /tmp, /install only.
+	// Any write to /home/ is illegitimate regardless of the specific path.
+	// This catches systemd persistence, LaunchAgent injection, IMDS token
+	// caching, and any other home-directory attack without maintaining a
+	// blacklist of individual paths.
+	if isWrite && isHomeDir(evt.FilePath) {
+		evt.Category = types.CategoryPersistence
+		evt.Reason = "Write to user home directory: " + evt.FilePath +
+			" — packages do not write to the user's home directory during " +
+			"install or import. This may indicate persistence, config " +
+			"injection, or credential tampering."
+		return
+	}
+
+	// Sandbox/environment detection — reading system introspection paths
+	// that reveal tracing, container environment, or network isolation.
+	// This is evasion, not credential access.
+	if isSandboxDetectionPath(evt.FilePath) {
+		evt.Category = types.CategoryEvasion
+		evt.Reason = "Sandbox detection attempt: " + evt.FilePath +
+			" — package is probing the execution environment to detect " +
+			"analysis tools (strace, Docker, network isolation). " +
+			"This is a common evasion technique to suppress malicious " +
+			"behavior when being analyzed."
+		return
+	}
+
+	// Default: credential/secret file access (read from sensitive path).
 	evt.Category = types.CategoryCredentialAccess
 	if isWrite {
 		evt.Reason = "Write to sensitive file: " + evt.FilePath +
@@ -226,6 +353,39 @@ func classifyOpenat(evt *types.SyscallEvent) {
 		evt.Reason = "Read of sensitive file: " + evt.FilePath +
 			" — legitimate packages do not access credential files during install."
 	}
+}
+
+// isSandboxDetectionPath returns true if the path is commonly used to
+// detect sandboxes, tracers, or container environments.
+func isSandboxDetectionPath(filePath string) bool {
+	// /proc/self/status — TracerPid reveals strace
+	// /proc/self/maps — loaded libraries reveal libfaketime
+	// /proc/self/cgroup — reveals Docker/k8s
+	// /proc/self/mountinfo — reveals overlay filesystem
+	// /proc/<pid>/comm — reveals tracer process name
+	// /sys/class/net — reveals network namespace isolation
+	sandboxPaths := []string{
+		"/proc/self/status",
+		"/proc/self/maps",
+		"/proc/self/cgroup",
+		"/proc/self/mountinfo",
+		"/sys/class/net",
+	}
+	for _, p := range sandboxPaths {
+		if strings.Contains(filePath, p) {
+			return true
+		}
+	}
+	// /proc/<pid>/comm (numeric PID, not /proc/self/)
+	if strings.HasPrefix(filePath, "/proc/") && strings.HasSuffix(filePath, "/comm") {
+		return true
+	}
+	return false
+}
+
+// isHomeDir returns true if the path is inside a user home directory.
+func isHomeDir(filePath string) bool {
+	return strings.HasPrefix(filePath, "/home/") || strings.HasPrefix(filePath, "/root/")
 }
 
 func classifyExecve(evt *types.SyscallEvent) {
@@ -317,6 +477,12 @@ func isBenign(evt *types.SyscallEvent) bool {
 		return false
 	case types.EventRename:
 		return isBenignRename(evt)
+	case types.EventMmap, types.EventMprotect:
+		// RWX memory is never benign in package install/import context.
+		return false
+	case types.EventUnlink:
+		// Parser already filters to only emit deletions from suspicious dirs.
+		return false
 	default:
 		return false
 	}
@@ -329,10 +495,13 @@ func isBenignNetwork(evt *types.SyscallEvent) bool {
 		return false
 	}
 
-	// DNS tunneling check: even if the DNS server IP is benign (e.g. 8.8.8.8),
-	// the query domain itself may be carrying exfiltrated data.
-	if evt.DNSQuery != "" && isDNSTunnel(evt.DNSQuery) {
-		return false
+	// DNS query checks: even if the DNS server IP is benign (e.g. 8.8.8.8),
+	// the query domain itself may be carrying exfiltrated data or resolving
+	// a known exfiltration service (Discord webhooks, Telegram bots, etc.).
+	if evt.DNSQuery != "" {
+		if matchExfilService(evt.DNSQuery) != "" || isDNSTunnel(evt.DNSQuery) {
+			return false
+		}
 	}
 
 	ip := net.ParseIP(evt.DstAddr)
@@ -694,6 +863,57 @@ func hasAllowedDir(dir string) bool {
 	return dir == "/usr/bin/" || dir == "/usr/local/bin/" || dir == "/bin/"
 }
 
+// knownExfilDomains maps domain suffixes to human-readable service names.
+// These are legitimate services frequently abused by threat actors to exfiltrate
+// stolen credentials, wallet keys, and environment variables.
+var knownExfilDomains = []struct {
+	suffix  string
+	service string
+}{
+	// Chat platforms (primary info-stealer exfil channel).
+	{"discord.com", "Discord"},
+	{"discordapp.com", "Discord"},
+	{"discord.gg", "Discord"},
+	// Telegram Bot API.
+	{"api.telegram.org", "Telegram"},
+	{"telegram.org", "Telegram"},
+	// Paste / code sharing services.
+	{"pastebin.com", "Pastebin"},
+	{"hastebin.com", "Hastebin"},
+	{"paste.ee", "Paste.ee"},
+	{"dpaste.org", "dpaste"},
+	{"ghostbin.com", "Ghostbin"},
+	{"rentry.co", "Rentry"},
+	{"paste.rs", "paste.rs"},
+	// Webhook relay services.
+	{"webhook.site", "Webhook.site"},
+	{"pipedream.net", "Pipedream"},
+	{"hookbin.com", "Hookbin"},
+	{"requestbin.com", "RequestBin"},
+	// File hosting (used for stage-2 download AND exfil upload).
+	{"transfer.sh", "transfer.sh"},
+	{"file.io", "file.io"},
+	{"0x0.st", "0x0.st"},
+	// IP / geo lookup (recon before exfil).
+	{"ipinfo.io", "ipinfo.io"},
+	{"ifconfig.me", "ifconfig.me"},
+	{"ipapi.co", "ipapi.co"},
+	{"ip-api.com", "ip-api.com"},
+	{"checkip.amazonaws.com", "checkip.amazonaws.com"},
+}
+
+// matchExfilService checks whether a DNS query domain matches a known
+// data exfiltration service. Returns the service name or "" if no match.
+func matchExfilService(query string) string {
+	lower := strings.ToLower(query)
+	for _, d := range knownExfilDomains {
+		if lower == d.suffix || strings.HasSuffix(lower, "."+d.suffix) {
+			return d.service
+		}
+	}
+	return ""
+}
+
 // DNS tunneling detection.
 //
 // Exfiltration via DNS encodes data in subdomain labels:
@@ -711,29 +931,22 @@ const (
 	dnsEntropyThreshold = 3.5
 )
 
-// benignDNSSuffixes are domain suffixes that are expected during package installation.
-// DNS queries to these are never flagged as tunneling regardless of label entropy.
-var benignDNSSuffixes = []string{
-	"pypi.org",
-	"pythonhosted.org",
-	"npmjs.org",
-	"npmjs.com",
-	"registry.npmjs.org",
-	"googleapis.com",
-	"debian.org",
-	"ubuntu.com",
-}
-
 // isDNSTunnel returns true if the DNS query domain shows signs of data exfiltration.
+//
+// No whitelist. The entropy heuristic alone distinguishes legitimate domains
+// from encoded exfil payloads. Whitelists are a liability — if this repo is
+// compromised, an attacker could add their exfil domain to bypass detection.
+//
+// Legitimate package registry domains (pypi.org, npmjs.org) have short,
+// low-entropy labels that never trigger the heuristic:
+//
+//	files.pythonhosted.org      → "files" entropy ≈ 2.3 bits/char  (< 3.5)
+//	registry.npmjs.org          → "registry" entropy ≈ 2.8 bits/char (< 3.5)
+//
+// Encoded exfil payloads have high-entropy labels:
+//
+//	aGVsbG8gd29ybGQ.evil.com   → "aGVsbG8gd29ybGQ" entropy ≈ 3.8 bits/char (> 3.5)
 func isDNSTunnel(query string) bool {
-	// Skip known-benign package registry domains.
-	lower := strings.ToLower(query)
-	for _, suffix := range benignDNSSuffixes {
-		if strings.HasSuffix(lower, suffix) {
-			return false
-		}
-	}
-
 	if len(query) > dnsMaxQueryLen {
 		return true
 	}
