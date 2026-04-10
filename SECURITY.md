@@ -45,7 +45,8 @@ kojuto is a security tool that intentionally runs untrusted code in an isolated 
 
 ### Detection
 
-- **Dynamic analysis**: strace monitors `connect`, `sendto`, `sendmsg`, `execve`, `openat`, `rename`, and `sendfile` syscalls during install and import phases
+- **Dynamic analysis**: strace monitors `connect`, `sendto`, `sendmsg`, `execve`, `openat`, `rename`, `mmap`, `mprotect`, `unlink`, `sendfile`, and `ptrace` syscalls during install and import phases
+- **Audit hooks**: Python PEP 578 hook (`sitecustomize.py`) intercepts `compile`/`exec`/`import` events; Node.js `--require` hook intercepts `eval`/`Function`/`vm` calls. Detects dynamic code execution that generates no `execve` syscall
 - **DNS tunneling detection**: extracts query domains from `sendto` payloads and flags high-entropy subdomains (Shannon entropy > 3.5 bits/char) used for data exfiltration
 - **Credential access detection**: `openat` monitoring flags access to sensitive paths (`~/.ssh/`, `~/.aws/`, `/etc/shadow`, `/proc/self/environ`, etc.)
 - **Binary hijacking detection**: `rename`/`renameat`/`renameat2` monitoring detects attempts to overwrite trusted binaries (`python3`, `node`, `sh`, etc.)
@@ -53,7 +54,7 @@ kojuto is a security tool that intentionally runs untrusted code in an isolated 
 - **Time-shifted import**: `libfaketime` advances the clock +30 days during import probes to trigger date-gated payloads
 - **Honeypot simulation**: fake credential files and CI environment variables (randomly generated per scan) provoke credential-harvesting malware into observable behavior
 - **eBPF mode** (opt-in): kprobes for `connect`, `sendto`, `sendmsg`, `bind`, `listen`, `accept`, `execve`, `openat`, and `rename` — full parity with strace-container mode; best-effort attachment for non-critical probes
-- **gVisor runtime** (`--runtime runsc`): user-space kernel masks `/proc/1/cgroup` and `/proc/self/mountinfo`, defeating the remaining container-detection signals
+- **gVisor runtime** (`--runtime auto`, default): auto-detects gVisor availability; user-space kernel masks `/proc/1/cgroup` and `/proc/self/mountinfo`, defeating the remaining container-detection signals
 - **sudo-free eBPF**: `scripts/setup-caps.sh` grants `CAP_BPF` + `CAP_PERFMON` to the binary via `setcap`, eliminating the need for root
 
 ### Anti-Fingerprinting
@@ -67,7 +68,8 @@ kojuto is a security tool that intentionally runs untrusted code in an isolated 
 
 kojuto detects malicious behavior at the syscall level. The following attack vectors are outside its current detection scope:
 
-- **Memory-only execution** (`mmap` + `PROT_EXEC`): Shellcode executed via JIT-style memory mapping without `execve`. Network isolation and read-only filesystem limit the practical impact. Use `--runtime runsc` (gVisor) for additional kernel-level protection against container escape via kernel exploits.
+- **Memory-only execution** (`mmap` + `PROT_EXEC`): Shellcode executed via JIT-style memory mapping without `execve`. Simultaneous PROT_WRITE+PROT_EXEC is detected; W^X patterns (`mmap(RW)` → `mprotect(RX)`) are indistinguishable from V8 JIT. Network isolation and read-only filesystem limit the practical impact.
+- **Audit hook evasion**: `eval`/`exec`/`Function` are now detected via audit hooks, but sophisticated malware can disable the Python audit hook via `ctypes` (clobbering the C-level hook list) or detect the hook's presence by inspecting `sitecustomize.py`. The Node.js hook can be bypassed by overriding `globalThis.eval` before the hook loads.
 - **Legitimate-host exfiltration**: Stolen data sent via connections to benign hosts (e.g. `pypi.org:443`) cannot be distinguished from normal traffic at the syscall level, as kojuto does not inspect packet payloads.
 - **Environment variable reads**: `os.environ` / `process.env` access does not generate syscalls (values are in process memory at startup). Honeypot environment variables are set, but reads are detected only indirectly when the values are exfiltrated via network connections.
 - **Import-time delayed execution**: kojuto imports packages but does not call their functions. Payloads that activate only when specific functions are called (e.g. `pkg.connect()`) will not trigger during scanning.
