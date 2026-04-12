@@ -4,6 +4,36 @@ package probe
 
 import "testing"
 
+// TestEBPFProbe_Dropped_Getter verifies the Dropped() accessor so that
+// outputReport's `dropped > 0 → inconclusive` gate has a live path from
+// the probe to the verdict. The full Start() path requires root + BPF
+// and can't be unit-tested here.
+func TestEBPFProbe_Dropped_Getter(t *testing.T) {
+	p := NewEBPF()
+	if got := p.Dropped(); got != 0 {
+		t.Errorf("Dropped() on fresh probe = %d, want 0", got)
+	}
+	p.dropped = 7
+	if got := p.Dropped(); got != 7 {
+		t.Errorf("Dropped() after increment = %d, want 7", got)
+	}
+}
+
+// TestStraceFallback_Dropped_Getter mirrors the eBPF test so the strace
+// fallback's counter is covered too. StraceFallback has 0% coverage
+// across the rest of the file (host-strace is rarely exercised) — this
+// at least pins the drop→verdict contract.
+func TestStraceFallback_Dropped_Getter(t *testing.T) {
+	s := NewStrace()
+	if got := s.Dropped(); got != 0 {
+		t.Errorf("Dropped() on fresh fallback = %d, want 0", got)
+	}
+	s.dropped = 3
+	if got := s.Dropped(); got != 3 {
+		t.Errorf("Dropped() after increment = %d, want 3", got)
+	}
+}
+
 func TestFormatOpenFlags(t *testing.T) {
 	tests := []struct {
 		name  string

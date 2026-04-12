@@ -50,6 +50,19 @@ func TestContainerStrace_Events(t *testing.T) {
 	}
 }
 
+func TestContainerStrace_Dropped(t *testing.T) {
+	cs := NewContainerStrace()
+	if got := cs.Dropped(); got != 0 {
+		t.Errorf("Dropped() on fresh probe = %d, want 0", got)
+	}
+	// Simulate the parser hitting the buffer-full fallback. In production
+	// this path feeds the verdict → inconclusive gate in cmd/root.go.
+	cs.dropped = 42
+	if got := cs.Dropped(); got != 42 {
+		t.Errorf("Dropped() after increment = %d, want 42", got)
+	}
+}
+
 func TestDrainReader(t *testing.T) {
 	content := "hello world\nfoo bar\n"
 	reader := io.NopCloser(bytes.NewReader([]byte(content)))
