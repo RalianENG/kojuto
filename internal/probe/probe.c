@@ -228,30 +228,18 @@ int kprobe_accept(struct pt_regs *ctx) {
     return 0;
 }
 
-SEC("kprobe/do_execveat_common")
-int kprobe_execve(struct pt_regs *ctx) {
-    if (!is_target_ns())
-        return 0;
-
-    // do_execveat_common(int fd, struct filename *filename, ...)
-    // The filename struct contains the path string.
-    struct filename *fname = (struct filename *)PT_REGS_PARM2(ctx);
-    if (!fname)
-        return 0;
-
-    struct file_event evt = {};
-    evt.timestamp_ns = bpf_ktime_get_ns();
-    evt.pid = bpf_get_current_pid_tgid() >> 32;
-    evt.uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
-    evt.event_type = EVT_EXECVE;
-
-    const char *name_ptr;
-    bpf_probe_read_kernel(&name_ptr, sizeof(name_ptr), &fname->name);
-    bpf_probe_read_kernel_str(&evt.path, sizeof(evt.path), name_ptr);
-
-    bpf_perf_event_output(ctx, &file_events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
-    return 0;
-}
+// execve kprobe replaced by tracepoint below.
+//
+// `do_execveat_common` was never actually attachable on modern compiled
+// kernels: GCC renames it to `do_execveat_common.isra.0` under the
+// interprocedural scalar-replacement-of-aggregates optimization, so
+// link.Kprobe("do_execveat_common", ...) returns ENOENT and the
+// best-effort attach loop silently skipped it. Result: the eBPF probe
+// never captured execve events at all, invalidating code_execution and
+// anti_forensics detection in eBPF mode.
+//
+// Switching to the sys_enter_execve/execveat tracepoints avoids the
+// compiler-rename problem entirely — tracepoints are stable ABI.
 
 SEC("kprobe/do_sys_openat2")
 int kprobe_openat(struct pt_regs *ctx) {
@@ -332,6 +320,52 @@ struct sys_enter_ctx {
     __u32 _pad2;
     __u64 args[6];
 };
+
+// execve(filename, argv, envp). Fires on exec of any binary; the
+// analyzer flags execs from /tmp/, /dev/shm/ etc. as code_execution.
+SEC("tracepoint/syscalls/sys_enter_execve")
+int tp_execve(struct sys_enter_ctx *ctx) {
+    if (!is_target_ns())
+        return 0;
+
+    const char *filename = (const char *)ctx->args[0];
+    if (!filename)
+        return 0;
+
+    struct file_event evt = {};
+    evt.timestamp_ns = bpf_ktime_get_ns();
+    evt.pid = bpf_get_current_pid_tgid() >> 32;
+    evt.uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    evt.event_type = EVT_EXECVE;
+
+    bpf_probe_read_user_str(&evt.path, sizeof(evt.path), filename);
+
+    bpf_perf_event_output(ctx, &file_events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+    return 0;
+}
+
+// execveat(dfd, filename, argv, envp, flags). Newer syscall form used
+// by some runtimes (execveat with AT_FDCWD is equivalent to execve).
+SEC("tracepoint/syscalls/sys_enter_execveat")
+int tp_execveat(struct sys_enter_ctx *ctx) {
+    if (!is_target_ns())
+        return 0;
+
+    const char *filename = (const char *)ctx->args[1];
+    if (!filename)
+        return 0;
+
+    struct file_event evt = {};
+    evt.timestamp_ns = bpf_ktime_get_ns();
+    evt.pid = bpf_get_current_pid_tgid() >> 32;
+    evt.uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    evt.event_type = EVT_EXECVE;
+
+    bpf_probe_read_user_str(&evt.path, sizeof(evt.path), filename);
+
+    bpf_perf_event_output(ctx, &file_events, BPF_F_CURRENT_CPU, &evt, sizeof(evt));
+    return 0;
+}
 
 // ptrace(request, pid, addr, data). PTRACE_TRACEME is the anti-debugging
 // canary: the child calls it to confirm it is not already being traced.

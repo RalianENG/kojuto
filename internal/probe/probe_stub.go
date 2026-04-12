@@ -42,9 +42,10 @@ type probeObjects struct {
 	KprobeBind    *ebpf.Program `ebpf:"kprobe_bind"`
 	KprobeListen  *ebpf.Program `ebpf:"kprobe_listen"`
 	KprobeAccept  *ebpf.Program `ebpf:"kprobe_accept"`
-	KprobeExecve  *ebpf.Program `ebpf:"kprobe_execve"`
 	KprobeOpenat  *ebpf.Program `ebpf:"kprobe_openat"`
 	KprobeRename  *ebpf.Program `ebpf:"kprobe_rename"`
+	TpExecve      *ebpf.Program `ebpf:"tp_execve"`
+	TpExecveat    *ebpf.Program `ebpf:"tp_execveat"`
 	TpPtrace      *ebpf.Program `ebpf:"tp_ptrace"`
 	TpMmap        *ebpf.Program `ebpf:"tp_mmap"`
 	TpMprotect    *ebpf.Program `ebpf:"tp_mprotect"`
@@ -63,7 +64,8 @@ func (o *probeObjects) Close() error {
 	progs := []*ebpf.Program{
 		o.KprobeConnect, o.KprobeSendto, o.KprobeSendmsg,
 		o.KprobeBind, o.KprobeListen, o.KprobeAccept,
-		o.KprobeExecve, o.KprobeOpenat, o.KprobeRename,
+		o.KprobeOpenat, o.KprobeRename,
+		o.TpExecve, o.TpExecveat,
 		o.TpPtrace, o.TpMmap, o.TpMprotect,
 		o.TpUnlink, o.TpUnlinkat,
 	}

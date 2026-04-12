@@ -127,7 +127,6 @@ func (p *EBPFProbe) Start(targetPIDNS uint32) error {
 		{"__sys_bind", objs.KprobeBind},
 		{"__sys_listen", objs.KprobeListen},
 		{"__sys_accept4", objs.KprobeAccept},
-		{"do_execveat_common", objs.KprobeExecve},
 		{"do_sys_openat2", objs.KprobeOpenat},
 		{"vfs_rename", objs.KprobeRename},
 	} {
@@ -145,6 +144,8 @@ func (p *EBPFProbe) Start(targetPIDNS uint32) error {
 		name  string
 		prog  *ebpf.Program
 	}{
+		{"syscalls", "sys_enter_execve", objs.TpExecve},
+		{"syscalls", "sys_enter_execveat", objs.TpExecveat},
 		{"syscalls", "sys_enter_ptrace", objs.TpPtrace},
 		{"syscalls", "sys_enter_mmap", objs.TpMmap},
 		{"syscalls", "sys_enter_mprotect", objs.TpMprotect},
