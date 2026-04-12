@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/RalianENG/kojuto/internal/types"
 )
@@ -35,6 +36,7 @@ const SandboxPythonVersion = "3.12"
 const (
 	RuntimeDefault = ""      // Docker default (runc).
 	RuntimeGVisor  = "runsc" // gVisor user-space kernel.
+	RuntimeAuto    = "auto"  // Use gVisor if available, else runc.
 	networkNone    = "none"  // Fallback when isolated network creation fails.
 )
 
@@ -58,14 +60,37 @@ func (s *Sandbox) SetLocalMode(local bool) {
 }
 
 // New creates a new Sandbox instance.
+// If containerRuntime is "auto", it probes Docker for gVisor availability
+// and uses runsc if registered, otherwise falls back to runc.
 func New(packageDir, pkg string, needsPtrace bool, ecosystem, containerRuntime string) *Sandbox {
+	rt := containerRuntime
+	if rt == RuntimeAuto {
+		rt = resolveRuntime()
+	}
 	return &Sandbox{
 		packageDir:  packageDir,
 		pkg:         pkg,
 		needsPtrace: needsPtrace,
 		ecosystem:   ecosystem,
-		runtime:     containerRuntime,
+		runtime:     rt,
 	}
+}
+
+// resolveRuntime checks whether gVisor (runsc) is registered as a Docker
+// runtime and returns RuntimeGVisor if available, RuntimeDefault otherwise.
+func resolveRuntime() string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := execCommand(ctx, "docker", "info", "--format", "{{json .Runtimes}}")
+	out, err := cmd.Output()
+	if err != nil {
+		return RuntimeDefault
+	}
+	if strings.Contains(string(out), "runsc") {
+		return RuntimeGVisor
+	}
+	return RuntimeDefault
 }
 
 // writeSeccompProfile writes the embedded seccomp profile to a temp file
@@ -149,6 +174,10 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 		// Re-add SYS_PTRACE for strace, CHOWN+FOWNER for tmpfs file setup.
 		args = append(args, "--cap-add=SYS_PTRACE", "--cap-add=CHOWN", "--cap-add=FOWNER")
 	}
+
+	// Audit hook: load kojuto-require.js before any user code in Node.js.
+	// This intercepts eval/Function/vm dynamic code execution.
+	args = append(args, "--env=NODE_OPTIONS=--require /opt/kojuto/kojuto-require.js")
 
 	// Honeypot environment variables: simulate a CI/developer machine to
 	// trigger environment-gated malware (e.g. "if CI: exfiltrate()").
@@ -633,10 +662,14 @@ func (s *Sandbox) WriteProbeScriptsMulti(ctx context.Context, pkgs []string) {
 		system, sysplatform, osname string
 		sep, pathsep, linesep       string
 	}
+	// linesep is interpolated into a single-quoted Python string literal.
+	// The escape sequences must be the LITERAL backslash-letter forms
+	// ("\\n" / "\\r\\n") so that Python parses them — embedding a real
+	// newline byte breaks the source mid-line with SyntaxError.
 	pyPlatforms := []pyPlatform{
-		{"Linux", "linux", "posix", "/", ":", "\n"},
+		{"Linux", "linux", "posix", "/", ":", "\\n"},
 		{"Windows", "win32", "nt", "\\\\", ";", "\\r\\n"},
-		{"Darwin", "darwin", "posix", "/", ":", "\n"},
+		{"Darwin", "darwin", "posix", "/", ":", "\\n"},
 	}
 	for _, p := range pyPlatforms {
 		var imports strings.Builder
@@ -711,10 +744,14 @@ func (s *Sandbox) WriteProbeScripts(ctx context.Context) {
 		system, sysplatform, osname string
 		sep, pathsep, linesep       string
 	}
+	// linesep is interpolated into a single-quoted Python string literal.
+	// The escape sequences must be the LITERAL backslash-letter forms
+	// ("\\n" / "\\r\\n") so that Python parses them — embedding a real
+	// newline byte breaks the source mid-line with SyntaxError.
 	pyPlatforms := []pyPlatform{
-		{"Linux", "linux", "posix", "/", ":", "\n"},
+		{"Linux", "linux", "posix", "/", ":", "\\n"},
 		{"Windows", "win32", "nt", "\\\\", ";", "\\r\\n"},
-		{"Darwin", "darwin", "posix", "/", ":", "\n"},
+		{"Darwin", "darwin", "posix", "/", ":", "\\n"},
 	}
 	for _, p := range pyPlatforms {
 		script := fmt.Sprintf(

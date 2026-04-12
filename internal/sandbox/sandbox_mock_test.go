@@ -20,7 +20,10 @@ func fakeExecCommand(ctx context.Context, name string, args ...string) *exec.Cmd
 	cs := []string{"-test.run=TestHelperProcess", "--", name}
 	cs = append(cs, args...)
 	cmd := exec.CommandContext(ctx, os.Args[0], cs...)
-	cmd.Env = []string{"GO_WANT_HELPER_PROCESS=1"}
+	cmd.Env = []string{
+		"GO_WANT_HELPER_PROCESS=1",
+		"FAKE_RUNSC=" + os.Getenv("FAKE_RUNSC"),
+	}
 	return cmd
 }
 
@@ -68,6 +71,28 @@ func TestHelperProcess(_ *testing.T) {
 		fmt.Print("fake-container-id-12345")
 	case "inspect":
 		fmt.Print("12345")
+	case "info":
+		// Check if --format is requesting Runtimes.
+		for _, a := range args {
+			if strings.Contains(a, "Runtimes") {
+				// Return value depends on FAKE_RUNSC env var.
+				if os.Getenv("FAKE_RUNSC") == "1" {
+					runtimes := map[string]interface{}{
+						"runc":  map[string]string{"path": "runc"},
+						"runsc": map[string]string{"path": "/usr/bin/runsc"},
+					}
+					data, _ := json.Marshal(runtimes)
+					fmt.Print(string(data))
+				} else {
+					runtimes := map[string]interface{}{
+						"runc": map[string]string{"path": "runc"},
+					}
+					data, _ := json.Marshal(runtimes)
+					fmt.Print(string(data))
+				}
+				return
+			}
+		}
 	case "logs":
 		fmt.Print("fake log output")
 	case "image":

@@ -4,7 +4,7 @@ Thanks for your interest in contributing! This guide covers the development work
 
 ## Prerequisites
 
-- Go 1.25+
+- Go 1.24+
 - Docker (for sandbox image and integration tests)
 - golangci-lint v2+ (`go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest`)
 - Linux for eBPF development (optional — strace-container mode works on all platforms)

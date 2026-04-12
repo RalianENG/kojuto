@@ -50,6 +50,15 @@ An OSS tool that detects suspicious syscalls during package installation and imp
 | `ptrace(2)` | `PTRACE_TRACEME` self-check | Anti-debugging evasion (detects tracing to suppress malicious behavior) |
 | `sendfile(2)` | Zero-copy file-to-socket transfer | Forensic trace (not parsed into events) |
 
+### Audit Hooks (Non-Syscall Detection)
+
+| Runtime | Mechanism | Events Intercepted | Attack Example |
+|---|---|---|---|
+| Python | PEP 578 `sys.addaudithook()` via `sitecustomize.py` | `compile`, `exec`, `import`, `ctypes.dlopen` | `exec(base64.b64decode(...))`, obfuscated payload execution |
+| Node.js | `--require` preload via `NODE_OPTIONS` | `eval`, `Function`, `vm.runInNewContext`, `vm.runInThisContext`, `vm.Script` | `eval(Buffer.from(...,'base64'))`, `new Function('return process.env.SECRET')` |
+
+Audit hook output is multiplexed with strace output on stderr using a `KOJUTO:` prefix. The parser filters standard library internals (pip, npm, setuptools, frozen modules, dataclass codegen) via filename and snippet heuristics to minimize false positives.
+
 ### execve Analysis Logic
 
 - Validates full binary path (directory + basename), not just basename
@@ -64,7 +73,8 @@ Two complementary detection strategies:
 
 1. **Sensitive path matching** (any access mode): ~50 path patterns including SSH/GPG keys, cloud credentials (AWS/Azure/GCP/OCI/Aliyun), crypto wallets (Bitcoin/Ethereum/Solana/Monero/Electrum/Exodus/Atomic), browser data (Chrome/Firefox/Brave/Opera/Vivaldi/Edge + extension Local Storage/IndexedDB), shell startup files, desktop keyrings, application tokens, and sandbox detection paths (`/proc/self/status`, `/proc/self/maps`, `/proc/self/cgroup`, `/sys/class/net`)
 2. **Home directory write detection** (whitelist-based): ANY write (`O_WRONLY`/`O_RDWR`/`O_CREAT`) to `/home/` or `/root/` is flagged — pip/npm only write to site-packages, `/usr/local/bin`, `/tmp`, and `/install`. This catches systemd persistence, LaunchAgent injection, and unknown attack paths without maintaining a blacklist
-3. **Sandbox detection classification**: reads to `/proc/self/status`, `/proc/<pid>/comm`, `/proc/self/maps`, `/proc/self/cgroup`, `/sys/class/net` are classified as `evasion` (not `credential_access`) to indicate environment probing
+3. **System binary write detection**: writes to known system binaries (`python3`, `node`, `pip`, `sh`, etc.) in `/usr/local/bin/` or `/usr/bin/` are classified as `binary_hijacking` — prevents benignPaths bypass where an attacker overwrites a trusted binary on a writable tmpfs mount
+4. **Sandbox detection classification**: reads to `/proc/self/status`, `/proc/<pid>/comm`, `/proc/self/maps`, `/proc/self/cgroup`, `/sys/class/net` are classified as `evasion` (not `credential_access`) to indicate environment probing
 
 - `.npmrc` and `.pypirc` are excluded (npm/pip read these during normal operation)
 - Events include `open_flags` (e.g. `O_RDONLY`) to indicate read/write intent
@@ -104,10 +114,11 @@ CLI (cobra)
   │   ├─ no-new-privileges
   │   └─ Anti-fingerprinting (host information mirroring)
   │
-  ├─ Probe            Syscall monitoring
+  ├─ Probe            Syscall + audit hook monitoring
   │   ├─ strace-container (default, full syscall coverage)
   │   ├─ strace (host-level, Linux only)
-  │   └─ eBPF (opt-in, full syscall parity with strace, fastest)
+  │   ├─ eBPF (opt-in, full syscall parity with strace, fastest)
+  │   └─ Audit hooks (Python PEP 578 + Node.js --require, multiplexed on strace stderr)
   │
   ├─ Analyzer         Event classification and risk assessment
   │   ├─ Network events: filter out loopback/unspecified/link-local
@@ -188,7 +199,8 @@ CLI (cobra)
 
 | Runtime | Flag | Isolation | /proc masking |
 |---|---|---|---|
-| runc (default) | (none) | Docker kernel sharing | /proc/1/cgroup, mountinfo leak |
+| auto (default) | `--runtime auto` | gVisor if available, else runc | Best available |
+| runc | `--runtime runc` | Docker kernel sharing | /proc/1/cgroup, mountinfo leak |
 | gVisor (runsc) | `--runtime runsc` | User-space kernel | Fully masked |
 
 ### Known Unmasked Signals (runc only)

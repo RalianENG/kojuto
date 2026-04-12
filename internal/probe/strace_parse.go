@@ -182,6 +182,12 @@ func isSensitivePath(filePath string) bool {
 }
 
 func parseStraceLine(line string, state *ParseState) (types.SyscallEvent, bool) {
+	// Audit hook output from sitecustomize.py / kojuto-require.js.
+	// These lines are interleaved with strace output on stderr.
+	if evt, ok := parseAuditHook(line); ok {
+		return evt, true
+	}
+
 	// Track file creation in suspicious dirs (side effect, no event emitted).
 	trackTmpFileCreation(line, state)
 	if evt, ok := parseConnectOrSendto(line, straceConnectRe, types.EventConnect); ok {
@@ -254,14 +260,37 @@ func parseStraceLine(line string, state *ParseState) (types.SyscallEvent, bool) 
 	return types.SyscallEvent{}, false
 }
 
+// systemBinaries are names that benignPaths trusts in /usr/local/bin/ or
+// /usr/bin/.  A write to any of these paths is a binary hijack attempt:
+// the attacker overwrites a trusted binary so that subsequent execve of
+// the same path passes the benignPaths whitelist.
+var systemBinaries = map[string]bool{
+	"python": true, "python3": true, "python3.12": true,
+	"node": true, "npm": true, "npx": true,
+	"pip": true, "pip3": true,
+	"sh": true, "bash": true, "dash": true,
+	"env": true,
+}
+
+// isSystemBinaryWrite returns true if the path is a write to a known
+// system binary location (e.g. /usr/local/bin/python3).
+func isSystemBinaryWrite(filePath string) bool {
+	base := filePath
+	if idx := strings.LastIndex(filePath, "/"); idx >= 0 {
+		base = filePath[idx+1:]
+	}
+	if !systemBinaries[base] {
+		return false
+	}
+	return strings.HasPrefix(filePath, "/usr/local/bin/") ||
+		strings.HasPrefix(filePath, "/usr/bin/") ||
+		strings.HasPrefix(filePath, "/bin/")
+}
+
 // parseOpenat emits events for:
 //  1. Sensitive file paths (credentials, keys, etc.) — any access mode.
 //  2. ANY write to the user home directory (/home/) — pip/npm never write here.
-//     This is a whitelist-based check derived from the sandbox structure:
-//     the only legitimate write targets are site-packages, /usr/local/bin,
-//     /tmp, and /install. Writes to /home/ indicate persistence, credential
-//     tampering, or other malicious file operations regardless of the
-//     specific path.
+//  3. Writes to system binary paths — binary hijack for benignPaths bypass.
 func parseOpenat(line string) (types.SyscallEvent, bool) {
 	matches := straceOpenatRe.FindStringSubmatch(line)
 	if matches == nil {
@@ -278,8 +307,10 @@ func parseOpenat(line string) (types.SyscallEvent, bool) {
 		strings.Contains(flags, "O_RDWR") ||
 		strings.Contains(flags, "O_CREAT")
 
-	// Emit if: sensitive path (any access), OR write to user home.
-	if !isSensitivePath(filePath) && (!isWrite || !isUserHomePath(filePath)) {
+	// Emit if: sensitive path, write to user home, OR write to system binary.
+	if !isSensitivePath(filePath) &&
+		(!isWrite || !isUserHomePath(filePath)) &&
+		(!isWrite || !isSystemBinaryWrite(filePath)) {
 		return types.SyscallEvent{}, false
 	}
 
@@ -687,4 +718,182 @@ func parseDNSName(data []byte) string {
 		return ""
 	}
 	return strings.Join(labels, ".")
+}
+
+// auditHookPrefix is the line prefix emitted by kojuto's audit hooks
+// (sitecustomize.py for Python, kojuto-require.js for Node.js).
+const auditHookPrefix = "KOJUTO:"
+
+// benignAuditModules lists module prefixes whose import/compile/exec events
+// are normal interpreter or tooling internals.
+var benignAuditModules = []string{
+	"_distutils_hack",
+	"pip",
+	"setuptools",
+	"wheel",
+	"pkg_resources",
+	"_pytest",
+	"npm",
+	"node_modules",
+	"sitecustomize",
+	"kojuto-require",
+	"usercustomize",
+}
+
+// benignAuditPaths lists path substrings that identify standard library,
+// interpreter-internal, or kojuto's own probe scripts.  compile/exec events
+// whose filename contains one of these are benign.
+var benignAuditPaths = []string{
+	"/usr/local/lib/python",
+	"/usr/lib/python",
+	"<frozen ",
+	"/usr/local/bin/",
+	"/usr/bin/",
+	"importlib",
+	"_kojuto_probe_",
+}
+
+// benignStringSnippetPrefixes are snippet prefixes that are benign when the
+// filename is "<string>" — these are standard library internals like
+// namedtuple factories, dataclass code generation, etc.
+var benignStringSnippetPrefixes = []string{
+	"lambda _cls",           // namedtuple factory
+	"def __",                // dataclass generated methods
+	"b'lambda _cls",         // bytes variant
+	"b'def __create_fn__",   // dataclass code gen
+	"b\"def __create_fn__",  // dataclass code gen (double-quote)
+	"b'def raise_from",      // pip vendored raise_from helper
+	"b\"def raise_from",     // raise_from (double-quote variant)
+	"<code object <module>", // exec of stdlib code objects
+}
+
+// parseAuditHook parses a KOJUTO: prefixed line emitted by the Python or
+// Node.js audit hook.
+//
+// Python compile/exec format: KOJUTO:<event>:<filename>:<snippet>
+// Python import format:       KOJUTO:import:<module_name>
+// Node.js format:             KOJUTO:<event>:<snippet>.
+func parseAuditHook(line string) (types.SyscallEvent, bool) {
+	if !strings.HasPrefix(line, auditHookPrefix) {
+		return types.SyscallEvent{}, false
+	}
+
+	rest := line[len(auditHookPrefix):]
+	idx := strings.Index(rest, ":")
+	if idx < 0 {
+		return types.SyscallEvent{}, false
+	}
+
+	event := rest[:idx]
+	payload := rest[idx+1:]
+
+	// For compile/exec, payload is "filename:snippet".
+	// For import/ctypes.dlopen and Node.js events, payload is the snippet itself.
+	var filename, snippet string
+	switch event {
+	case "compile", "exec":
+		if colonIdx := strings.Index(payload, ":"); colonIdx >= 0 {
+			filename = payload[:colonIdx]
+			snippet = payload[colonIdx+1:]
+		} else {
+			snippet = payload
+		}
+	default:
+		snippet = payload
+	}
+
+	// Filter benign interpreter/tooling internals.
+	if isBenignAuditEvent(event, filename, snippet) {
+		return types.SyscallEvent{}, false
+	}
+
+	return types.SyscallEvent{
+		Timestamp:   time.Now(),
+		Syscall:     types.EventDynamicExec,
+		AuditEvent:  event,
+		FilePath:    filename,
+		CodeSnippet: snippet,
+	}, true
+}
+
+// isBenignAuditEvent returns true for audit events generated by the Python/
+// Node.js standard library, pip, npm, setuptools, or other interpreter
+// internals.  For compile/exec events the filename field provides the
+// definitive signal: anything outside site-packages or /tmp is benign.
+// nodeAuditEvents are events emitted by kojuto-require.js.
+// These never have a filename and should NOT be filtered by the
+// Python-specific <string>/short-snippet heuristics.
+var nodeAuditEvents = map[string]bool{
+	"eval":                true,
+	"Function":            true,
+	"vm.runInNewContext":  true,
+	"vm.runInThisContext": true,
+	"vm.Script":           true,
+}
+
+func isBenignAuditEvent(event, filename, snippet string) bool {
+	// All import events are benign — suspicious imports are already
+	// caught by the openat/execve monitors.
+	if event == "import" {
+		return true
+	}
+
+	// Node.js audit events (eval/Function/vm) are always suspicious.
+	// They have no filename and must not fall through to the Python
+	// <string> short-snippet filter.
+	if nodeAuditEvents[event] {
+		return false
+	}
+
+	// compile/exec: if filename is available, use it as the primary filter.
+	// Standard library, pip internals, and frozen modules are benign.
+	if filename != "" {
+		for _, pathMarker := range benignAuditPaths {
+			if strings.Contains(filename, pathMarker) {
+				return true
+			}
+		}
+		// Known tooling modules.
+		for _, mod := range benignAuditModules {
+			if strings.Contains(filename, mod) {
+				return true
+			}
+		}
+	}
+
+	// Fallback: filter by snippet content when filename is absent.
+	for _, mod := range benignAuditModules {
+		if strings.Contains(snippet, mod) {
+			return true
+		}
+	}
+
+	// "None" or empty snippet = compile(None) from frozen modules.
+	if snippet == "None" || snippet == "" {
+		return true
+	}
+
+	// <string> filename: filter known-benign patterns and short internal
+	// compile() calls from the stdlib.
+	if filename == "<string>" || filename == "" {
+		for _, prefix := range benignStringSnippetPrefixes {
+			if strings.HasPrefix(snippet, prefix) {
+				return true
+			}
+		}
+
+		// CPython internally compiles short expressions (type names, format
+		// specs) from <string>.  These appear as b'...' with very short
+		// content.  Real attack payloads via exec/eval are significantly
+		// longer.  Threshold: snippets under 60 chars from <string> are
+		// almost certainly interpreter internals.
+		if len(snippet) < 60 {
+			return true
+		}
+
+		// Unknown code from <string> — suspicious.
+		return false
+	}
+
+	return false
 }

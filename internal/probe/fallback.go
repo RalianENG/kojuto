@@ -19,12 +19,13 @@ type StraceFallback struct {
 	events    chan types.SyscallEvent
 	done      chan struct{}
 	closeOnce sync.Once
+	dropped   uint64
 }
 
 // NewStrace creates a strace-based fallback probe.
 func NewStrace() *StraceFallback {
 	return &StraceFallback{
-		events: make(chan types.SyscallEvent, 256),
+		events: make(chan types.SyscallEvent, 8192),
 		done:   make(chan struct{}),
 	}
 }
@@ -65,6 +66,8 @@ func (s *StraceFallback) StartWithPID(pid uint32) error {
 				case s.events <- evt:
 				case <-s.done:
 					return
+				default:
+					s.dropped++
 				}
 			}
 		}
@@ -90,4 +93,9 @@ func (s *StraceFallback) Close() error {
 
 func (s *StraceFallback) Method() string {
 	return "strace"
+}
+
+// Dropped returns events discarded because the events channel was full.
+func (s *StraceFallback) Dropped() uint64 {
+	return s.dropped
 }

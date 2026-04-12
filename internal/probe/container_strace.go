@@ -151,3 +151,8 @@ func (c *ContainerStrace) Close() error {
 func (c *ContainerStrace) Method() string {
 	return "strace-container"
 }
+
+// Dropped returns events discarded because the events channel was full.
+func (c *ContainerStrace) Dropped() uint64 {
+	return c.dropped
+}

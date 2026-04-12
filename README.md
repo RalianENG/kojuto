@@ -17,7 +17,7 @@ An EDR for package installations — monitors syscalls during install and import
 
 1. **Download** — Fetch the target package to the host (network allowed)
 2. **Isolate** — Run installation inside a hardened Docker container with network isolation
-3. **Install + Monitor** — Record `connect`, `sendto`, `sendmsg`, `sendmmsg`, `bind`, `listen`, `accept`, `execve`, `openat`, `rename`, `sendfile`, and `ptrace` syscalls via strace (or eBPF)
+3. **Install + Monitor** — Record `connect`, `sendto`, `sendmsg`, `sendmmsg`, `bind`, `listen`, `accept`, `execve`, `openat`, `rename`, `sendfile`, `ptrace`, `mmap`, `mprotect`, and `unlink` syscalls via strace (or eBPF). Audit hooks intercept `eval`/`exec`/`compile` (Python PEP 578) and `eval`/`Function`/`vm` (Node.js `--require`) for dynamic code execution detection
 4. **Import + Monitor** — Import/require the package under 3 simulated OS identities (Linux, Windows, macOS) with time shifted +30–180 days (randomized) via `libfaketime` to trigger platform-gated and date-gated payloads
 5. **Report** — Output findings as JSON
 
@@ -64,7 +64,8 @@ sudo ./kojuto scan requests --probe-method ebpf
 sudo ./scripts/setup-caps.sh ./kojuto
 ./kojuto scan requests --probe-method ebpf
 
-# Use gVisor runtime for stronger isolation (masks /proc/1/cgroup, mountinfo)
+# gVisor is auto-detected by default (use runsc if available, else runc)
+# Explicitly force gVisor runtime
 ./kojuto scan requests --runtime runsc
 
 # Set scan timeout per package
@@ -92,11 +93,11 @@ sudo ./scripts/setup-caps.sh ./kojuto
 | `-f, --file` | Dependency file to scan (`requirements.txt`, `package.json`, or any `*.txt`/`*.json`) |
 | `--pin` | Output pinned dependency file after all-clean batch scan (requires `-f`) |
 | `--local` | Scan a local package file (`.whl`, `.tgz`) or directory instead of downloading |
-| `--runtime` | Container runtime: default (runc) or `runsc` (gVisor) |
+| `--runtime` | Container runtime: `auto` (default, use gVisor if available), `runsc`, or `runc` |
 | `--probe-method` | `auto` / `ebpf` / `strace` / `strace-container` (default: `auto`) |
 | `--timeout` | Scan timeout per package (default: `5m`) |
 | `--config` | Config file path (default: `kojuto.yml` in current directory) |
-| `--strict` | Ignore `sensitive_paths.exclude` from config (recommended for CI) |
+| `--strict` | Ignore `sensitive_paths.exclude` from config (default: `false` on CLI; the GitHub Action sets this to `true` by default for CI safety) |
 
 ### Exit Codes
 
@@ -155,6 +156,13 @@ sudo ./scripts/setup-caps.sh ./kojuto
       "dst_port": 53,
       "family": 2,
       "dns_query": "aGVsbG8gd29ybGQ.evil.com"
+    },
+    {
+      "timestamp": "2026-04-01T12:00:06Z",
+      "pid": 0,
+      "syscall": "dynamic_exec",
+      "audit_event": "eval",
+      "code_snippet": "process.env.GITHUB_TOKEN"
     }
   ]
 }
@@ -206,10 +214,10 @@ sudo ./scripts/setup-caps.sh ./kojuto
 ## Requirements
 
 - Docker
-- Go 1.25+ (build from source; required by dependencies)
+- Go 1.24+ (build from source)
 - Linux, macOS, or Windows (via Docker Desktop)
 - Root or CAP_BPF + CAP_PERFMON for `--probe-method=ebpf` (use `scripts/setup-caps.sh` to avoid sudo)
-- gVisor (`runsc`) for `--runtime=runsc` (optional, stronger isolation)
+- gVisor (`runsc`) for stronger isolation (auto-detected; install via `apt install runsc && runsc install`)
 
 ## Documentation
 
@@ -254,6 +262,7 @@ Of the 300 malicious samples, 238 failed to install (dependencies already remove
 | DNS tunneling (`dns_tunneling`) | `airio` → high-entropy subdomain queries, DoH connections | `sendto` port 53 with entropy > 3.5, `connect` to known DoH servers |
 | Evasion (`evasion`) | `ptrace(PTRACE_TRACEME)`, reading `/proc/self/status`, `/sys/class/net` | `ptrace` self-check or sandbox detection via `/proc`/`/sys` introspection |
 | Anti-forensics (`anti_forensics`) | Create `/tmp/payload` → execute → delete | `unlink` correlated with prior `openat(O_CREAT)` + `execve` for same path |
+| Dynamic code execution (`dynamic_code_execution`) | `eval(base64(...))`, `new Function()`, `vm.runInNewContext()` | Audit hooks: Python PEP 578 (`compile`/`exec`) and Node.js `--require` (`eval`/`Function`/`vm`) |
 
 ### Configuration
 
@@ -275,7 +284,7 @@ sensitive_paths:
 
 kojuto detects malicious behavior at the syscall level. The following attack vectors are outside its detection scope:
 
-- **`eval`/`exec` in Python, `Function()` in Node.js** — interpreter-internal execution generates no `execve` syscall
+- **`eval`/`exec` in Python, `Function()` in Node.js** — now partially detected via audit hooks (PEP 578 for Python, `--require` for Node.js), but can be disabled via `ctypes` hook clobbering or by detecting the hook's presence
 - **Environment variable reads** — `os.environ.get()` is a pure memory operation with no syscall (honeypot values are planted to mitigate impact)
 - **W^X shellcode** — `mmap(RW)` → `mprotect(RX)` is indistinguishable from V8 JIT (simultaneous RWX IS detected)
 - **Function-call-gated payloads** — import phase only executes top-level code, not function calls

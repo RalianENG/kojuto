@@ -624,3 +624,218 @@ func TestParseOpenat_HomeReadNotEmitted(t *testing.T) {
 		t.Error("read from /home/ not in sensitive paths should not be emitted")
 	}
 }
+
+// ============================================================
+// Audit hook tests
+// ============================================================
+
+func TestParseAuditHook_PythonCompile(t *testing.T) {
+	line := "KOJUTO:compile:evil.py:b'import os\\nos.getcwd()'"
+	evt, ok := parseAuditHook(line)
+	if !ok {
+		t.Fatal("expected audit hook parse to succeed")
+	}
+	if evt.Syscall != types.EventDynamicExec {
+		t.Errorf("syscall = %q, want %q", evt.Syscall, types.EventDynamicExec)
+	}
+	if evt.AuditEvent != "compile" {
+		t.Errorf("audit_event = %q, want compile", evt.AuditEvent)
+	}
+	if evt.FilePath != "evil.py" {
+		t.Errorf("file_path = %q, want evil.py", evt.FilePath)
+	}
+	if evt.CodeSnippet != "b'import os\\nos.getcwd()'" {
+		t.Errorf("code_snippet = %q", evt.CodeSnippet)
+	}
+}
+
+func TestParseAuditHook_PythonExec(t *testing.T) {
+	line := `KOJUTO:exec:evil.py:<code object <module> at 0x7f0fc81cd020, file "evil.py", line 1>`
+	evt, ok := parseAuditHook(line)
+	if !ok {
+		t.Fatal("expected audit hook parse to succeed")
+	}
+	if evt.AuditEvent != "exec" {
+		t.Errorf("audit_event = %q, want exec", evt.AuditEvent)
+	}
+	if evt.FilePath != "evil.py" {
+		t.Errorf("file_path = %q, want evil.py", evt.FilePath)
+	}
+}
+
+func TestParseAuditHook_NodeEval(t *testing.T) {
+	line := "KOJUTO:eval:process.env.GITHUB_TOKEN"
+	evt, ok := parseAuditHook(line)
+	if !ok {
+		t.Fatal("expected Node.js eval audit hook parse to succeed")
+	}
+	if evt.AuditEvent != "eval" {
+		t.Errorf("audit_event = %q, want eval", evt.AuditEvent)
+	}
+	if evt.CodeSnippet != "process.env.GITHUB_TOKEN" {
+		t.Errorf("code_snippet = %q", evt.CodeSnippet)
+	}
+}
+
+func TestParseAuditHook_NodeFunction(t *testing.T) {
+	line := "KOJUTO:Function:return process.env.AWS_SECRET_ACCESS_KEY"
+	evt, ok := parseAuditHook(line)
+	if !ok {
+		t.Fatal("expected Function audit hook parse to succeed")
+	}
+	if evt.AuditEvent != "Function" {
+		t.Errorf("audit_event = %q, want Function", evt.AuditEvent)
+	}
+}
+
+func TestParseAuditHook_NodeVm(t *testing.T) {
+	line := `KOJUTO:vm.runInNewContext:typeof process !== "undefined" && process.env.NPM_TOKEN`
+	evt, ok := parseAuditHook(line)
+	if !ok {
+		t.Fatal("expected vm.runInNewContext audit hook parse to succeed")
+	}
+	if evt.AuditEvent != "vm.runInNewContext" {
+		t.Errorf("audit_event = %q, want vm.runInNewContext", evt.AuditEvent)
+	}
+}
+
+func TestParseAuditHook_NotKojutoLine(t *testing.T) {
+	lines := []string{
+		`[pid 100] connect(3, {sa_family=AF_INET}, 16) = 0`,
+		`execve("/usr/bin/python3", ["python3"], ...) = 0`,
+		`some random strace output`,
+	}
+	for _, line := range lines {
+		_, ok := parseAuditHook(line)
+		if ok {
+			t.Errorf("non-KOJUTO line should not parse: %q", line)
+		}
+	}
+}
+
+func TestIsBenignAuditEvent_Import(t *testing.T) {
+	// All import events are benign.
+	if !isBenignAuditEvent("import", "", "os") {
+		t.Error("import os should be benign")
+	}
+	if !isBenignAuditEvent("import", "", "malicious_package") {
+		t.Error("all imports should be benign (caught by openat/execve)")
+	}
+}
+
+func TestIsBenignAuditEvent_StdlibCompile(t *testing.T) {
+	// compile from standard library path.
+	if !isBenignAuditEvent("compile", "/usr/local/lib/python3.12/re/__init__.py", "b'...'") {
+		t.Error("stdlib compile should be benign")
+	}
+	// compile from frozen module.
+	if !isBenignAuditEvent("compile", "<frozen importlib>", "b'...'") {
+		t.Error("frozen module compile should be benign")
+	}
+}
+
+func TestIsBenignAuditEvent_DataclassCodegen(t *testing.T) {
+	if !isBenignAuditEvent("compile", "<string>", `b"def __create_fn__(__dataclass_type_name__):\n..."`) {
+		t.Error("dataclass codegen should be benign")
+	}
+}
+
+func TestIsBenignAuditEvent_ShortStringSnippet(t *testing.T) {
+	// Short snippets from <string> are interpreter internals.
+	if !isBenignAuditEvent("compile", "<string>", "b'int'") {
+		t.Error("short <string> snippet should be benign")
+	}
+}
+
+func TestIsBenignAuditEvent_SuspiciousExec(t *testing.T) {
+	// exec from a non-stdlib file should NOT be benign.
+	if isBenignAuditEvent("exec", "evil.py", "<code object>") {
+		t.Error("exec from evil.py should be suspicious")
+	}
+}
+
+func TestIsBenignAuditEvent_NodeEventsNeverBenign(t *testing.T) {
+	// Node.js audit events must never be filtered.
+	nodeEvents := []string{"eval", "Function", "vm.runInNewContext", "vm.runInThisContext", "vm.Script"}
+	for _, event := range nodeEvents {
+		if isBenignAuditEvent(event, "", "short") {
+			t.Errorf("Node.js event %q should never be benign", event)
+		}
+	}
+}
+
+func TestIsBenignAuditEvent_KojutoProbeScript(t *testing.T) {
+	// kojuto's own probe scripts should be filtered.
+	if !isBenignAuditEvent("exec", "/tmp/_kojuto_probe_win32.py", "<code object>") {
+		t.Error("kojuto probe script should be benign")
+	}
+}
+
+// ============================================================
+// System binary write tests
+// ============================================================
+
+func TestIsSystemBinaryWrite(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{"/usr/local/bin/python3", true},
+		{"/usr/local/bin/node", true},
+		{"/usr/bin/sh", true},
+		{"/usr/local/bin/pip", true},
+		{"/bin/bash", true},
+		{"/usr/local/bin/my-new-tool", false}, // not a system binary
+		{"/tmp/python3", false},               // wrong directory
+		{"/home/dev/python3", false},          // wrong directory
+		{"/usr/local/bin/black", false},       // pip entry_point, not system binary
+	}
+
+	for _, tt := range tests {
+		got := isSystemBinaryWrite(tt.path)
+		if got != tt.want {
+			t.Errorf("isSystemBinaryWrite(%q) = %v, want %v", tt.path, got, tt.want)
+		}
+	}
+}
+
+func TestParseOpenat_SystemBinaryWrite(t *testing.T) {
+	saved := sensitivePathPatterns
+	defer func() { sensitivePathPatterns = saved }()
+	SetSensitivePaths([]string{})
+	state := NewParseState()
+
+	// Write to /usr/local/bin/python3 — should be emitted.
+	line := `openat(AT_FDCWD, "/usr/local/bin/python3", O_WRONLY|O_CREAT|O_TRUNC, 0755) = 3`
+	evt, ok := parseStraceLine(line, state)
+	if !ok {
+		t.Fatal("write to system binary should be emitted")
+	}
+	if evt.FilePath != "/usr/local/bin/python3" {
+		t.Errorf("file_path = %q", evt.FilePath)
+	}
+
+	// Read from /usr/local/bin/python3 — should NOT be emitted.
+	readLine := `openat(AT_FDCWD, "/usr/local/bin/python3", O_RDONLY|O_CLOEXEC) = 3`
+	_, ok = parseStraceLine(readLine, state)
+	if ok {
+		t.Error("read from system binary should not be emitted")
+	}
+}
+
+func TestParseAuditHook_IntegratedWithParseStraceLine(t *testing.T) {
+	state := NewParseState()
+
+	// KOJUTO: line should be parsed by parseStraceLine via parseAuditHook.
+	line := "KOJUTO:eval:require('child_process').execSync('whoami')"
+	evt, ok := parseStraceLine(line, state)
+	if !ok {
+		t.Fatal("KOJUTO: line should be parsed by parseStraceLine")
+	}
+	if evt.Syscall != types.EventDynamicExec {
+		t.Errorf("syscall = %q, want %q", evt.Syscall, types.EventDynamicExec)
+	}
+	if evt.AuditEvent != "eval" {
+		t.Errorf("audit_event = %q, want eval", evt.AuditEvent)
+	}
+}

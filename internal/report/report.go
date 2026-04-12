@@ -10,7 +10,7 @@ import (
 )
 
 // Generate creates a Report from scan results.
-func Generate(pkg, version, ecosystem, verdict, probeMethod string, events []types.SyscallEvent, lostSamples uint64, summary *types.ReportSummary) types.Report {
+func Generate(pkg, version, ecosystem, verdict, probeMethod string, events []types.SyscallEvent, lostSamples, dropped uint64, summary *types.ReportSummary) types.Report {
 	if events == nil {
 		events = []types.SyscallEvent{}
 	}
@@ -25,6 +25,7 @@ func Generate(pkg, version, ecosystem, verdict, probeMethod string, events []typ
 		Events:      events,
 		ProbeMethod: probeMethod,
 		LostSamples: lostSamples,
+		Dropped:     dropped,
 	}
 }
 

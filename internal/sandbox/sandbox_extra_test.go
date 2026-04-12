@@ -430,6 +430,46 @@ func TestRandBase62(t *testing.T) {
 	}
 }
 
+func TestResolveRuntime_WithRunsc(t *testing.T) {
+	withFakeExec(t)
+	t.Setenv("FAKE_RUNSC", "1")
+
+	rt := resolveRuntime()
+	if rt != RuntimeGVisor {
+		t.Errorf("resolveRuntime() = %q, want %q", rt, RuntimeGVisor)
+	}
+}
+
+func TestResolveRuntime_WithoutRunsc(t *testing.T) {
+	withFakeExec(t)
+	t.Setenv("FAKE_RUNSC", "0")
+
+	rt := resolveRuntime()
+	if rt != RuntimeDefault {
+		t.Errorf("resolveRuntime() = %q, want %q", rt, RuntimeDefault)
+	}
+}
+
+func TestNew_Auto_ResolvesToDefault(t *testing.T) {
+	withFakeExec(t)
+	t.Setenv("FAKE_RUNSC", "0")
+
+	sb := New("/tmp/pkg", "test", false, types.EcosystemPyPI, RuntimeAuto)
+	if sb.runtime != RuntimeDefault {
+		t.Errorf("runtime = %q, want %q (auto without runsc)", sb.runtime, RuntimeDefault)
+	}
+}
+
+func TestNew_Auto_ResolvesToGVisor(t *testing.T) {
+	withFakeExec(t)
+	t.Setenv("FAKE_RUNSC", "1")
+
+	sb := New("/tmp/pkg", "test", false, types.EcosystemPyPI, RuntimeAuto)
+	if sb.runtime != RuntimeGVisor {
+		t.Errorf("runtime = %q, want %q (auto with runsc)", sb.runtime, RuntimeGVisor)
+	}
+}
+
 func TestFakeTokens_NotHexOnly(t *testing.T) {
 	hasNonHex := false
 	for range 10 {

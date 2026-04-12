@@ -51,3 +51,8 @@ func (p *unsupportedProbe) Close() error {
 func (p *unsupportedProbe) Method() string {
 	return "unsupported"
 }
+
+// Dropped always returns 0 on non-Linux platforms.
+func (p *unsupportedProbe) Dropped() uint64 {
+	return 0
+}

@@ -295,9 +295,11 @@ func TestVersionCmd(t *testing.T) {
 func TestPrintVerdict(_ *testing.T) {
 	// Just ensure printVerdict doesn't panic for each verdict type.
 	// Output goes to stderr which we don't capture, but no panic = pass.
-	printVerdict(types.VerdictClean, 0, 0)
-	printVerdict(types.VerdictSuspicious, 3, 0)
-	printVerdict(types.VerdictInconclusive, 0, 5)
+	printVerdict(types.VerdictClean, 0, 0, 0)
+	printVerdict(types.VerdictSuspicious, 3, 0, 0)
+	printVerdict(types.VerdictInconclusive, 0, 5, 0)
+	printVerdict(types.VerdictInconclusive, 0, 0, 12)
+	printVerdict(types.VerdictInconclusive, 0, 5, 12)
 }
 
 func TestOpenOutput_Stdout(t *testing.T) {
@@ -447,6 +449,60 @@ func TestOutputReport_Inconclusive(t *testing.T) {
 	}
 	if ve.Verdict != types.VerdictInconclusive {
 		t.Errorf("verdict = %q, want %q", ve.Verdict, types.VerdictInconclusive)
+	}
+}
+
+// Non-zero `dropped` (userspace channel overflow) must also flip the
+// verdict to inconclusive — same correctness contract as lostSamples,
+// but through the userspace path instead of the kernel perf buffer.
+func TestOutputReport_InconclusiveOnDropped(t *testing.T) {
+	origOutput := flagOutput
+	origVersion := flagVersion
+	origEcosystem := flagEcosystem
+	defer func() {
+		flagOutput = origOutput
+		flagVersion = origVersion
+		flagEcosystem = origEcosystem
+	}()
+
+	dir := t.TempDir()
+	flagOutput = filepath.Join(dir, "report.json")
+	flagVersion = testVersion
+	flagEcosystem = types.EcosystemPyPI
+
+	result := &scanResult{
+		method:  "ebpf",
+		events:  nil,
+		dropped: 17,
+	}
+
+	err := outputReport("test-pkg", result)
+	if err == nil {
+		t.Fatal("expected VerdictError when dropped > 0")
+	}
+
+	var ve *VerdictError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *VerdictError, got %T: %v", err, err)
+	}
+	if ve.Verdict != types.VerdictInconclusive {
+		t.Errorf("verdict = %q, want %q", ve.Verdict, types.VerdictInconclusive)
+	}
+
+	// Report JSON should carry the dropped count through.
+	raw, readErr := os.ReadFile(flagOutput)
+	if readErr != nil {
+		t.Fatalf("reading report: %v", readErr)
+	}
+	var r types.Report
+	if jsonErr := json.Unmarshal(raw, &r); jsonErr != nil {
+		t.Fatalf("unmarshal report: %v", jsonErr)
+	}
+	if r.Dropped != 17 {
+		t.Errorf("report.dropped = %d, want 17", r.Dropped)
+	}
+	if r.Verdict != types.VerdictInconclusive {
+		t.Errorf("report.verdict = %q, want inconclusive", r.Verdict)
 	}
 }
 

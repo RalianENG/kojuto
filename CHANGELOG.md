@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Audit hooks for dynamic code execution detection** — Python PEP 578 hook (`sitecustomize.py`) intercepts `compile`/`exec`/`import`/`ctypes.dlopen`; Node.js `--require` hook (`kojuto-require.js`) intercepts `eval`/`Function`/`vm.runInNewContext`/`vm.runInThisContext`/`vm.Script`. New `dynamic_code_execution` category and `EventDynamicExec` event type
+- **System binary write detection** — `openat` with write flags to trusted system binaries (`python3`, `node`, `pip`, `sh`, etc.) in `/usr/local/bin/` or `/usr/bin/` classified as `binary_hijacking`, preventing benignPaths bypass via tmpfs overwrite
+- **gVisor auto-detection** — `--runtime` default changed from empty (runc) to `auto`: probes `docker info` for runsc availability and uses gVisor if registered, falls back to runc otherwise
+- **npm test package** — `testdata/probe-npm-0.1.0/` with lifecycle hook payloads (preinstall/postinstall) and require-time import phase covering 31 TTPs across 9 attack categories including audit hook validation
+
+### Changed
+- Go version requirement lowered from 1.25.0 to 1.24.0 (stable release); `golang.org/x/sys` downgraded from v0.43.0 to v0.41.0
+- `--runtime` flag default changed from `""` to `"auto"`
+- `evasion-test` package updated: `b2_eval_exec` and `b3_function_constructor` promoted from `[BYPASS]` to `[DETECT]` (now `a10`/`a11`); new `b9_audit_hook_disable`, `b10_eval_via_import`, `c6_detect_audit_hook` evasion tests
+
+### Fixed
+- 21 linter errors: gofmt (15 files), importShadow (2), ifElseChain (1), godot (1), intrange (1), staticcheck De Morgan (1)
+
 ## [0.5.0]
 
 ### Added

@@ -100,7 +100,7 @@ Prerequisites:
   # Scan a local package file
   kojuto scan --local ./malware-1.0.0.whl
 
-  # Use gVisor runtime for stronger isolation
+  # Use gVisor runtime for stronger isolation (auto-detected by default)
   kojuto scan requests --runtime runsc`,
 	Args:          cobra.MaximumNArgs(1),
 	RunE:          runScan,
@@ -137,7 +137,7 @@ func init() {
 	scanCmd.Flags().StringVarP(&flagFile, "file", "f", "", "dependency file to scan (requirements.txt or package.json)")
 	scanCmd.Flags().StringVar(&flagPin, "pin", "", "output pinned dependency file after all-clean scan (requires -f)")
 	scanCmd.Flags().StringVar(&flagLocal, "local", "", "scan a local package file (.whl, .tgz) or directory instead of downloading")
-	scanCmd.Flags().StringVar(&flagRuntime, "runtime", "", "container runtime: default (runc) or runsc (gVisor)")
+	scanCmd.Flags().StringVar(&flagRuntime, "runtime", "auto", "container runtime: auto (use gVisor if available), runsc, or runc")
 	scanCmd.Flags().StringVar(&flagProbeMethod, "probe-method", methodAuto, "probe method: auto, ebpf, strace, strace-container")
 	scanCmd.Flags().DurationVar(&flagTimeout, "timeout", 5*time.Minute, "scan timeout per package")
 	scanCmd.Flags().StringVar(&flagConfig, "config", "", "config file path (default: kojuto.yml in current directory)")
@@ -204,6 +204,7 @@ type scanResult struct {
 	method      string
 	events      []types.SyscallEvent
 	lostSamples uint64
+	dropped     uint64
 }
 
 func runScan(_ *cobra.Command, args []string) error {
@@ -599,7 +600,12 @@ func runLocalScan(_ []string) error {
 		defer os.RemoveAll(tmpDir)
 
 		dlDir = filepath.Join(tmpDir, "packages")
-		if mkErr := os.MkdirAll(dlDir, 0o750); mkErr != nil {
+		// 0o755 (not 0o750): the sandbox container runs pip as the
+		// unprivileged `dev` user (UID 1000) but the host process is
+		// usually root or a different UID. Without world-execute on the
+		// directory, the in-container user cannot list the bind-mounted
+		// package files and pip's glob expansion silently empties.
+		if mkErr := os.MkdirAll(dlDir, 0o755); mkErr != nil {
 			return fmt.Errorf("creating package dir: %w", mkErr)
 		}
 
@@ -869,22 +875,53 @@ func runEBPFProbe(ctx context.Context, sb *sandbox.Sandbox, pkg string) (*scanRe
 	if startErr := ep.Start(pidnsInode); startErr != nil {
 		return nil, fmt.Errorf("starting eBPF probe: %w", startErr)
 	}
-	fmt.Fprintf(os.Stderr, "[!] eBPF probe monitors connect() only — sendto/sendmsg/execve are not covered. Consider --probe-method=strace-container for full coverage.\n")
-	defer func() { _ = ep.Close() }()
 
 	if unpauseErr := sb.Unpause(ctx); unpauseErr != nil {
+		_ = ep.Close()
 		return nil, fmt.Errorf("unpausing container: %w", unpauseErr)
 	}
 
-	events, err := installAndCollect(ctx, sb, pkg, ep)
-	if err != nil {
-		return nil, err
+	// Phase 1: install. The eBPF probe is host-side, so a single Start()
+	// covers every phase below — no need to recreate the probe per phase
+	// the way runContainerStraceProbe must.
+	fmt.Fprintf(os.Stderr, "[*] Phase 1/2: Installing %s in sandbox...\n", pkg)
+	installOut, installErr := sb.InstallPackage(ctx)
+	if installErr != nil {
+		_ = ep.Close()
+		fmt.Fprintf(os.Stderr, "[!] Install output:\n%s\n", string(installOut))
+		return nil, fmt.Errorf("install failed: %w", installErr)
+	}
+
+	// Phase 2: import under each simulated OS identity to trigger
+	// platform-gated payloads. Without this, eBPF mode misses every
+	// __init__.py-resident attack — most pypi malware lives here, not
+	// in setup.py.
+	sb.WriteProbeScripts(ctx)
+	importCmds := sb.ImportCommands()
+	osNames := []string{"Linux", "Windows", "macOS"}
+	for i, cmd := range importCmds {
+		label := osNames[i%len(osNames)]
+		fmt.Fprintf(os.Stderr, "[*] Phase 2/2: Importing %s (simulating %s)...\n", pkg, label)
+		if out, importErr := sb.Exec(ctx, cmd); importErr != nil {
+			fmt.Fprintf(os.Stderr, "[!] Import (%s) failed (non-fatal): %v\n%s\n", label, importErr, string(out))
+		}
+	}
+
+	// Allow the perf buffer + reader goroutines to drain in-flight events
+	// before closing. Mirrors installAndCollect's eventDrainDelay.
+	time.Sleep(eventDrainDelay)
+	_ = ep.Close()
+
+	var events []types.SyscallEvent
+	for evt := range ep.Events() {
+		events = append(events, evt)
 	}
 
 	return &scanResult{
 		events:      events,
 		method:      ep.Method(),
 		lostSamples: ep.LostSamples,
+		dropped:     ep.Dropped(),
 	}, nil
 }
 
@@ -910,8 +947,9 @@ func runStraceProbe(ctx context.Context, sb *sandbox.Sandbox, pkg string) (*scan
 	}
 
 	return &scanResult{
-		events: events,
-		method: sp.Method(),
+		events:  events,
+		method:  sp.Method(),
+		dropped: sp.Dropped(),
 	}, nil
 }
 
@@ -931,6 +969,7 @@ func runContainerStraceProbe(ctx context.Context, sb *sandbox.Sandbox, pkg strin
 	for evt := range cp.Events() {
 		events = append(events, evt)
 	}
+	dropped := cp.Dropped()
 
 	// Phase 2: Import under each simulated OS to defeat platform-gated payloads.
 	// Write probe scripts to /tmp first (outside strace), then execute them.
@@ -953,11 +992,13 @@ func runContainerStraceProbe(ctx context.Context, sb *sandbox.Sandbox, pkg strin
 		for evt := range ip.Events() {
 			events = append(events, evt)
 		}
+		dropped += ip.Dropped()
 	}
 
 	return &scanResult{
-		events: events,
-		method: cp.Method(),
+		events:  events,
+		method:  cp.Method(),
+		dropped: dropped,
 	}, nil
 }
 
@@ -984,13 +1025,17 @@ func installAndCollect(ctx context.Context, sb *sandbox.Sandbox, pkg string, p p
 
 func outputReport(pkg string, result *scanResult) error {
 	verdict, filtered := analyzer.Analyze(result.events)
-	if result.lostSamples > 0 {
+	// Either kernel-level perf buffer overflow (lostSamples) or userspace
+	// events-channel overflow (dropped) means the scan lost visibility and
+	// the verdict must not be "clean" — a dropped event could be the one
+	// that would have flagged a malicious syscall.
+	if result.lostSamples > 0 || result.dropped > 0 {
 		verdict = types.VerdictInconclusive
 	}
 
 	summary := analyzer.GenerateSummary(verdict, filtered)
-	r := report.Generate(pkg, flagVersion, flagEcosystem, verdict, result.method, filtered, result.lostSamples, summary)
-	printVerdict(verdict, len(filtered), result.lostSamples)
+	r := report.Generate(pkg, flagVersion, flagEcosystem, verdict, result.method, filtered, result.lostSamples, result.dropped, summary)
+	printVerdict(verdict, len(filtered), result.lostSamples, result.dropped)
 
 	w, err := openOutput()
 	if err != nil {
@@ -1017,12 +1062,12 @@ func outputReport(pkg string, result *scanResult) error {
 	}
 }
 
-func printVerdict(verdict string, eventCount int, lostSamples uint64) {
+func printVerdict(verdict string, eventCount int, lostSamples, dropped uint64) {
 	switch verdict {
 	case types.VerdictSuspicious:
 		fmt.Fprintf(os.Stderr, "[!] SUSPICIOUS: %d suspicious event(s) detected\n", eventCount)
 	case types.VerdictInconclusive:
-		fmt.Fprintf(os.Stderr, "[!] INCONCLUSIVE: %d event(s) lost — probe buffer overflow, possible evasion attempt. Treating as failure.\n", lostSamples)
+		fmt.Fprintf(os.Stderr, "[!] INCONCLUSIVE: %d kernel sample(s) lost, %d event(s) dropped — probe buffer overflow, possible evasion attempt. Treating as failure.\n", lostSamples, dropped)
 	default:
 		fmt.Fprintf(os.Stderr, "[+] CLEAN: No suspicious activity detected\n")
 	}
