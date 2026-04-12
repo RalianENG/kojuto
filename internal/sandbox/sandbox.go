@@ -662,10 +662,14 @@ func (s *Sandbox) WriteProbeScriptsMulti(ctx context.Context, pkgs []string) {
 		system, sysplatform, osname string
 		sep, pathsep, linesep       string
 	}
+	// linesep is interpolated into a single-quoted Python string literal.
+	// The escape sequences must be the LITERAL backslash-letter forms
+	// ("\\n" / "\\r\\n") so that Python parses them — embedding a real
+	// newline byte breaks the source mid-line with SyntaxError.
 	pyPlatforms := []pyPlatform{
-		{"Linux", "linux", "posix", "/", ":", "\n"},
+		{"Linux", "linux", "posix", "/", ":", "\\n"},
 		{"Windows", "win32", "nt", "\\\\", ";", "\\r\\n"},
-		{"Darwin", "darwin", "posix", "/", ":", "\n"},
+		{"Darwin", "darwin", "posix", "/", ":", "\\n"},
 	}
 	for _, p := range pyPlatforms {
 		var imports strings.Builder
@@ -740,10 +744,14 @@ func (s *Sandbox) WriteProbeScripts(ctx context.Context) {
 		system, sysplatform, osname string
 		sep, pathsep, linesep       string
 	}
+	// linesep is interpolated into a single-quoted Python string literal.
+	// The escape sequences must be the LITERAL backslash-letter forms
+	// ("\\n" / "\\r\\n") so that Python parses them — embedding a real
+	// newline byte breaks the source mid-line with SyntaxError.
 	pyPlatforms := []pyPlatform{
-		{"Linux", "linux", "posix", "/", ":", "\n"},
+		{"Linux", "linux", "posix", "/", ":", "\\n"},
 		{"Windows", "win32", "nt", "\\\\", ";", "\\r\\n"},
-		{"Darwin", "darwin", "posix", "/", ":", "\n"},
+		{"Darwin", "darwin", "posix", "/", ":", "\\n"},
 	}
 	for _, p := range pyPlatforms {
 		script := fmt.Sprintf(
