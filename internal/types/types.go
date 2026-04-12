@@ -95,6 +95,7 @@ type Report struct {
 	Events         []SyscallEvent  `json:"events"`
 	StaticFindings []StaticFinding `json:"static_findings,omitempty"`
 	LostSamples    uint64          `json:"lost_samples,omitempty"`
+	Dropped        uint64          `json:"dropped,omitempty"`
 }
 
 // Verdict constants.

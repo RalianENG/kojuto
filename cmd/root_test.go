@@ -295,9 +295,11 @@ func TestVersionCmd(t *testing.T) {
 func TestPrintVerdict(_ *testing.T) {
 	// Just ensure printVerdict doesn't panic for each verdict type.
 	// Output goes to stderr which we don't capture, but no panic = pass.
-	printVerdict(types.VerdictClean, 0, 0)
-	printVerdict(types.VerdictSuspicious, 3, 0)
-	printVerdict(types.VerdictInconclusive, 0, 5)
+	printVerdict(types.VerdictClean, 0, 0, 0)
+	printVerdict(types.VerdictSuspicious, 3, 0, 0)
+	printVerdict(types.VerdictInconclusive, 0, 5, 0)
+	printVerdict(types.VerdictInconclusive, 0, 0, 12)
+	printVerdict(types.VerdictInconclusive, 0, 5, 12)
 }
 
 func TestOpenOutput_Stdout(t *testing.T) {
