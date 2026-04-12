@@ -29,6 +29,8 @@ type probeFileEvent struct {
 	UID         uint32
 	EventType   uint8
 	Pad         [3]uint8
+	Extra1      uint32
+	Extra2      uint32
 	Path        [128]int8
 	Path2       [128]int8
 }
@@ -43,6 +45,11 @@ type probeObjects struct {
 	KprobeExecve  *ebpf.Program `ebpf:"kprobe_execve"`
 	KprobeOpenat  *ebpf.Program `ebpf:"kprobe_openat"`
 	KprobeRename  *ebpf.Program `ebpf:"kprobe_rename"`
+	TpPtrace      *ebpf.Program `ebpf:"tp_ptrace"`
+	TpMmap        *ebpf.Program `ebpf:"tp_mmap"`
+	TpMprotect    *ebpf.Program `ebpf:"tp_mprotect"`
+	TpUnlink      *ebpf.Program `ebpf:"tp_unlink"`
+	TpUnlinkat    *ebpf.Program `ebpf:"tp_unlinkat"`
 	Events        *ebpf.Map     `ebpf:"events"`
 	FileEvents    *ebpf.Map     `ebpf:"file_events"`
 	TargetPidns   *ebpf.Map     `ebpf:"target_pidns"`
@@ -57,6 +64,8 @@ func (o *probeObjects) Close() error {
 		o.KprobeConnect, o.KprobeSendto, o.KprobeSendmsg,
 		o.KprobeBind, o.KprobeListen, o.KprobeAccept,
 		o.KprobeExecve, o.KprobeOpenat, o.KprobeRename,
+		o.TpPtrace, o.TpMmap, o.TpMprotect,
+		o.TpUnlink, o.TpUnlinkat,
 	}
 	for _, p := range progs {
 		if p != nil {

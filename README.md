@@ -97,7 +97,7 @@ sudo ./scripts/setup-caps.sh ./kojuto
 | `--probe-method` | `auto` / `ebpf` / `strace` / `strace-container` (default: `auto`) |
 | `--timeout` | Scan timeout per package (default: `5m`) |
 | `--config` | Config file path (default: `kojuto.yml` in current directory) |
-| `--strict` | Ignore `sensitive_paths.exclude` from config (recommended for CI) |
+| `--strict` | Ignore `sensitive_paths.exclude` from config (default: `false` on CLI; the GitHub Action sets this to `true` by default for CI safety) |
 
 ### Exit Codes
 

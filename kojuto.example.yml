@@ -2,7 +2,7 @@
 # Copy to kojuto.yml and customize as needed.
 
 sensitive_paths:
-  # Additional paths to monitor (added to the ~40 built-in defaults).
+  # Additional paths to monitor (added to the 60+ built-in defaults).
   # Use substring patterns — any openat call whose path contains
   # the pattern will be flagged as suspicious.
   include:

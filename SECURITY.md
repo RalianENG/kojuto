@@ -45,15 +45,15 @@ kojuto is a security tool that intentionally runs untrusted code in an isolated 
 
 ### Detection
 
-- **Dynamic analysis**: strace monitors `connect`, `sendto`, `sendmsg`, `execve`, `openat`, `rename`, `mmap`, `mprotect`, `unlink`, `sendfile`, and `ptrace` syscalls during install and import phases
+- **Dynamic analysis**: strace monitors `connect`, `sendto`, `sendmsg`, `sendmmsg`, `bind`, `listen`, `accept`, `accept4`, `execve`, `openat`, `rename`, `renameat`, `renameat2`, `sendfile`, `ptrace`, `mmap`, `mprotect`, `unlink`, and `unlinkat` syscalls during install and import phases
 - **Audit hooks**: Python PEP 578 hook (`sitecustomize.py`) intercepts `compile`/`exec`/`import` events; Node.js `--require` hook intercepts `eval`/`Function`/`vm` calls. Detects dynamic code execution that generates no `execve` syscall
 - **DNS tunneling detection**: extracts query domains from `sendto` payloads and flags high-entropy subdomains (Shannon entropy > 3.5 bits/char) used for data exfiltration
 - **Credential access detection**: `openat` monitoring flags access to sensitive paths (`~/.ssh/`, `~/.aws/`, `/etc/shadow`, `/proc/self/environ`, etc.)
 - **Binary hijacking detection**: `rename`/`renameat`/`renameat2` monitoring detects attempts to overwrite trusted binaries (`python3`, `node`, `sh`, etc.)
 - **Multi-OS import probing**: packages are imported under simulated Linux, Windows, and macOS identities to trigger platform-gated payloads
-- **Time-shifted import**: `libfaketime` advances the clock +30 days during import probes to trigger date-gated payloads
+- **Time-shifted import**: `libfaketime` advances the clock by a random offset between +30 and +180 days during import probes to trigger date-gated payloads; randomization prevents signature-based evasion, upper bound avoids TLS certificate expiry
 - **Honeypot simulation**: fake credential files and CI environment variables (randomly generated per scan) provoke credential-harvesting malware into observable behavior
-- **eBPF mode** (opt-in): kprobes for `connect`, `sendto`, `sendmsg`, `bind`, `listen`, `accept`, `execve`, `openat`, and `rename` — full parity with strace-container mode; best-effort attachment for non-critical probes
+- **eBPF mode** (opt-in): kprobes for `connect`, `sendto`, `sendmsg`, `bind`, `listen`, `accept`, `execve`, `openat`, and `rename`, plus tracepoints for `ptrace` (evasion), `mmap`/`mprotect` (memory execution), and `unlink`/`unlinkat` (anti-forensics) — full detection parity with strace-container mode; best-effort attachment for non-critical probes
 - **gVisor runtime** (`--runtime auto`, default): auto-detects gVisor availability; user-space kernel masks `/proc/1/cgroup` and `/proc/self/mountinfo`, defeating the remaining container-detection signals
 - **sudo-free eBPF**: `scripts/setup-caps.sh` grants `CAP_BPF` + `CAP_PERFMON` to the binary via `setcap`, eliminating the need for root
 
