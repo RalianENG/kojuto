@@ -266,51 +266,8 @@ func (p *EBPFProbe) readFileLoop() {
 		}
 		path2 := nullTermString(path2Bytes[:])
 
-		evt := types.SyscallEvent{
-			Timestamp: time.Now().UTC(),
-			PID:       raw.Pid,
-		}
-
-		switch raw.EventType {
-		case evtExecve:
-			evt.Syscall = types.EventExecve
-			evt.Comm = path
-		case evtOpenat:
-			evt.Syscall = types.EventOpenat
-			evt.FilePath = path
-			evt.OpenFlags = formatOpenFlags(raw.Extra1)
-			// Track create→delete candidates for anti-forensics correlation.
-			if raw.Extra1&oCreat != 0 && isSuspiciousTmpPath(path) {
-				p.createdTmpMu.Lock()
-				p.createdTmpFiles[path] = true
-				p.createdTmpMu.Unlock()
-			}
-		case evtRename:
-			evt.Syscall = types.EventRename
-			evt.SrcPath = path
-			evt.DstPath = path2
-		case evtPtrace:
-			evt.Syscall = types.EventPtrace
-			evt.Comm = "ptrace(PTRACE_TRACEME)"
-		case evtMmap:
-			evt.Syscall = types.EventMmap
-			evt.MemProt = formatProt(raw.Extra1)
-			evt.MemFlags = formatMmapFlags(raw.Extra2)
-		case evtMprotect:
-			evt.Syscall = types.EventMprotect
-			evt.MemProt = formatProt(raw.Extra1)
-		case evtUnlink:
-			// Only emit if the path was created during this scan under a
-			// suspicious directory — matches strace-mode behavior.
-			p.createdTmpMu.Lock()
-			created := p.createdTmpFiles[path]
-			p.createdTmpMu.Unlock()
-			if !created {
-				continue
-			}
-			evt.Syscall = types.EventUnlink
-			evt.FilePath = path
-		default:
+		evt, ok := p.classifyFileEvent(&raw, path, path2)
+		if !ok {
 			continue
 		}
 
@@ -322,6 +279,61 @@ func (p *EBPFProbe) readFileLoop() {
 			p.dropped++
 		}
 	}
+}
+
+// classifyFileEvent turns a raw eBPF file_event into a SyscallEvent,
+// returning ok=false if the event should be dropped (unknown type, or
+// an unlink whose path was not seen in the createdTmpFiles set during
+// the current scan). Extracted from readFileLoop to keep that loop's
+// cyclomatic complexity under the lint threshold.
+func (p *EBPFProbe) classifyFileEvent(raw *probeFileEvent, path, path2 string) (types.SyscallEvent, bool) {
+	evt := types.SyscallEvent{
+		Timestamp: time.Now().UTC(),
+		PID:       raw.Pid,
+	}
+	switch raw.EventType {
+	case evtExecve:
+		evt.Syscall = types.EventExecve
+		evt.Comm = path
+	case evtOpenat:
+		evt.Syscall = types.EventOpenat
+		evt.FilePath = path
+		evt.OpenFlags = formatOpenFlags(raw.Extra1)
+		// Track create→delete candidates for anti-forensics correlation.
+		if raw.Extra1&oCreat != 0 && isSuspiciousTmpPath(path) {
+			p.createdTmpMu.Lock()
+			p.createdTmpFiles[path] = true
+			p.createdTmpMu.Unlock()
+		}
+	case evtRename:
+		evt.Syscall = types.EventRename
+		evt.SrcPath = path
+		evt.DstPath = path2
+	case evtPtrace:
+		evt.Syscall = types.EventPtrace
+		evt.Comm = "ptrace(PTRACE_TRACEME)"
+	case evtMmap:
+		evt.Syscall = types.EventMmap
+		evt.MemProt = formatProt(raw.Extra1)
+		evt.MemFlags = formatMmapFlags(raw.Extra2)
+	case evtMprotect:
+		evt.Syscall = types.EventMprotect
+		evt.MemProt = formatProt(raw.Extra1)
+	case evtUnlink:
+		// Only emit if the path was created during this scan under a
+		// suspicious directory — matches strace-mode behavior.
+		p.createdTmpMu.Lock()
+		created := p.createdTmpFiles[path]
+		p.createdTmpMu.Unlock()
+		if !created {
+			return evt, false
+		}
+		evt.Syscall = types.EventUnlink
+		evt.FilePath = path
+	default:
+		return evt, false
+	}
+	return evt, true
 }
 
 func (p *EBPFProbe) Events() <-chan types.SyscallEvent {

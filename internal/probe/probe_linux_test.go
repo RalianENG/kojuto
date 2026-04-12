@@ -136,11 +136,11 @@ func TestIsSuspiciousTmpPath(t *testing.T) {
 		{"/root/.ssh/id_rsa", false},
 
 		// Edge cases that must NOT match.
-		{"/tmpfiles/normal", false},   // prefix collision: /tmp vs /tmpfiles
-		{"/var/log/syslog", false},    // /var but not /var/tmp
-		{"/runtime/app", false},       // /run prefix collision
-		{"", false},                   // empty path
-		{"/t", false},                 // too short to match
+		{"/tmpfiles/normal", false}, // prefix collision: /tmp vs /tmpfiles
+		{"/var/log/syslog", false},  // /var but not /var/tmp
+		{"/runtime/app", false},     // /run prefix collision
+		{"", false},                 // empty path
+		{"/t", false},               // too short to match
 	}
 	for _, tt := range tests {
 		t.Run(tt.path, func(t *testing.T) {
