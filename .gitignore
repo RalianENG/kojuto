@@ -36,6 +36,9 @@ internal/probe/*_bpfel.o
 internal/probe/*_bpfeb.go
 internal/probe/*_bpfeb.o
 
+# eBPF kernel headers (regenerate with: bpftool btf dump file /sys/kernel/btf/vmlinux format c > headers/vmlinux.h)
+headers/
+
 # Demo
 *.tape
 *.gif
@@ -48,5 +51,11 @@ testdata/*.whl
 testdata/*.tar.gz
 testdata/*/build/
 testdata/*/*.egg-info/
+testdata/*/*.tgz
+
+# Python bytecode cache
 __pycache__/
-*.tgz
+*.pyc
+
+# Claude Code local state
+.claude/*.lock
