@@ -76,8 +76,8 @@ var scanCmd = &cobra.Command{
 The target package is installed inside an isolated Docker container while
 syscalls (connect, sendto, execve, openat, rename, etc.) are recorded via
 strace or eBPF. Import is then repeated under three simulated OS identities
-(Linux, Windows, macOS) with the clock shifted +30 days to trigger
-platform-gated and date-gated payloads.
+(Linux, Windows, macOS) with the clock shifted by a randomized +30 to +180
+days (via libfaketime) to trigger platform-gated and date-gated payloads.
 
 Prerequisites:
   - Docker must be installed and running

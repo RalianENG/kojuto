@@ -30,7 +30,7 @@ inputs:
     required: false
     default: ''
   runtime:
-    description: 'Container runtime: default (runc) or runsc (gVisor)'
+    description: 'Container runtime: auto (default, use gVisor if available), runsc (force gVisor), runc (force Docker default). Empty string also resolves to auto on the CLI.'
     required: false
     default: ''
   probe-method:
