@@ -47,6 +47,8 @@ var (
 	flagTimeout     time.Duration
 	flagConfig      string
 	flagStrict      bool
+	flagNoColor     bool
+	flagQuiet       bool
 )
 
 // Replaceable dependencies for testing.
@@ -143,6 +145,12 @@ func init() {
 	scanCmd.Flags().StringVar(&flagConfig, "config", "", "config file path (default: kojuto.yml in current directory)")
 	scanCmd.Flags().BoolVar(&flagStrict, "strict", false, "ignore sensitive_paths.exclude from config (recommended for CI)")
 
+	rootCmd.PersistentFlags().BoolVar(&flagNoColor, "no-color", false, "disable colored output (NO_COLOR env is also respected)")
+	rootCmd.PersistentFlags().BoolVarP(&flagQuiet, "quiet", "q", false, "suppress phase progress output; emit only the final verdict block")
+	rootCmd.PersistentPreRun = func(_ *cobra.Command, _ []string) {
+		configureColor(flagNoColor)
+	}
+
 	rootCmd.AddCommand(scanCmd)
 	rootCmd.AddCommand(versionCmd)
 }
@@ -170,9 +178,15 @@ func preRunLoadConfig(_ *cobra.Command, _ []string) error {
 }
 
 // VerdictError is returned when the scan verdict is not clean.
+//
+// Categories carries the unique attack-category list from the scan's
+// summary, populated only on `suspicious` verdicts. The batch
+// summary uses it to show per-package category attribution without
+// re-reading the report JSON from disk.
 type VerdictError struct {
-	Verdict  string
-	ExitCode int
+	Verdict    string
+	ExitCode   int
+	Categories []string
 }
 
 func (e *VerdictError) Error() string {
@@ -311,18 +325,20 @@ func runBatchScan(_ []string) error {
 	}
 
 	// Phase 1: Fast batch screening — install all packages in a single sandbox.
-	fmt.Fprintf(os.Stderr, "[*] Phase 1: Batch screening %d packages from %s (%s)...\n", len(deps), flagFile, ecosystem)
+	phaseInfo("screening", fmt.Sprintf("%d packages from %s (%s)", len(deps), flagFile, ecosystem))
 
 	verdict, batchErr := runBatchScreening(deps, ecosystem)
 	if batchErr != nil {
 		// Batch screening failed (download/sandbox error). Fall back to per-package scan.
-		fmt.Fprintf(os.Stderr, "[!] Batch screening failed: %v\n", batchErr)
-		fmt.Fprintf(os.Stderr, "[*] Falling back to per-package scan...\n")
+		fmt.Fprintf(os.Stderr, "  %s batch screening failed: %v\n", styleYellowBold("!"), batchErr)
+		phaseInfo("fallback", "per-package scan")
 		return runPerPackageScan(deps, ecosystem)
 	}
 
 	if verdict == types.VerdictClean {
-		fmt.Fprintf(os.Stderr, "[+] CLEAN: All %d packages passed batch screening\n", len(deps))
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintf(os.Stderr, "  %s  all %d packages passed batch screening\n",
+			styleGreenBold("✓ CLEAN"), len(deps))
 
 		if flagPin != "" {
 			pinned := make([]pinnedDep, 0, len(deps))
@@ -332,13 +348,15 @@ func runBatchScan(_ []string) error {
 			if err := writePinnedFile(flagPin, pinned, ecosystem); err != nil {
 				return fmt.Errorf("writing pinned file: %w", err)
 			}
-			fmt.Fprintf(os.Stderr, "[+] Pinned %d packages to %s\n", len(pinned), flagPin)
+			fmt.Fprintf(os.Stderr, "  %s pinned %d packages to %s\n",
+				styleGreenBold("✓"), len(pinned), flagPin)
 		}
 		return nil
 	}
 
 	// Phase 2: Suspicious activity detected — re-scan individually to find the culprit.
-	fmt.Fprintf(os.Stderr, "[!] Suspicious activity in batch scan — starting per-package attribution...\n")
+	fmt.Fprintf(os.Stderr, "  %s suspicious activity in batch scan, attributing per-package\n",
+		styleYellowBold("!"))
 	return runPerPackageScan(deps, ecosystem)
 }
 
@@ -371,7 +389,7 @@ func runBatchScreening(deps []depfile.Dep, ecosystem string) (string, error) {
 	}
 
 	flagEcosystem = ecosystem
-	fmt.Fprintf(os.Stderr, "[*] Downloading %d packages...\n", len(pkgNames))
+	phaseInfo("download", fmt.Sprintf("%d packages", len(pkgNames)))
 	downloadBatchPackages(ctx, deps, targets, dlDir, ecosystem)
 
 	// Start a single sandbox with all packages.
@@ -390,13 +408,14 @@ func runBatchScreening(deps []depfile.Dep, ecosystem string) (string, error) {
 	}()
 
 	// Install all packages at once with strace.
-	fmt.Fprintf(os.Stderr, "[*] Installing %d packages in sandbox...\n", len(pkgNames))
+	installPhase := startPhase("install", fmt.Sprintf("%d packages", len(pkgNames)))
 	cp := probe.NewContainerStrace()
 	installOut, installErr := cp.StartAndInstall(ctx, sb.ContainerID(), sb.InstallAllCommand(pkgNames))
 	if installErr != nil {
 		fmt.Fprintf(os.Stderr, "[!] Install output:\n%s\n", string(installOut))
 		return "", fmt.Errorf("batch install failed: %w", installErr)
 	}
+	installPhase.end()
 
 	var events []types.SyscallEvent
 	for evt := range cp.Events() {
@@ -409,7 +428,7 @@ func runBatchScreening(deps []depfile.Dep, ecosystem string) (string, error) {
 	osNames := []string{"Linux", "Windows", "macOS"}
 
 	for i, cmd := range importCmds {
-		fmt.Fprintf(os.Stderr, "[*] Importing %d packages (simulating %s)...\n", len(pkgNames), osNames[i])
+		importPhase := startPhase("import", fmt.Sprintf("%d packages, %s", len(pkgNames), osNames[i]))
 
 		ip := probe.NewContainerStrace()
 		importOut, importErr := ip.StartAndInstall(ctx, sb.ContainerID(), cmd)
@@ -420,10 +439,11 @@ func runBatchScreening(deps []depfile.Dep, ecosystem string) (string, error) {
 		for evt := range ip.Events() {
 			events = append(events, evt)
 		}
+		importPhase.end()
 	}
 
 	verdict, filtered := analyzer.Analyze(events)
-	fmt.Fprintf(os.Stderr, "[*] Batch screening: %s (%d events)\n", verdict, len(filtered))
+	phaseInfo("screening", fmt.Sprintf("verdict=%s (%d events)", verdict, len(filtered)))
 
 	return verdict, nil
 }
@@ -463,24 +483,30 @@ func downloadIndividually(ctx context.Context, deps []depfile.Dep, dlDir, ecosys
 
 // runPerPackageScan falls back to the original per-package scanning approach.
 func runPerPackageScan(deps []depfile.Dep, ecosystem string) error {
-	var suspicious []string
+	t0 := time.Now()
+	var suspicious []batchSuspicious
 	var scanErrors []string
 	var pinned []pinnedDep
 
 	for i, dep := range deps {
-		fmt.Fprintf(os.Stderr, "\n[%d/%d] Scanning %s", i+1, len(deps), dep.Name)
-		if dep.Version != "" {
-			fmt.Fprintf(os.Stderr, " (%s)", dep.Version)
-		}
 		fmt.Fprintln(os.Stderr)
+		coord := dep.Name
+		if dep.Version != "" {
+			coord = dep.Name + "@" + dep.Version
+		}
+		phaseInfo("scan", fmt.Sprintf("[%d/%d] %s", i+1, len(deps), coord))
 
 		resolved, scanErr := scanSinglePackage(dep.Name, dep.Version, ecosystem)
 		if scanErr != nil {
 			var ve *VerdictError
 			if errors.As(scanErr, &ve) {
-				suspicious = append(suspicious, dep.Name)
+				suspicious = append(suspicious, batchSuspicious{
+					name:       dep.Name,
+					categories: ve.Categories,
+				})
 			} else {
-				fmt.Fprintf(os.Stderr, "[!] Error scanning %s: %v\n", dep.Name, scanErr)
+				fmt.Fprintf(os.Stderr, "  %s error scanning %s: %v\n",
+					styleYellowBold("!"), dep.Name, scanErr)
 				scanErrors = append(scanErrors, dep.Name)
 			}
 		} else if resolved != nil {
@@ -488,24 +514,23 @@ func runPerPackageScan(deps []depfile.Dep, ecosystem string) error {
 		}
 	}
 
-	// Summary.
-	fmt.Fprintf(os.Stderr, "\n=== Batch scan complete ===\n")
-	fmt.Fprintf(os.Stderr, "  Total:      %d\n", len(deps))
-	fmt.Fprintf(os.Stderr, "  Clean:      %d\n", len(deps)-len(suspicious)-len(scanErrors))
-	fmt.Fprintf(os.Stderr, "  Suspicious: %d\n", len(suspicious))
-	fmt.Fprintf(os.Stderr, "  Errors:     %d\n", len(scanErrors))
+	// Summary block (renderer respects --quiet via shared progressOut wrapper —
+	// but since the summary is the verdict-equivalent for batch mode, we always
+	// write to stderr regardless of flagQuiet).
+	renderBatchSummary(os.Stderr, len(deps), len(scanErrors), suspicious, time.Since(t0))
 
 	if len(suspicious) > 0 {
-		fmt.Fprintf(os.Stderr, "  Flagged:    %s\n", strings.Join(suspicious, ", "))
 		if flagPin != "" {
-			fmt.Fprintf(os.Stderr, "[!] --pin refused: suspicious packages detected\n")
+			fmt.Fprintf(os.Stderr, "  %s --pin refused: suspicious packages detected\n",
+				styleYellowBold("!"))
 		}
 		return &VerdictError{Verdict: types.VerdictSuspicious, ExitCode: exitCodeSuspicious}
 	}
 
 	if len(scanErrors) > 0 {
 		if flagPin != "" {
-			fmt.Fprintf(os.Stderr, "[!] --pin refused: scan errors occurred\n")
+			fmt.Fprintf(os.Stderr, "  %s --pin refused: scan errors occurred\n",
+				styleYellowBold("!"))
 		}
 		return fmt.Errorf("scan failed for: %s", strings.Join(scanErrors, ", "))
 	}
@@ -514,7 +539,8 @@ func runPerPackageScan(deps []depfile.Dep, ecosystem string) error {
 		if err := writePinnedFile(flagPin, pinned, ecosystem); err != nil {
 			return fmt.Errorf("writing pinned file: %w", err)
 		}
-		fmt.Fprintf(os.Stderr, "[+] Pinned %d packages to %s\n", len(pinned), flagPin)
+		fmt.Fprintf(os.Stderr, "  %s pinned %d packages to %s\n",
+			styleGreenBold("✓"), len(pinned), flagPin)
 	}
 
 	return nil
@@ -631,7 +657,7 @@ func runLocalScan(_ []string) error {
 		}
 	}
 
-	fmt.Fprintf(os.Stderr, "[*] Scanning local package: %s (%s)\n", pkg, ecosystem)
+	phaseInfo("scanning", fmt.Sprintf("%s (%s)", pkg, ecosystem))
 
 	flagEcosystem = ecosystem
 	flagVersion = downloaderDetectVersion(dlDir, pkg)
@@ -771,7 +797,7 @@ func prepareLocalNpm(sourceDir, pkg string) (string, error) {
 }
 
 func downloadPackage(ctx context.Context, pkg string) (string, error) {
-	fmt.Fprintf(os.Stderr, "[*] Downloading %s (%s)...\n", pkg, flagEcosystem)
+	phaseInfo("download", fmt.Sprintf("%s (%s)", pkg, flagEcosystem))
 
 	tmpDir, err := os.MkdirTemp("", "kojuto-*")
 	if err != nil {
@@ -805,18 +831,18 @@ func selectProbeMethod() string {
 	// spots for sendto/sendmsg/execve. Only use eBPF when explicitly requested.
 	switch {
 	case runtime.GOOS == "linux":
-		fmt.Fprintf(os.Stderr, "[*] Using in-container strace for full syscall coverage\n")
+		phaseInfo("probe", "using in-container strace for full syscall coverage")
 
 		return methodStraceContainer
 	default:
-		fmt.Fprintf(os.Stderr, "[*] Non-Linux host, using in-container strace\n")
+		phaseInfo("probe", "non-Linux host, using in-container strace")
 
 		return methodStraceContainer
 	}
 }
 
 func startSandbox(ctx context.Context, dlDir, pkg, method string) (*sandbox.Sandbox, error) {
-	fmt.Fprintf(os.Stderr, "[*] Preparing sandbox...\n")
+	phaseInfo("sandbox", "preparing isolated container")
 
 	dockerfilePath := findDockerfile()
 	if err := sandboxEnsureImage(ctx, dockerfilePath); err != nil {
@@ -846,7 +872,7 @@ func startSandbox(ctx context.Context, dlDir, pkg, method string) (*sandbox.Sand
 }
 
 func runProbeAndInstall(ctx context.Context, sb *sandbox.Sandbox, pkg, method string) (*scanResult, error) {
-	fmt.Fprintf(os.Stderr, "[*] Starting %s probe...\n", method)
+	phaseInfo("probe", "starting "+method)
 
 	switch method {
 	case methodEBPF:
@@ -860,7 +886,7 @@ func runProbeAndInstall(ctx context.Context, sb *sandbox.Sandbox, pkg, method st
 	}
 }
 
-func runEBPFProbe(ctx context.Context, sb *sandbox.Sandbox, pkg string) (*scanResult, error) {
+func runEBPFProbe(ctx context.Context, sb *sandbox.Sandbox, _ string) (*scanResult, error) {
 	containerPID, err := sb.PID(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("getting container PID: %w", err)
@@ -884,13 +910,14 @@ func runEBPFProbe(ctx context.Context, sb *sandbox.Sandbox, pkg string) (*scanRe
 	// Phase 1: install. The eBPF probe is host-side, so a single Start()
 	// covers every phase below — no need to recreate the probe per phase
 	// the way runContainerStraceProbe must.
-	fmt.Fprintf(os.Stderr, "[*] Phase 1/2: Installing %s in sandbox...\n", pkg)
+	installPhase := startPhase("install", "")
 	installOut, installErr := sb.InstallPackage(ctx)
 	if installErr != nil {
 		_ = ep.Close()
 		fmt.Fprintf(os.Stderr, "[!] Install output:\n%s\n", string(installOut))
 		return nil, fmt.Errorf("install failed: %w", installErr)
 	}
+	installPhase.end()
 
 	// Phase 2: import under each simulated OS identity to trigger
 	// platform-gated payloads. Without this, eBPF mode misses every
@@ -901,10 +928,11 @@ func runEBPFProbe(ctx context.Context, sb *sandbox.Sandbox, pkg string) (*scanRe
 	osNames := []string{"Linux", "Windows", "macOS"}
 	for i, cmd := range importCmds {
 		label := osNames[i%len(osNames)]
-		fmt.Fprintf(os.Stderr, "[*] Phase 2/2: Importing %s (simulating %s)...\n", pkg, label)
+		importPhase := startPhase("import", label)
 		if out, importErr := sb.Exec(ctx, cmd); importErr != nil {
 			fmt.Fprintf(os.Stderr, "[!] Import (%s) failed (non-fatal): %v\n%s\n", label, importErr, string(out))
 		}
+		importPhase.end()
 	}
 
 	// Allow the perf buffer + reader goroutines to drain in-flight events
@@ -953,10 +981,10 @@ func runStraceProbe(ctx context.Context, sb *sandbox.Sandbox, pkg string) (*scan
 	}, nil
 }
 
-func runContainerStraceProbe(ctx context.Context, sb *sandbox.Sandbox, pkg string) (*scanResult, error) {
+func runContainerStraceProbe(ctx context.Context, sb *sandbox.Sandbox, _ string) (*scanResult, error) {
 	// Phase 1: Install with strace monitoring.
 	cp := probe.NewContainerStrace()
-	fmt.Fprintf(os.Stderr, "[*] Phase 1/2: Installing %s in sandbox (with strace)...\n", pkg)
+	installPhase := startPhase("install", "")
 
 	installOut, err := cp.StartAndInstall(ctx, sb.ContainerID(), sb.InstallCommand())
 	if err != nil {
@@ -964,6 +992,7 @@ func runContainerStraceProbe(ctx context.Context, sb *sandbox.Sandbox, pkg strin
 
 		return nil, fmt.Errorf("install failed: %w", err)
 	}
+	installPhase.end()
 
 	var events []types.SyscallEvent
 	for evt := range cp.Events() {
@@ -980,7 +1009,7 @@ func runContainerStraceProbe(ctx context.Context, sb *sandbox.Sandbox, pkg strin
 
 	for i, cmd := range importCmds {
 		label := osNames[i%len(osNames)]
-		fmt.Fprintf(os.Stderr, "[*] Phase 2/2: Importing %s (simulating %s)...\n", pkg, label)
+		importPhase := startPhase("import", label)
 
 		ip := probe.NewContainerStrace()
 		importOut, importErr := ip.StartAndInstall(ctx, sb.ContainerID(), cmd)
@@ -988,6 +1017,7 @@ func runContainerStraceProbe(ctx context.Context, sb *sandbox.Sandbox, pkg strin
 			fmt.Fprintf(os.Stderr, "[!] Import (%s) failed (non-fatal): %v\n", label, importErr)
 			_ = importOut
 		}
+		importPhase.end()
 
 		for evt := range ip.Events() {
 			events = append(events, evt)
@@ -1002,8 +1032,8 @@ func runContainerStraceProbe(ctx context.Context, sb *sandbox.Sandbox, pkg strin
 	}, nil
 }
 
-func installAndCollect(ctx context.Context, sb *sandbox.Sandbox, pkg string, p probe.Probe) ([]types.SyscallEvent, error) {
-	fmt.Fprintf(os.Stderr, "[*] Installing %s in sandbox...\n", pkg)
+func installAndCollect(ctx context.Context, sb *sandbox.Sandbox, _ string, p probe.Probe) ([]types.SyscallEvent, error) {
+	phaseInfo("install", "running pip/npm in sandbox")
 
 	installOut, err := sb.InstallPackage(ctx)
 	if err != nil {
@@ -1035,7 +1065,7 @@ func outputReport(pkg string, result *scanResult) error {
 
 	summary := analyzer.GenerateSummary(verdict, filtered)
 	r := report.Generate(pkg, flagVersion, flagEcosystem, verdict, result.method, filtered, result.lostSamples, result.dropped, summary)
-	printVerdict(verdict, len(filtered), result.lostSamples, result.dropped)
+	renderVerdictBlock(os.Stderr, verdict, pkg, flagVersion, len(filtered), summary, result.lostSamples, result.dropped)
 
 	w, err := openOutput()
 	if err != nil {
@@ -1052,24 +1082,17 @@ func outputReport(pkg string, result *scanResult) error {
 
 	switch verdict {
 	case types.VerdictSuspicious:
-		return &VerdictError{Verdict: verdict, ExitCode: exitCodeSuspicious}
+		var cats []string
+		if summary != nil {
+			cats = summary.Categories
+		}
+		return &VerdictError{Verdict: verdict, ExitCode: exitCodeSuspicious, Categories: cats}
 	case types.VerdictInconclusive:
 		// Treat inconclusive as failure — lost events may hide real attacks.
 		// CI pipelines should block on this just like suspicious.
 		return &VerdictError{Verdict: verdict, ExitCode: exitCodeSuspicious}
 	default:
 		return nil
-	}
-}
-
-func printVerdict(verdict string, eventCount int, lostSamples, dropped uint64) {
-	switch verdict {
-	case types.VerdictSuspicious:
-		fmt.Fprintf(os.Stderr, "[!] SUSPICIOUS: %d suspicious event(s) detected\n", eventCount)
-	case types.VerdictInconclusive:
-		fmt.Fprintf(os.Stderr, "[!] INCONCLUSIVE: %d kernel sample(s) lost, %d event(s) dropped — probe buffer overflow, possible evasion attempt. Treating as failure.\n", lostSamples, dropped)
-	default:
-		fmt.Fprintf(os.Stderr, "[+] CLEAN: No suspicious activity detected\n")
 	}
 }
 
