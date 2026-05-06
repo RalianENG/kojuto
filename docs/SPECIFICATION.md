@@ -71,7 +71,7 @@ Audit hook output is multiplexed with strace output on stderr using a `KOJUTO:` 
 
 Two complementary detection strategies:
 
-1. **Sensitive path matching** (any access mode): ~50 path patterns including SSH/GPG keys, cloud credentials (AWS/Azure/GCP/OCI/Aliyun), crypto wallets (Bitcoin/Ethereum/Solana/Monero/Electrum/Exodus/Atomic), browser data (Chrome/Firefox/Brave/Opera/Vivaldi/Edge + extension Local Storage/IndexedDB), shell startup files, desktop keyrings, application tokens, and sandbox detection paths (`/proc/self/status`, `/proc/self/mountinfo`, `/sys/class/net`). `/proc/self/maps` and `/proc/self/cgroup` are deliberately omitted from defaults — V8/Node startup, glibc, and Python's runpy read them on every launch — opt in via config include only if the extra signal is worth the per-scan noise.
+1. **Sensitive path matching** (any access mode): ~60 path patterns including SSH/GPG keys, cloud credentials (AWS/Azure/GCP/OCI/Aliyun), crypto wallets (Bitcoin/Ethereum/Solana/Monero/Electrum/Exodus/Atomic), browser data (Chrome/Firefox/Brave/Opera/Vivaldi/Edge + extension Local Storage/IndexedDB), shell startup files, desktop keyrings, application tokens, and sandbox detection paths (`/proc/self/status`, `/proc/self/mountinfo`, `/sys/class/net`). `/proc/self/maps` and `/proc/self/cgroup` are deliberately omitted from defaults — V8/Node startup, glibc, and Python's runpy read them on every launch — opt in via config include only if the extra signal is worth the per-scan noise.
 2. **Home directory write detection** (whitelist-based): ANY write (`O_WRONLY`/`O_RDWR`/`O_CREAT`) to `/home/` or `/root/` is flagged — pip/npm only write to site-packages, `/usr/local/bin`, `/tmp`, and `/install`. This catches systemd persistence, LaunchAgent injection, and unknown attack paths without maintaining a blacklist
 3. **System binary write detection**: writes to known system binaries (`python3`, `node`, `pip`, `sh`, etc.) in `/usr/local/bin/` or `/usr/bin/` are classified as `binary_hijacking` — prevents benignPaths bypass where an attacker overwrites a trusted binary on a writable tmpfs mount
 4. **Sandbox detection classification**: reads to `/proc/self/status`, `/proc/self/mountinfo`, `/proc/<pid>/comm`, and `/sys/class/net` are classified as `evasion` (not `credential_access`) to indicate environment probing. If `/proc/self/maps` or `/proc/self/cgroup` are added back via custom config include, they are also classified as `evasion`.
@@ -108,7 +108,7 @@ CLI (cobra)
   ├─ Downloader       Package download (pip / npm)
   │
   ├─ Sandbox          Docker container isolation
-  │   ├─ Isolated bridge network (internal, no external gateway)
+  │   ├─ --network=none (zero network connectivity, no embedded DNS resolver)
   │   ├─ Read-only rootfs + targeted tmpfs mounts
   │   ├─ cap-drop=ALL + custom seccomp profile
   │   ├─ no-new-privileges
@@ -176,7 +176,7 @@ CLI (cobra)
 
 | Setting | Value | Purpose |
 |---|---|---|
-| Network | Isolated internal bridge | Block external traffic + anti-fingerprint |
+| Network | `--network=none` | Zero network connectivity (no bridge, no embedded DNS resolver attack surface) |
 | Filesystem | `--read-only` + tmpfs | Restrict writes |
 | Capabilities | `--cap-drop=ALL` | Minimize privileges |
 | seccomp | Custom profile (always applied) | Block `mount`, `unshare`, `setns`, `bpf`, `memfd_create`, `prctl(PR_SET_NAME)`, etc. |
@@ -192,7 +192,8 @@ CLI (cobra)
 | Username | Host's actual username reflected in mount path |
 | CPU / Memory | Host's actual values mirrored (with caps) |
 | `/.dockerenv` | Removed on startup |
-| Network | Internal bridge makes `/proc/net/tcp` non-empty, `connect()` returns `ETIMEDOUT` |
+| `/etc/resolv.conf` | Injected via `--dns=198.51.100.1` (RFC 5737 TEST-NET-2, guaranteed unreachable) so the file is non-empty without revealing isolation |
+| Network | `--network=none` returns `ENETUNREACH` on `connect()`; combine with `--runtime runsc` to mask remaining `/proc/1/cgroup` and `/proc/self/mountinfo` signals |
 | Mount path | `/home/<host-user>/projects` (resembles host layout) |
 
 ### Container Runtime
@@ -218,16 +219,19 @@ CLI (cobra)
 
 The `testdata/` directory contains attack simulation packages for detection validation:
 
-- `axios-demo/` — Simulates the axios/plain-crypto-js supply chain attack (March 2026)
-  - postinstall hook executing `setup.js`
-  - C2 connection to `142.11.206.73:8000`
-  - Credential file enumeration (`.ssh/`, `.aws/`, `.git-credentials`, `.netrc`, `.config/gh/`)
-  - Stage 2 payload drop and execution (`/tmp/ld.py`)
-  - Self-deletion (anti-forensics)
+- `probe-alpha-0.1.0/` (PyPI sdist) — multi-vector TTP coverage map covering install-phase (`setup.py` + `payload.py`) and import-phase (`__init__.py`) detections: DNS exfil services, C2 connect, stage-2 drop+exec, bind/listen backdoor, ptrace evasion, ~14 wallet/credential reads, DNS tunneling, and create→exec→delete anti-forensics. See [`testdata/probe-alpha-0.1.0/DETECTION_MAP.md`](../testdata/probe-alpha-0.1.0/DETECTION_MAP.md).
+- `probe-npm-0.1.0/` (npm tarball) — equivalent coverage on the Node.js side (preinstall/postinstall lifecycle hooks + require-time payload, audit-hook eval/Function/vm validation).
+- `evasion-test-0.1.0/` — sandbox-detection and audit-hook-bypass attempts; verifies that `[DETECT]` cases are flagged and `[BYPASS]` cases are documented gaps.
 
-Usage: `kojuto scan --local testdata/axios-attack-demo-1.14.1.tgz -e npm`
+Usage:
 
-Expected result: `suspicious` with ~10 events (connect, openat, execve).
+```bash
+kojuto scan --local testdata/probe-alpha-0.1.0/
+kojuto scan --local testdata/probe-npm-0.1.0/  -e npm
+kojuto scan --local testdata/evasion-test-0.1.0/
+```
+
+Expected result for `probe-alpha`: `suspicious` covering ~10 categories across install + 3 OS-identity import phases.
 
 ---
 

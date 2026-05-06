@@ -17,7 +17,7 @@ An EDR for package installations — monitors syscalls during install and import
 
 1. **Download** — Fetch the target package to the host (network allowed)
 2. **Isolate** — Run installation inside a hardened Docker container with network isolation
-3. **Install + Monitor** — Record `connect`, `sendto`, `sendmsg`, `sendmmsg`, `bind`, `listen`, `accept`, `execve`, `openat`, `rename`, `sendfile`, `ptrace`, `mmap`, `mprotect`, and `unlink` syscalls via strace (or eBPF). Audit hooks intercept `eval`/`exec`/`compile` (Python PEP 578) and `eval`/`Function`/`vm` (Node.js `--require`) for dynamic code execution detection
+3. **Install + Monitor** — Record `connect`, `sendto`, `sendmsg`, `sendmmsg`, `bind`, `listen`, `accept`/`accept4`, `execve`, `openat`, `rename`/`renameat`/`renameat2`, `sendfile`, `ptrace`, `mmap`, `mprotect`, and `unlink`/`unlinkat` syscalls via strace (or eBPF). Audit hooks intercept `compile`/`exec`/`import` (Python PEP 578) and `eval`/`Function`/`vm` (Node.js `--require`) for dynamic code execution detection
 4. **Import + Monitor** — Import/require the package under 3 simulated OS identities (Linux, Windows, macOS) with time shifted +30–180 days (randomized) via `libfaketime` to trigger platform-gated and date-gated payloads
 5. **Report** — Output findings as JSON
 
@@ -28,7 +28,7 @@ The sandbox is intentionally seeded with realistic artifacts to provoke maliciou
 
 All values are randomly generated per scan to prevent signature-based evasion and ensure unique execution environments.
 
-`openat` detects credential access (`.ssh/`, `.gnupg/`, `.aws/`, `/etc/shadow`, `/proc/self/environ`, `.netrc`, `.git-credentials`, `.docker/config.json`, `.config/gh/`), `rename` detects trusted binary replacement, `bind`/`listen`/`accept` detect backdoor server setup, and DNS tunneling detection extracts query domains from `sendto` payloads to flag high-entropy subdomains used for data exfiltration. `ptrace(PTRACE_TRACEME)` detects anti-debugging evasion where malware checks if it is being traced. `sendfile` is traced for forensic purposes but not parsed into structured events.
+`openat` detects credential access across ~60 sensitive path patterns (SSH/GPG, cloud credentials, crypto wallets, browser data, shell startup files, application tokens — fully customizable via `kojuto.yml`), `rename` detects trusted binary replacement, `bind`/`listen`/`accept` detect backdoor server setup, and DNS tunneling detection extracts query domains from `sendto` payloads to flag high-entropy subdomains used for data exfiltration. `ptrace(PTRACE_TRACEME)` detects anti-debugging evasion where malware checks if it is being traced. `sendfile` is traced for forensic purposes but not parsed into structured events.
 
 Well-behaved packages typically do not make unexpected network connections, spawn unrelated processes, access credential files, or modify trusted binaries during install or import. Any such activity is treated as suspicious and surfaced for review.
 
