@@ -4,6 +4,7 @@ import (
 	"math"
 	"net"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -138,13 +139,79 @@ func GenerateSummary(verdict string, events []types.SyscallEvent) *types.ReportS
 	risk := assessRisk(categories)
 	desc := buildDescription(events, categories)
 	remediation := buildRemediation(categories)
+	breakdown := buildBreakdown(events)
 
 	return &types.ReportSummary{
 		RiskLevel:   risk,
 		Categories:  categories,
+		Breakdown:   breakdown,
 		Description: desc,
 		Remediation: remediation,
 	}
+}
+
+// categoryShortDesc returns a terse phrase suitable for a single
+// table row in the CLI verdict breakdown. Distinct from
+// buildDescription() which assembles a full grammatical sentence.
+func categoryShortDesc(c string) string {
+	switch c {
+	case types.CategoryC2:
+		return "outbound to non-loopback addresses"
+	case types.CategoryDataExfil:
+		return "DNS to known exfil services (Discord/Telegram/Pastebin)"
+	case types.CategoryCredentialAccess:
+		return "~/.ssh, ~/.aws, ~/.git-credentials, etc."
+	case types.CategoryCodeExecution:
+		return "execve from /tmp or inline -c/-e"
+	case types.CategoryBinaryHijack:
+		return "rename onto trusted system binary"
+	case types.CategoryBackdoor:
+		return "bind/listen/accept during install"
+	case types.CategoryPersistence:
+		return ".bashrc / shell startup / home directory write"
+	case types.CategoryDNSTunnel:
+		return "high-entropy subdomains, DoH connect"
+	case types.CategoryEvasion:
+		return "ptrace self-check, sandbox detection"
+	case types.CategoryMemExec:
+		return "shellcode injection (mmap+mprotect RWX)"
+	case types.CategoryAntiForensics:
+		return "create-execute-delete chain"
+	case types.CategoryDynamicExec:
+		return "eval / Function() / vm.runIn*Context (audit hook)"
+	}
+	return c
+}
+
+// buildBreakdown counts events per category and returns the result
+// sorted by count descending (ties broken alphabetically by category
+// name for deterministic output).
+func buildBreakdown(events []types.SyscallEvent) []types.CategoryHit {
+	counts := make(map[string]int)
+	for i := range events {
+		if events[i].Category == "" {
+			continue
+		}
+		counts[events[i].Category]++
+	}
+	if len(counts) == 0 {
+		return nil
+	}
+	hits := make([]types.CategoryHit, 0, len(counts))
+	for cat, n := range counts {
+		hits = append(hits, types.CategoryHit{
+			Category:    cat,
+			Count:       n,
+			Description: categoryShortDesc(cat),
+		})
+	}
+	sort.Slice(hits, func(i, j int) bool {
+		if hits[i].Count != hits[j].Count {
+			return hits[i].Count > hits[j].Count
+		}
+		return hits[i].Category < hits[j].Category
+	})
+	return hits
 }
 
 func assessRisk(categories []string) string {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -292,14 +293,29 @@ func TestVersionCmd(t *testing.T) {
 	}
 }
 
-func TestPrintVerdict(_ *testing.T) {
-	// Just ensure printVerdict doesn't panic for each verdict type.
-	// Output goes to stderr which we don't capture, but no panic = pass.
-	printVerdict(types.VerdictClean, 0, 0, 0)
-	printVerdict(types.VerdictSuspicious, 3, 0, 0)
-	printVerdict(types.VerdictInconclusive, 0, 5, 0)
-	printVerdict(types.VerdictInconclusive, 0, 0, 12)
-	printVerdict(types.VerdictInconclusive, 0, 5, 12)
+func TestRenderVerdictBlock(_ *testing.T) {
+	// Smoke test for each verdict + edge case. Output is discarded — we
+	// just want to confirm no panic when summary is nil, breakdown is
+	// empty, or both lostSamples/dropped are zero/non-zero.
+	w := io.Discard
+	renderVerdictBlock(w, types.VerdictClean, "pkg", "1.0", 0, &types.ReportSummary{
+		RiskLevel:   "none",
+		Description: "No suspicious activity detected.",
+	}, 0, 0)
+	renderVerdictBlock(w, types.VerdictSuspicious, "pkg", "1.0", 3, &types.ReportSummary{
+		RiskLevel:   "high",
+		Categories:  []string{types.CategoryC2},
+		Breakdown:   []types.CategoryHit{{Category: types.CategoryC2, Count: 3, Description: "outbound"}},
+		Description: "outbound connection.",
+		Remediation: "Do NOT install.",
+	}, 0, 0)
+	renderVerdictBlock(w, types.VerdictInconclusive, "pkg", "1.0", 0, &types.ReportSummary{
+		Description: "Probe data was lost.",
+		Remediation: "Re-run with --probe-method strace-container.",
+	}, 5, 0)
+	renderVerdictBlock(w, types.VerdictInconclusive, "pkg", "", 0, nil, 0, 12)
+	renderVerdictBlock(w, types.VerdictInconclusive, "pkg", "1.0", 0, nil, 5, 12)
+	renderVerdictBlock(w, types.VerdictSuspicious, "pkg", "1.0", 1, nil, 0, 0)
 }
 
 func TestOpenOutput_Stdout(t *testing.T) {
