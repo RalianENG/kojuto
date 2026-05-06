@@ -83,15 +83,21 @@ func TestInstallCommand_Npm(t *testing.T) {
 	sb := New("/mnt/packages", "lodash", false, types.EcosystemNpm, "")
 
 	cmd := sb.InstallCommand()
-	if len(cmd) == 0 {
-		t.Fatal("InstallCommand returned empty")
+	if len(cmd) != 3 || cmd[0] != "sh" || cmd[1] != "-c" {
+		t.Fatalf("InstallCommand = %v, want [sh -c <script>]", cmd)
 	}
 
-	if cmd[0] != "npm" {
-		t.Errorf("expected npm, got %s", cmd[0])
+	// The script must exercise all three lifecycle hooks. `npm rebuild`
+	// (the previous approach) skipped preinstall and postinstall, which
+	// is precisely where most npm supply chain payloads live.
+	for _, hook := range []string{"preinstall", "install", "postinstall"} {
+		if !strings.Contains(cmd[2], hook) {
+			t.Errorf("script missing %q hook invocation:\n%s", hook, cmd[2])
+		}
 	}
-	if cmd[1] != "rebuild" {
-		t.Errorf("expected rebuild, got %s", cmd[1])
+	// No-pkg form must walk node_modules to fire every top-level dep.
+	if !strings.Contains(cmd[2], "/install/node_modules") {
+		t.Errorf("script must reference /install/node_modules, got:\n%s", cmd[2])
 	}
 }
 
@@ -317,21 +323,33 @@ func TestInstallAllCommand_Npm(t *testing.T) {
 	pkgs := []string{"lodash", "express"}
 	cmd := sb.InstallAllCommand(pkgs)
 
-	if len(cmd) == 0 {
-		t.Fatal("InstallAllCommand returned empty")
+	if len(cmd) != 3 || cmd[0] != "sh" || cmd[1] != "-c" {
+		t.Fatalf("InstallAllCommand = %v, want [sh -c <script>]", cmd)
 	}
-	if cmd[0] != "npm" {
-		t.Errorf("expected npm, got %s", cmd[0])
-	}
-	if cmd[1] != "rebuild" {
-		t.Errorf("expected rebuild, got %s", cmd[1])
-	}
-	// Last 2 args should be package names.
-	tail := cmd[len(cmd)-2:]
-	for i, want := range pkgs {
-		if tail[i] != want {
-			t.Errorf("arg[%d] = %q, want %q", i, tail[i], want)
+	// All three lifecycle hooks must be invoked.
+	for _, hook := range []string{"preinstall", "install", "postinstall"} {
+		if !strings.Contains(cmd[2], hook) {
+			t.Errorf("script missing %q hook invocation:\n%s", hook, cmd[2])
 		}
+	}
+	// Each named package must appear under /install/node_modules.
+	for _, p := range pkgs {
+		want := "/install/node_modules/" + p
+		if !strings.Contains(cmd[2], want) {
+			t.Errorf("script missing path %q:\n%s", want, cmd[2])
+		}
+	}
+}
+
+func TestNpmLifecycleScript_ScopedPackage(t *testing.T) {
+	// Scoped packages live at /install/node_modules/@scope/name; the
+	// script must quote the path so the @ character does not break the
+	// shell command. Regression guard for a bug that would have hidden
+	// scoped-dep lifecycle behavior from strace.
+	got := npmLifecycleScript([]string{"@scope/lib"})
+	want := `"/install/node_modules/@scope/lib"`
+	if !strings.Contains(got, want) {
+		t.Errorf("scoped path missing %q in:\n%s", want, got)
 	}
 }
 

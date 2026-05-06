@@ -36,20 +36,28 @@ func (c *ContainerStrace) Start(_ uint32) error {
 
 // StartAndInstall runs strace wrapping pip install inside the container.
 // It blocks until installation completes, populating the events channel.
+//
+// On every error path the events channel is closed before returning so
+// callers can safely `for evt := range c.Events()` to drain — without
+// this, a fail-fast error (e.g. ctx already canceled before cmd.Start)
+// would leave the channel open and hang the caller.
 func (c *ContainerStrace) StartAndInstall(ctx context.Context, containerID string, installCmd []string) ([]byte, error) {
 	cmd := c.buildCommand(ctx, containerID, installCmd)
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
+		close(c.events)
 		return nil, fmt.Errorf("strace stderr pipe: %w", err)
 	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		close(c.events)
 		return nil, fmt.Errorf("pip stdout pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
+		close(c.events)
 		return nil, fmt.Errorf("starting strace in container: %w", err)
 	}
 

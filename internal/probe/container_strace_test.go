@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/RalianENG/kojuto/internal/types"
 )
@@ -60,6 +61,41 @@ func TestContainerStrace_Dropped(t *testing.T) {
 	cs.dropped = 42
 	if got := cs.Dropped(); got != 42 {
 		t.Errorf("Dropped() after increment = %d, want 42", got)
+	}
+}
+
+// TestContainerStrace_StartAndInstall_CtxAlreadyDeadlined pins the
+// fast-path channel-close behavior. When ctx is already canceled before
+// cmd.Start runs (which the runProbeAndInstall import loop hits if the
+// install phase consumed the whole timeout budget), the events channel
+// must still be closed so the caller's `for evt := range ip.Events()`
+// drain loop returns. The previous code only closed on the success
+// path, hanging the scanner indefinitely under tight timeouts.
+func TestContainerStrace_StartAndInstall_CtxAlreadyDeadlined(t *testing.T) {
+	cs := NewContainerStrace()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Force cmd.Start to fail with "context canceled".
+
+	_, err := cs.StartAndInstall(ctx, "fake-container-id", []string{"true"})
+	if err == nil {
+		t.Fatal("expected error from canceled ctx, got nil")
+	}
+
+	// The drain loop must NOT block. If the channel is still open, this
+	// hangs and the test times out — which is exactly the bug we're
+	// regression-guarding against.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range cs.Events() {
+		}
+	}()
+	select {
+	case <-done:
+		// pass — channel was closed, range terminated
+	case <-time.After(2 * time.Second):
+		t.Fatal("Events() channel still open after StartAndInstall error — drain loop would hang the scanner")
 	}
 }
 

@@ -586,12 +586,13 @@ func (s *Sandbox) InstallPackage(ctx context.Context) ([]byte, error) {
 func (s *Sandbox) InstallCommand() []string {
 	if s.ecosystem == types.EcosystemNpm {
 		// The host has already resolved deps into node_modules (with
-		// --ignore-scripts). restoreLocalBin copied them to /install (writable).
-		// npm rebuild executes lifecycle scripts under strace monitoring.
-		return []string{
-			"npm", "rebuild",
-			"--prefix=/install",
-		}
+		// --ignore-scripts). Inside the sandbox we fire each package's
+		// preinstall + install + postinstall hooks under strace.
+		// `npm rebuild` (the previous approach) only runs the `install`
+		// script and rebuilds native modules — it skips preinstall and
+		// postinstall, which is exactly where most npm supply chain
+		// attacks place their payload (axios, crypto-js, Shai-Hulud).
+		return []string{"sh", "-c", npmLifecycleScript(nil)}
 	}
 
 	// Local mode: install directly from the file in the mount point.
@@ -621,11 +622,10 @@ func (s *Sandbox) InstallCommand() []string {
 // All wheels must already be in the mount point directory.
 func (s *Sandbox) InstallAllCommand(pkgs []string) []string {
 	if s.ecosystem == types.EcosystemNpm {
-		// Rebuild only the target packages (not all transitive deps).
-		// Transitive deps without lifecycle scripts are covered by
-		// the import phase which loads them via require().
-		cmd := []string{"npm", "rebuild", "--prefix=/install"}
-		return append(cmd, pkgs...)
+		// Fire lifecycle scripts only for the target packages (not all
+		// transitive deps). Transitive deps without lifecycle scripts
+		// are covered by the import phase which loads them via require().
+		return []string{"sh", "-c", npmLifecycleScript(pkgs)}
 	}
 
 	cmd := []string{
@@ -635,6 +635,54 @@ func (s *Sandbox) InstallAllCommand(pkgs []string) []string {
 		"--",
 	}
 	return append(cmd, pkgs...)
+}
+
+// npmLifecycleScript builds a /bin/sh script that fires preinstall +
+// install + postinstall hooks for each target package directory under
+// /install/node_modules. When pkgs is nil, every package directory at
+// the top tier of node_modules is exercised (handles both bare names
+// and scoped @scope/name layouts via find at depth 2-3).
+//
+// `npm run --silent --if-present <hook>` is used so that:
+//   - missing hooks are no-ops (no need to inspect each package.json),
+//   - npm's own status output stays out of the strace stream.
+//
+// Each package runs in its own subshell with `;` between hooks so a
+// single failing script does not abort the whole sweep — partial
+// progress is what we want for a forensic capture.
+func npmLifecycleScript(pkgs []string) string {
+	const hooks = `npm run --silent --if-present preinstall; ` +
+		`npm run --silent --if-present install; ` +
+		`npm run --silent --if-present postinstall`
+
+	if len(pkgs) == 0 {
+		// mindepth 2 catches /install/node_modules/<pkg>/package.json,
+		// maxdepth 3 also catches /install/node_modules/@scope/<pkg>/package.json
+		// while excluding nested transitive node_modules.
+		//
+		// `find ... | while read` instead of `find -print0 | read -d ""`
+		// because the sandbox's /bin/sh is dash, which silently rejects
+		// the bash-only `-d` flag and produces an empty event stream.
+		// Newlines in node_modules paths are not realistic.
+		return `find /install/node_modules -mindepth 2 -maxdepth 3 -name package.json -type f ` +
+			`| while IFS= read -r pj; do ` +
+			`(cd "$(dirname "$pj")" && ` + hooks + `) 2>&1; done`
+	}
+
+	var b strings.Builder
+	for i, p := range pkgs {
+		if i > 0 {
+			b.WriteString("; ")
+		}
+		// Quote the path so scoped packages like @scope/pkg work
+		// without word-splitting.
+		b.WriteString(`(cd "/install/node_modules/`)
+		b.WriteString(p)
+		b.WriteString(`" && `)
+		b.WriteString(hooks)
+		b.WriteString(`) 2>&1`)
+	}
+	return b.String()
 }
 
 // WriteProbeScriptsMulti writes one combined import probe script per OS identity.

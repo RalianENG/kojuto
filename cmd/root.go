@@ -663,7 +663,7 @@ func runLocalScan(_ []string) error {
 	flagVersion = downloaderDetectVersion(dlDir, pkg)
 
 	// For npm local packages, we need to create a node_modules structure
-	// from the .tgz so the sandbox can run npm rebuild with lifecycle scripts.
+	// from the .tgz so the sandbox can run npm install with lifecycle scripts.
 	if ecosystem == types.EcosystemNpm {
 		npmDir, npmErr := prepareLocalNpm(dlDir, pkg)
 		if npmErr != nil {
@@ -746,11 +746,20 @@ func detectPackageName(filename string) string {
 // prepareLocalNpm creates a staging directory with node_modules from
 // a local .tgz file. This mirrors what downloadNpm does for registry
 // packages: npm install --ignore-scripts on the host, then the sandbox
-// runs npm rebuild to execute lifecycle scripts under strace.
+// fires lifecycle scripts under strace.
 func prepareLocalNpm(sourceDir, pkg string) (string, error) {
 	stagingDir, err := os.MkdirTemp("", "kojuto-local-npm-*")
 	if err != nil {
 		return "", fmt.Errorf("creating npm staging dir: %w", err)
+	}
+	// MkdirTemp creates with 0o700 — the sandbox container's `dev` user
+	// (UID 1000) is not the host UID, so without world-execute on this
+	// directory the in-container user cannot traverse the bind-mounted
+	// node_modules tree. find returns nothing, the lifecycle hooks never
+	// fire, and the scan silently misses every install-time payload.
+	// Mirrors the explicit 0o755 used in runLocalScan's PyPI path.
+	if chmodErr := os.Chmod(stagingDir, 0o755); chmodErr != nil {
+		return "", fmt.Errorf("relaxing staging dir perms: %w", chmodErr)
 	}
 
 	// Find .tgz in source directory.
