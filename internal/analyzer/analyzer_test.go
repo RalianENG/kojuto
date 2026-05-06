@@ -1138,3 +1138,97 @@ func TestAnalyze_DynamicExecNotFiltered(t *testing.T) {
 		t.Errorf("category = %q, want %q", filtered[0].Category, types.CategoryDynamicExec)
 	}
 }
+
+func TestBuildBreakdown_OrderAndContent(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Category: types.CategoryC2},
+		{Category: types.CategoryC2},
+		{Category: types.CategoryMemExec},
+		{Category: types.CategoryMemExec},
+		{Category: types.CategoryMemExec},
+		{Category: types.CategoryEvasion},
+		{Category: ""}, // ignored
+	}
+	got := buildBreakdown(events)
+
+	if len(got) != 3 {
+		t.Fatalf("expected 3 categories, got %d: %+v", len(got), got)
+	}
+
+	// Sorted by count desc, then alphabetical: memory_execution(3) > c2_communication(2) > evasion(1).
+	if got[0].Category != types.CategoryMemExec || got[0].Count != 3 {
+		t.Errorf("first hit = %+v, want memory_execution=3", got[0])
+	}
+	if got[1].Category != types.CategoryC2 || got[1].Count != 2 {
+		t.Errorf("second hit = %+v, want c2_communication=2", got[1])
+	}
+	if got[2].Category != types.CategoryEvasion || got[2].Count != 1 {
+		t.Errorf("third hit = %+v, want evasion=1", got[2])
+	}
+
+	// Each hit should carry a non-empty short description for the CLI.
+	for _, h := range got {
+		if h.Description == "" {
+			t.Errorf("category %s missing short description", h.Category)
+		}
+	}
+}
+
+func TestBuildBreakdown_TieBreakerAlphabetical(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Category: types.CategoryEvasion},
+		{Category: types.CategoryC2},
+	}
+	got := buildBreakdown(events)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 categories, got %d", len(got))
+	}
+	// Equal counts (1 each) — tie broken alphabetically: c2 < evasion.
+	if got[0].Category != types.CategoryC2 {
+		t.Errorf("first should be c2_communication on alphabetical tie, got %s", got[0].Category)
+	}
+}
+
+func TestBuildBreakdown_NoEvents(t *testing.T) {
+	if got := buildBreakdown(nil); got != nil {
+		t.Errorf("nil events should produce nil breakdown, got %+v", got)
+	}
+	if got := buildBreakdown([]types.SyscallEvent{{Category: ""}}); got != nil {
+		t.Errorf("category-less events should produce nil breakdown, got %+v", got)
+	}
+}
+
+func TestCategoryShortDesc(t *testing.T) {
+	// Every Category constant in types.go should have a short desc.
+	cats := []string{
+		types.CategoryC2, types.CategoryDataExfil, types.CategoryCredentialAccess,
+		types.CategoryCodeExecution, types.CategoryBinaryHijack, types.CategoryBackdoor,
+		types.CategoryPersistence, types.CategoryDNSTunnel, types.CategoryEvasion,
+		types.CategoryMemExec, types.CategoryAntiForensics, types.CategoryDynamicExec,
+	}
+	for _, c := range cats {
+		if got := categoryShortDesc(c); got == "" || got == c {
+			t.Errorf("category %s lacks a distinct short description (got %q)", c, got)
+		}
+	}
+}
+
+func TestGenerateSummary_PopulatesBreakdown(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Category: types.CategoryC2, Comm: "evil", DstAddr: "1.1.1.1", DstPort: 443, Syscall: types.EventConnect},
+		{Category: types.CategoryC2, Comm: "evil", DstAddr: "1.1.1.1", DstPort: 443, Syscall: types.EventConnect},
+		{Category: types.CategoryMemExec, Syscall: types.EventMmap},
+	}
+	summary := GenerateSummary(types.VerdictSuspicious, events)
+	if summary == nil {
+		t.Fatal("GenerateSummary returned nil")
+	}
+	if len(summary.Breakdown) != 2 {
+		t.Errorf("breakdown length = %d, want 2", len(summary.Breakdown))
+	}
+	// Breakdown should NOT replace Description — both must be present
+	// for back-compat with JSON consumers.
+	if summary.Description == "" {
+		t.Error("Description must remain populated for back-compat")
+	}
+}

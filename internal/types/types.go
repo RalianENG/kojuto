@@ -77,10 +77,22 @@ type StaticFinding struct {
 
 // ReportSummary provides a human-readable overview of the scan findings.
 type ReportSummary struct {
-	RiskLevel   string   `json:"risk_level"`
-	Categories  []string `json:"categories,omitempty"`
-	Description string   `json:"description"`
-	Remediation string   `json:"remediation,omitempty"`
+	RiskLevel   string        `json:"risk_level"`
+	Categories  []string      `json:"categories,omitempty"`
+	Breakdown   []CategoryHit `json:"breakdown,omitempty"`
+	Description string        `json:"description"`
+	Remediation string        `json:"remediation,omitempty"`
+}
+
+// CategoryHit is a per-category aggregate used by the CLI verdict
+// renderer. Sorted by Count descending. Description is a short
+// one-line phrase distinct from ReportSummary.Description (which is a
+// full-sentence concatenation across all categories) so the CLI can
+// show the breakdown as a table without re-parsing the long string.
+type CategoryHit struct {
+	Category    string `json:"category"`
+	Count       int    `json:"count"`
+	Description string `json:"description"`
 }
 
 // Report is the final scan output.
