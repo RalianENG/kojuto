@@ -1,6 +1,8 @@
 package analyzer
 
 import (
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -1230,5 +1232,70 @@ func TestGenerateSummary_PopulatesBreakdown(t *testing.T) {
 	// for back-compat with JSON consumers.
 	if summary.Description == "" {
 		t.Error("Description must remain populated for back-compat")
+	}
+}
+
+// TestGenerateSummary_RemediationPriority verifies that when multiple
+// remediation tiers apply, the highest-severity message always wins —
+// regardless of map iteration order. The previous implementation walked
+// the categories slice and returned on first match, so the message text
+// flipped between runs.
+func TestGenerateSummary_RemediationPriority(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventConnect, DstAddr: "203.0.113.50", DstPort: 443, Category: types.CategoryC2},
+		{Syscall: types.EventOpenat, FilePath: "/home/dev/.ssh/id_rsa", Category: types.CategoryCredentialAccess},
+		{Syscall: types.EventOpenat, FilePath: "/home/dev/.bashrc", Category: types.CategoryPersistence},
+	}
+	const want = "audit the host for compromised credentials"
+
+	// Repeat to amortise Go's map iteration randomness — a single call
+	// could pass even when the priority logic is broken.
+	for i := 0; i < 50; i++ {
+		s := GenerateSummary(types.VerdictSuspicious, events)
+		if !strings.Contains(s.Remediation, want) {
+			t.Fatalf("iteration %d: expected high-severity remediation containing %q, got %q",
+				i, want, s.Remediation)
+		}
+	}
+}
+
+// TestGenerateSummary_DeterministicOrder verifies that Categories,
+// Description, and Remediation are stable across repeated calls with
+// identical input. Without the sort step in GenerateSummary, map
+// iteration order would scramble Categories and the joined Description
+// text run-to-run, polluting JSON diffs and demo recordings.
+func TestGenerateSummary_DeterministicOrder(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventOpenat, FilePath: "/home/dev/.bashrc", Category: types.CategoryPersistence},
+		{Syscall: types.EventConnect, DstAddr: "203.0.113.50", DstPort: 443, Category: types.CategoryC2},
+		{Syscall: types.EventOpenat, FilePath: "/home/dev/.ssh/id_rsa", Category: types.CategoryCredentialAccess},
+	}
+
+	wantCats := []string{
+		types.CategoryC2,
+		types.CategoryCredentialAccess,
+		types.CategoryPersistence,
+	}
+	sort.Strings(wantCats)
+
+	first := GenerateSummary(types.VerdictSuspicious, events)
+	if !reflect.DeepEqual(first.Categories, wantCats) {
+		t.Errorf("Categories = %v, want sorted %v", first.Categories, wantCats)
+	}
+
+	for i := 0; i < 50; i++ {
+		s := GenerateSummary(types.VerdictSuspicious, events)
+		if !reflect.DeepEqual(s.Categories, first.Categories) {
+			t.Fatalf("iteration %d: Categories changed from %v to %v",
+				i, first.Categories, s.Categories)
+		}
+		if s.Description != first.Description {
+			t.Fatalf("iteration %d: Description changed from %q to %q",
+				i, first.Description, s.Description)
+		}
+		if s.Remediation != first.Remediation {
+			t.Fatalf("iteration %d: Remediation changed from %q to %q",
+				i, first.Remediation, s.Remediation)
+		}
 	}
 }

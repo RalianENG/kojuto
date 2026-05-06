@@ -124,21 +124,26 @@ func GenerateSummary(verdict string, events []types.SyscallEvent) *types.ReportS
 		}
 	}
 
-	// Collect unique categories.
+	// Collect unique categories. Sorting here makes every downstream
+	// consumer (assessRisk, buildDescription, the report's JSON
+	// `categories` field) deterministic — Go map iteration is randomised,
+	// so without this the same event set could yield different summary
+	// text from one run to the next.
 	catSet := make(map[string]bool)
 	for i := range events {
 		if events[i].Category != "" {
 			catSet[events[i].Category] = true
 		}
 	}
-	var categories []string
+	categories := make([]string, 0, len(catSet))
 	for c := range catSet {
 		categories = append(categories, c)
 	}
+	sort.Strings(categories)
 
 	risk := assessRisk(categories)
 	desc := buildDescription(events, categories)
-	remediation := buildRemediation(categories)
+	remediation := buildRemediation(catSet)
 	breakdown := buildBreakdown(events)
 
 	return &types.ReportSummary{
@@ -263,19 +268,24 @@ func buildDescription(_ []types.SyscallEvent, categories []string) string {
 	return strings.Join(parts, "; ") + "."
 }
 
-func buildRemediation(categories []string) string {
-	for _, c := range categories {
-		switch c {
-		case types.CategoryC2, types.CategoryDataExfil, types.CategoryBackdoor, types.CategoryMemExec:
-			return "Do NOT install this package. Remove it from dependencies immediately. " +
-				"If previously installed, audit the host for compromised credentials and rotate secrets."
-		case types.CategoryCredentialAccess:
-			return "Do NOT install this package. If previously installed, rotate all credentials " +
-				"that were present on the machine (SSH keys, AWS tokens, Git credentials, etc.)."
-		case types.CategoryPersistence:
-			return "Do NOT install this package. If previously installed, inspect shell startup files " +
-				"(.bashrc, .zshrc, .profile) and crontab for injected malicious code."
-		}
+// buildRemediation picks the most severe remediation message that applies
+// to the detected categories. Tiers are checked in fixed order so the
+// output is deterministic regardless of map iteration; the previous
+// implementation walked categories sequentially and returned on first
+// match, which meant the message text could flip between runs.
+func buildRemediation(catSet map[string]bool) string {
+	if catSet[types.CategoryC2] || catSet[types.CategoryDataExfil] ||
+		catSet[types.CategoryBackdoor] || catSet[types.CategoryMemExec] {
+		return "Do NOT install this package. Remove it from dependencies immediately. " +
+			"If previously installed, audit the host for compromised credentials and rotate secrets."
+	}
+	if catSet[types.CategoryCredentialAccess] {
+		return "Do NOT install this package. If previously installed, rotate all credentials " +
+			"that were present on the machine (SSH keys, AWS tokens, Git credentials, etc.)."
+	}
+	if catSet[types.CategoryPersistence] {
+		return "Do NOT install this package. If previously installed, inspect shell startup files " +
+			"(.bashrc, .zshrc, .profile) and crontab for injected malicious code."
 	}
 	return "Do NOT install this package. Review the events list for details."
 }
