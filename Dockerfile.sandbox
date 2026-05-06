@@ -22,10 +22,18 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends strace libfaketime && \
     rm -rf /var/lib/apt/lists/*
 
-# Use pip/setuptools/wheel bundled in the base image as-is.
-# The base image is pinned by digest, so these versions are fully reproducible.
-# Do NOT add "pip install pip setuptools wheel" here — fetching from PyPI at
-# build time would reintroduce supply chain risk that the digest pin prevents.
+# Install setuptools + wheel so `pip install --no-build-isolation <sdist>`
+# can build wheels from setup.py / pyproject.toml. Modern python:3.12-*
+# images (slim and full alike) only ship pip — without these two, every
+# .tar.gz scan dies at the build_meta backend stage before kojuto can
+# observe the malicious setup.py.
+#
+# Pinned to specific versions AND SHA256 hashes via --require-hashes so
+# the supply chain risk is the same as the digest-pinned base image:
+# build only succeeds if PyPI returns these exact bytes.
+COPY internal/sandbox/build-deps.txt /tmp/build-deps.txt
+RUN pip install --no-deps --no-cache-dir --require-hashes -r /tmp/build-deps.txt && \
+    rm /tmp/build-deps.txt
 
 # Audit hooks: detect eval/exec/compile/Function/vm dynamic code execution.
 # Python: sitecustomize.py is auto-loaded by the interpreter on startup.

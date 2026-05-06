@@ -1,0 +1,15 @@
+# Build-time deps for the sandbox image. setuptools + wheel are required
+# so `pip install --no-build-isolation <sdist>` can compile wheels from
+# setup.py / pyproject.toml — pip itself ships with the python:3.12-slim
+# base, but those two are stripped from every modern Python image.
+#
+# Pinned to exact versions AND SHA256 hashes so the supply chain trust
+# is the same as the digest-pinned base image. Updating either pin
+# requires re-checking the hash:
+#
+#   pip download --no-deps --no-cache-dir -d /tmp/dl setuptools==<NEW> wheel==<NEW>
+#   sha256sum /tmp/dl/*.whl
+setuptools==78.1.1 \
+    --hash=sha256:c3a9c4211ff4c309edb8b8c4f1cbfa7ae324c4ba9f91ff254e3d305b9fd54561
+wheel==0.45.1 \
+    --hash=sha256:708e7481cc80179af0e556bbf0cc00b8444c7321e2700b8d8580231d13017248

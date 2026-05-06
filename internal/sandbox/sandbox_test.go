@@ -1,10 +1,38 @@
 package sandbox
 
 import (
+	"os"
 	"regexp"
 	"strings"
 	"testing"
 )
+
+// TestBuildDepsManifestIsHashPinned guards the supply chain story for
+// the sandbox image. The Dockerfile installs setuptools + wheel from
+// build-deps.txt with --require-hashes — without those two packages,
+// `pip install --no-build-isolation <sdist>` fails at the build_meta
+// backend stage and PyPI .tar.gz scans report empty events. The hash
+// pin keeps the trust boundary the same as the digest-pinned base
+// image: any update has to consciously refresh both version + sha256.
+func TestBuildDepsManifestIsHashPinned(t *testing.T) {
+	data, err := os.ReadFile("build-deps.txt")
+	if err != nil {
+		t.Fatalf("build-deps.txt missing — Dockerfile.sandbox depends on it: %v", err)
+	}
+	body := string(data)
+
+	for _, pkg := range []string{"setuptools==", "wheel=="} {
+		if !strings.Contains(body, pkg) {
+			t.Errorf("build-deps.txt must pin %s — without it the sandbox image cannot build sdists", pkg)
+		}
+	}
+
+	// At least two --hash entries (one per package). Catches accidental
+	// `pip install setuptools wheel` style edits that drop hash pinning.
+	if got := strings.Count(body, "--hash=sha256:"); got < 2 {
+		t.Errorf("build-deps.txt must include sha256 hashes for every pinned package, found %d", got)
+	}
+}
 
 func TestRandHex(t *testing.T) {
 	for _, n := range []int{8, 16, 36, 40, 64} {
