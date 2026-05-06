@@ -99,13 +99,20 @@ var (
 	// mmap(NULL, 4096, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f...
 	// Only match calls that include both PROT_WRITE and PROT_EXEC (RWX).
 	// Normal .so loading uses PROT_READ|PROT_EXEC (no WRITE).
-	// V8 JIT uses RW then mprotect to RX (W^X, never simultaneous RWX).
+	// V8 JIT classically uses W^X (RW then mprotect to RX), but recent
+	// Node/Bun/Deno builds — especially under containers without PKU/MTE
+	// — fall back to a code range that does emit simultaneous RWX,
+	// producing memory_execution false positives on every node-driven
+	// scan. See follow-up issue (interpreter-PID tracking) for the
+	// permanent fix; the current detection still catches ffi-napi /
+	// ctypes shellcode patterns that are the more common attack vector.
 	straceMmapRWXRe = regexp.MustCompile(
 		`mmap\([^,]*,\s*\d+,\s*(PROT_[A-Z_|]+PROT_WRITE[A-Z_|]*PROT_EXEC[A-Z_|]*|PROT_[A-Z_|]*PROT_EXEC[A-Z_|]*PROT_WRITE[A-Z_|]*),\s*([A-Z_|]+)`,
 	)
 
 	// mprotect(0x7f..., 4096, PROT_READ|PROT_WRITE|PROT_EXEC) = 0
-	// Changing memory permissions to include both WRITE and EXEC.
+	// Changing memory permissions to include both WRITE and EXEC. Same
+	// caveat as straceMmapRWXRe above re: V8 JIT noise.
 	straceMprotectRWXRe = regexp.MustCompile(
 		`mprotect\(0x[0-9a-f]+,\s*\d+,\s*(PROT_[A-Z_|]+PROT_WRITE[A-Z_|]*PROT_EXEC[A-Z_|]*|PROT_[A-Z_|]*PROT_EXEC[A-Z_|]*PROT_WRITE[A-Z_|]*)`,
 	)

@@ -20,9 +20,8 @@ func TestDefaultSensitivePaths(t *testing.T) {
 		"/.bitcoin/", "/.ethereum/", "/.solana/",
 		// Browser extensions
 		"/Local Storage/leveldb/", "/IndexedDB/",
-		// Sandbox detection paths
-		"/proc/self/maps", "/proc/self/status", "/proc/self/cgroup",
-		"/sys/class/net",
+		// Sandbox detection paths (intentionally narrow — see excluded list below)
+		"/proc/self/status", "/proc/self/mountinfo", "/sys/class/net",
 	}
 	for _, want := range required {
 		found := false
@@ -34,6 +33,22 @@ func TestDefaultSensitivePaths(t *testing.T) {
 		}
 		if !found {
 			t.Errorf("missing required path: %s", want)
+		}
+	}
+
+	// /proc/self/maps and /proc/self/cgroup are deliberately NOT in the
+	// defaults: V8/Node startup, glibc and Python's runpy read these on
+	// every process launch, so flagging them by default produced
+	// per-scan evasion noise that swamped real signal. Pin the absence
+	// so future "let's add these back to be safe" changes have to
+	// confront this test.
+	excluded := []string{"/proc/self/maps", "/proc/self/cgroup"}
+	for _, banned := range excluded {
+		for _, p := range paths {
+			if p == banned {
+				t.Errorf("default path %q must stay out of defaults — too noisy under interpreter startup; opt in via config include if needed",
+					banned)
+			}
 		}
 	}
 }
