@@ -88,7 +88,10 @@ func TestContainerStrace_StartAndInstall_CtxAlreadyDeadlined(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		for range cs.Events() {
+		for {
+			if _, ok := <-cs.Events(); !ok {
+				return
+			}
 		}
 	}()
 	select {

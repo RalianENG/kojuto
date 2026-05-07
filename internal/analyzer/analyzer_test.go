@@ -1248,9 +1248,9 @@ func TestGenerateSummary_RemediationPriority(t *testing.T) {
 	}
 	const want = "audit the host for compromised credentials"
 
-	// Repeat to amortise Go's map iteration randomness — a single call
+	// Repeat to amortize Go's map iteration randomness — a single call
 	// could pass even when the priority logic is broken.
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		s := GenerateSummary(types.VerdictSuspicious, events)
 		if !strings.Contains(s.Remediation, want) {
 			t.Fatalf("iteration %d: expected high-severity remediation containing %q, got %q",
@@ -1283,7 +1283,7 @@ func TestGenerateSummary_DeterministicOrder(t *testing.T) {
 		t.Errorf("Categories = %v, want sorted %v", first.Categories, wantCats)
 	}
 
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		s := GenerateSummary(types.VerdictSuspicious, events)
 		if !reflect.DeepEqual(s.Categories, first.Categories) {
 			t.Fatalf("iteration %d: Categories changed from %v to %v",

@@ -126,7 +126,7 @@ func GenerateSummary(verdict string, events []types.SyscallEvent) *types.ReportS
 
 	// Collect unique categories. Sorting here makes every downstream
 	// consumer (assessRisk, buildDescription, the report's JSON
-	// `categories` field) deterministic — Go map iteration is randomised,
+	// `categories` field) deterministic — Go map iteration is randomized,
 	// so without this the same event set could yield different summary
 	// text from one run to the next.
 	catSet := make(map[string]bool)
