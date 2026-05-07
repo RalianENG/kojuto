@@ -771,6 +771,36 @@ func TestIsBenignAuditEvent_KojutoProbeScript(t *testing.T) {
 	}
 }
 
+// "+" prefix is the wire marker emitted by sitecustomize.py when its
+// frame walk located a user-controlled origin (the scanned package, or
+// /tmp/install/home). Such events bypass the path-based benign list:
+// the originator IS the audited code, regardless of where it lives.
+func TestIsBenignAuditEvent_UserOriginMarker(t *testing.T) {
+	// Site-packages path looks benign on its face but the "+" marker
+	// says it's the scanned package — must report.
+	if isBenignAuditEvent("exec", "+/usr/local/lib/python3.12/site-packages/evil_pkg/__init__.py", "<code object>") {
+		t.Error("user-marked site-packages exec should be suspicious")
+	}
+	// Same path without the marker is benign (compat library doing
+	// its own internal exec).
+	if !isBenignAuditEvent("exec", "/usr/local/lib/python3.12/site-packages/six.py", "<code object>") {
+		t.Error("unmarked site-packages exec should be benign")
+	}
+}
+
+func TestParseAuditHook_StripsUserOriginMarker(t *testing.T) {
+	// The "+" prefix is wire-protocol detail; FilePath in the parsed
+	// event must not retain it.
+	line := "KOJUTO:exec:+/usr/local/lib/python3.12/site-packages/evil_pkg/__init__.py:<code object>"
+	evt, ok := parseAuditHook(line)
+	if !ok {
+		t.Fatal("expected audit hook parse to succeed")
+	}
+	if evt.FilePath != "/usr/local/lib/python3.12/site-packages/evil_pkg/__init__.py" {
+		t.Errorf("FilePath = %q, want path without leading '+'", evt.FilePath)
+	}
+}
+
 // ============================================================
 // System binary write tests
 // ============================================================

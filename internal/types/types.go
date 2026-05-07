@@ -61,6 +61,38 @@ const (
 	CategoryDynamicExec      = "dynamic_code_execution"
 )
 
+// Category severity tiers drive verdict assignment in analyzer.Analyze.
+// HIGH: a single event is enough to make the package SUSPICIOUS — these
+// patterns have no legitimate explanation during install/import.
+// MEDIUM: requires two or more events; isolated occurrences sometimes
+// happen in legitimate libraries (e.g. CDN entropy, debugger stubs).
+// LOW: never raises the verdict alone — too noisy in popular compat
+// libraries (six, attrs, dataclasses) that compile/exec their own
+// internal source. Still recorded in the report for forensics.
+const (
+	SeverityHigh   = "high"
+	SeverityMedium = "medium"
+	SeverityLow    = "low"
+)
+
+// CategorySeverity classifies each detection category. Categories not
+// in this map default to HIGH (fail-closed — better to flag a future
+// category we forgot to weight than silently swallow it).
+var CategorySeverity = map[string]string{
+	CategoryC2:               SeverityHigh,
+	CategoryDataExfil:        SeverityHigh,
+	CategoryCredentialAccess: SeverityHigh,
+	CategoryCodeExecution:    SeverityHigh,
+	CategoryBinaryHijack:     SeverityHigh,
+	CategoryBackdoor:         SeverityHigh,
+	CategoryPersistence:      SeverityHigh,
+	CategoryMemExec:          SeverityHigh,
+	CategoryAntiForensics:    SeverityHigh,
+	CategoryDNSTunnel:        SeverityMedium,
+	CategoryEvasion:          SeverityMedium,
+	CategoryDynamicExec:      SeverityLow,
+}
+
 // Scan phases.
 const (
 	PhaseInstall = "install"

@@ -55,11 +55,43 @@ func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
 		suspicious = append(suspicious, events[i])
 	}
 
-	if len(suspicious) > 0 {
-		return types.VerdictSuspicious, suspicious
+	if len(suspicious) == 0 {
+		return types.VerdictClean, nil
 	}
 
-	return types.VerdictClean, nil
+	// Severity-aware verdict. LOW-only event sets (e.g. dynamic_code_exec
+	// from `six`'s internal exec_) stay CLEAN — those patterns appear in
+	// legitimate compat libraries too often to single-handedly condemn a
+	// package. Events still flow into `suspicious` for forensic visibility
+	// in the report.
+	return decideVerdict(suspicious), suspicious
+}
+
+// decideVerdict applies the severity rules: any HIGH event → SUSPICIOUS;
+// two or more MEDIUM events → SUSPICIOUS; otherwise CLEAN. An unmapped
+// category is treated as HIGH so a newly added detector that someone
+// forgot to weight can still trigger the verdict.
+func decideVerdict(events []types.SyscallEvent) string {
+	var hi, med int
+	for i := range events {
+		if events[i].Category == "" {
+			continue
+		}
+		sev, known := types.CategorySeverity[events[i].Category]
+		if !known {
+			sev = types.SeverityHigh
+		}
+		switch sev {
+		case types.SeverityHigh:
+			hi++
+		case types.SeverityMedium:
+			med++
+		}
+		if hi >= 1 || med >= 2 {
+			return types.VerdictSuspicious
+		}
+	}
+	return types.VerdictClean
 }
 
 // collectExecutedPaths builds a set of file paths that appeared as the
@@ -124,21 +156,26 @@ func GenerateSummary(verdict string, events []types.SyscallEvent) *types.ReportS
 		}
 	}
 
-	// Collect unique categories.
+	// Collect unique categories. Sorting here makes every downstream
+	// consumer (assessRisk, buildDescription, the report's JSON
+	// `categories` field) deterministic — Go map iteration is randomized,
+	// so without this the same event set could yield different summary
+	// text from one run to the next.
 	catSet := make(map[string]bool)
 	for i := range events {
 		if events[i].Category != "" {
 			catSet[events[i].Category] = true
 		}
 	}
-	var categories []string
+	categories := make([]string, 0, len(catSet))
 	for c := range catSet {
 		categories = append(categories, c)
 	}
+	sort.Strings(categories)
 
 	risk := assessRisk(categories)
 	desc := buildDescription(events, categories)
-	remediation := buildRemediation(categories)
+	remediation := buildRemediation(catSet)
 	breakdown := buildBreakdown(events)
 
 	return &types.ReportSummary{
@@ -263,19 +300,24 @@ func buildDescription(_ []types.SyscallEvent, categories []string) string {
 	return strings.Join(parts, "; ") + "."
 }
 
-func buildRemediation(categories []string) string {
-	for _, c := range categories {
-		switch c {
-		case types.CategoryC2, types.CategoryDataExfil, types.CategoryBackdoor, types.CategoryMemExec:
-			return "Do NOT install this package. Remove it from dependencies immediately. " +
-				"If previously installed, audit the host for compromised credentials and rotate secrets."
-		case types.CategoryCredentialAccess:
-			return "Do NOT install this package. If previously installed, rotate all credentials " +
-				"that were present on the machine (SSH keys, AWS tokens, Git credentials, etc.)."
-		case types.CategoryPersistence:
-			return "Do NOT install this package. If previously installed, inspect shell startup files " +
-				"(.bashrc, .zshrc, .profile) and crontab for injected malicious code."
-		}
+// buildRemediation picks the most severe remediation message that applies
+// to the detected categories. Tiers are checked in fixed order so the
+// output is deterministic regardless of map iteration; the previous
+// implementation walked categories sequentially and returned on first
+// match, which meant the message text could flip between runs.
+func buildRemediation(catSet map[string]bool) string {
+	if catSet[types.CategoryC2] || catSet[types.CategoryDataExfil] ||
+		catSet[types.CategoryBackdoor] || catSet[types.CategoryMemExec] {
+		return "Do NOT install this package. Remove it from dependencies immediately. " +
+			"If previously installed, audit the host for compromised credentials and rotate secrets."
+	}
+	if catSet[types.CategoryCredentialAccess] {
+		return "Do NOT install this package. If previously installed, rotate all credentials " +
+			"that were present on the machine (SSH keys, AWS tokens, Git credentials, etc.)."
+	}
+	if catSet[types.CategoryPersistence] {
+		return "Do NOT install this package. If previously installed, inspect shell startup files " +
+			"(.bashrc, .zshrc, .profile) and crontab for injected malicious code."
 	}
 	return "Do NOT install this package. Review the events list for details."
 }

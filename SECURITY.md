@@ -35,7 +35,7 @@ kojuto is a security tool that intentionally runs untrusted code in an isolated 
 
 ### Sandbox Isolation
 
-- Packages run in Docker containers with an **isolated internal bridge network** (no external gateway)
+- Packages run in Docker containers with **`--network=none`** (zero network connectivity — no bridge interface, no Docker embedded DNS resolver, no attack surface)
 - Filesystem is **read-only** with targeted tmpfs mounts for writable paths
 - **`--cap-drop=ALL`** removes all Linux capabilities; `SYS_PTRACE`, `CHOWN`, and `FOWNER` are re-added only when needed
 - **`--no-new-privileges`** prevents privilege escalation
@@ -62,7 +62,7 @@ kojuto is a security tool that intentionally runs untrusted code in an isolated 
 - Host hostname, username, CPU count, and memory are mirrored into the container
 - `/.dockerenv` is removed on startup
 - Package mount path mirrors host directory layout
-- Isolated bridge network provides real network interfaces (connect returns `ETIMEDOUT`, not `ENETUNREACH`)
+- `/etc/resolv.conf` is populated via `--dns=198.51.100.1` (RFC 5737 TEST-NET-2, guaranteed unreachable) so the file is non-empty even under `--network=none` — prevents the empty-resolv-conf signal that would reveal isolation. `connect()` returns `ENETUNREACH`; combine with `--runtime runsc` to mask remaining `/proc/1/cgroup` and `/proc/self/mountinfo` signals
 
 ### Known Limitations
 

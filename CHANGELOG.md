@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Go version requirement lowered from 1.25.0 to 1.24.0 (stable release); `golang.org/x/sys` downgraded from v0.43.0 to v0.41.0
 - `--runtime` flag default changed from `""` to `"auto"`
 - `evasion-test` package updated: `b2_eval_exec` and `b3_function_constructor` promoted from `[BYPASS]` to `[DETECT]` (now `a10`/`a11`); new `b9_audit_hook_disable`, `b10_eval_via_import`, `c6_detect_audit_hook` evasion tests
+- Default sensitive paths trimmed: `/proc/self/maps` and `/proc/self/cgroup` removed from `DefaultSensitivePaths()` to eliminate per-scan false-positive evasion events caused by glibc / V8 / Python `runpy` reading them on every process launch. Re-enable via `kojuto.yml` `sensitive_paths.include` if needed
+- Verdict block keeps ANSI color even when stdout is redirected to a file (the verdict is rendered to stderr; only the JSON report goes to stdout, so terminal coloring is preserved for piped/redirected report output)
+- Analyzer remediation message and category list ordering made deterministic — Go's randomized map iteration previously caused identical event sets to produce different summary text and `categories` array ordering between runs
+- Documentation aligned with implementation: README/SPECIFICATION/SECURITY now describe the actual `--network=none` sandbox (previously claimed an isolated bridge); Python audit hook list corrected (`compile`/`exec`/`import` — `eval` is a Node.js-only event); SPECIFICATION test-data section rewritten around `probe-alpha`/`probe-npm`/`evasion-test` (the obsolete `axios-demo` entry was stale)
 
 ### Fixed
 - 21 linter errors: gofmt (15 files), importShadow (2), ifElseChain (1), godot (1), intrange (1), staticcheck De Morgan (1)

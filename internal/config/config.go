@@ -46,9 +46,13 @@ func DefaultSensitivePaths() []string {
 		// /etc/passwd is intentionally excluded: many standard tools
 		// (getpwnam, uid lookups) read it during normal operation.
 		"/proc/self/environ",
-		"/proc/self/maps",      // libfaketime/sandbox detection via loaded libraries
+		// /proc/self/maps and /proc/self/cgroup are intentionally excluded
+		// from defaults: glibc, V8/Node startup, Python's runpy, and
+		// container-aware libraries read these on every process launch,
+		// generating false-positive evasion events for any node-based or
+		// otherwise heavy package. Re-add them via config include if the
+		// extra signal is worth the noise.
 		"/proc/self/status",    // TracerPid detection (strace parent process)
-		"/proc/self/cgroup",    // Docker/container detection
 		"/proc/self/mountinfo", // overlay filesystem detection
 		"/sys/class/net",       // network namespace detection (no trailing slash)
 

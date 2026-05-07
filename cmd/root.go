@@ -76,8 +76,8 @@ var scanCmd = &cobra.Command{
 The target package is installed inside an isolated Docker container while
 syscalls (connect, sendto, execve, openat, rename, etc.) are recorded via
 strace or eBPF. Import is then repeated under three simulated OS identities
-(Linux, Windows, macOS) with the clock shifted +30 days to trigger
-platform-gated and date-gated payloads.
+(Linux, Windows, macOS) with the clock shifted by a randomized +30 to +180
+days (via libfaketime) to trigger platform-gated and date-gated payloads.
 
 Prerequisites:
   - Docker must be installed and running
@@ -281,7 +281,7 @@ func scanSinglePackage(pkg, version, ecosystem string) (*pinnedDep, error) {
 
 	method := selectProbeMethod()
 
-	sb, err := startSandbox(ctx, dlDir, pkg, method)
+	sb, err := startSandbox(ctx, dlDir, []string{pkg}, method)
 	if err != nil {
 		return nil, err
 	}
@@ -395,7 +395,7 @@ func runBatchScreening(deps []depfile.Dep, ecosystem string) (string, error) {
 	// Start a single sandbox with all packages.
 	method := selectProbeMethod()
 	// Use the first package name as the sandbox label.
-	sb, err := startSandbox(ctx, dlDir, pkgNames[0], method)
+	sb, err := startSandbox(ctx, dlDir, pkgNames, method)
 	if err != nil {
 		return "", err
 	}
@@ -663,7 +663,7 @@ func runLocalScan(_ []string) error {
 	flagVersion = downloaderDetectVersion(dlDir, pkg)
 
 	// For npm local packages, we need to create a node_modules structure
-	// from the .tgz so the sandbox can run npm rebuild with lifecycle scripts.
+	// from the .tgz so the sandbox can run npm install with lifecycle scripts.
 	if ecosystem == types.EcosystemNpm {
 		npmDir, npmErr := prepareLocalNpm(dlDir, pkg)
 		if npmErr != nil {
@@ -678,7 +678,7 @@ func runLocalScan(_ []string) error {
 
 	method := selectProbeMethod()
 
-	sb, err := startSandbox(ctx, dlDir, pkg, method)
+	sb, err := startSandbox(ctx, dlDir, []string{pkg}, method)
 	if err != nil {
 		return err
 	}
@@ -746,11 +746,20 @@ func detectPackageName(filename string) string {
 // prepareLocalNpm creates a staging directory with node_modules from
 // a local .tgz file. This mirrors what downloadNpm does for registry
 // packages: npm install --ignore-scripts on the host, then the sandbox
-// runs npm rebuild to execute lifecycle scripts under strace.
+// fires lifecycle scripts under strace.
 func prepareLocalNpm(sourceDir, pkg string) (string, error) {
 	stagingDir, err := os.MkdirTemp("", "kojuto-local-npm-*")
 	if err != nil {
 		return "", fmt.Errorf("creating npm staging dir: %w", err)
+	}
+	// MkdirTemp creates with 0o700 — the sandbox container's `dev` user
+	// (UID 1000) is not the host UID, so without world-execute on this
+	// directory the in-container user cannot traverse the bind-mounted
+	// node_modules tree. find returns nothing, the lifecycle hooks never
+	// fire, and the scan silently misses every install-time payload.
+	// Mirrors the explicit 0o755 used in runLocalScan's PyPI path.
+	if chmodErr := os.Chmod(stagingDir, 0o755); chmodErr != nil {
+		return "", fmt.Errorf("relaxing staging dir perms: %w", chmodErr)
 	}
 
 	// Find .tgz in source directory.
@@ -841,7 +850,7 @@ func selectProbeMethod() string {
 	}
 }
 
-func startSandbox(ctx context.Context, dlDir, pkg, method string) (*sandbox.Sandbox, error) {
+func startSandbox(ctx context.Context, dlDir string, pkgs []string, method string) (*sandbox.Sandbox, error) {
 	phaseInfo("sandbox", "preparing isolated container")
 
 	dockerfilePath := findDockerfile()
@@ -850,7 +859,12 @@ func startSandbox(ctx context.Context, dlDir, pkg, method string) (*sandbox.Sand
 	}
 
 	needsPtrace := method == methodStraceContainer
-	sb := sandboxNew(dlDir, pkg, needsPtrace, flagEcosystem, flagRuntime)
+	label := ""
+	if len(pkgs) > 0 {
+		label = pkgs[0]
+	}
+	sb := sandboxNew(dlDir, label, needsPtrace, flagEcosystem, flagRuntime)
+	sb.SetScanPkgs(pkgs)
 
 	if method == methodEBPF || method == methodStrace {
 		// Create then start-paused to minimize the TOCTOU window

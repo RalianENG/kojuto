@@ -36,22 +36,38 @@ var (
 // rest of the process. Called once from PersistentPreRun so any output
 // after startup honors the same setting.
 //
-//   - --no-color flag → force off
-//   - NO_COLOR env (any non-empty value) → force off (handled by fatih/color)
-//   - stderr not a TTY → off (we route progress + verdict to stderr)
-//   - otherwise → on
+// fatih/color's package init derives NoColor from stdout's TTY status,
+// which is wrong for kojuto: the user-facing UI (progress + verdict)
+// goes to stderr while stdout carries the JSON report. Under
+// `kojuto scan ... > report.json` the shell makes stdout a pipe, fatih
+// flips NoColor=true at init, and the verdict block lands monochrome
+// on the terminal even though stderr is still a TTY. The previous
+// implementation could only flip NoColor *off→on*, never back, so once
+// fatih disabled color we couldn't restore it. Set NoColor explicitly
+// every time based on the real UI sink.
 func configureColor(noColor bool) {
-	if noColor {
-		color.NoColor = true
-		return
+	color.NoColor = shouldDisableColor(
+		noColor,
+		os.Getenv("NO_COLOR"),
+		term.IsTerminal(int(os.Stderr.Fd())),
+	)
+}
+
+// shouldDisableColor encapsulates the precedence rules for ANSI output
+// so they can be unit-tested without hijacking os.Stderr or os.Getenv.
+//
+//   - --no-color flag → off
+//   - NO_COLOR env (any non-empty value, per no-color.org spec) → off
+//   - stderr is a TTY → on
+//   - otherwise → off
+func shouldDisableColor(noColorFlag bool, noColorEnv string, stderrIsTTY bool) bool {
+	if noColorFlag {
+		return true
 	}
-	// fatih/color initializes NoColor based on stdout's TTY status. We
-	// override using stderr because the user-facing progress + verdict
-	// goes to stderr (stdout is reserved for the JSON report when
-	// `-o -` or no -o is used).
-	if !term.IsTerminal(int(os.Stderr.Fd())) {
-		color.NoColor = true
+	if noColorEnv != "" {
+		return true
 	}
+	return !stderrIsTTY
 }
 
 // progressOut returns the writer for phase progress narration. When

@@ -163,3 +163,38 @@ func TestRenderBatchSummary(t *testing.T) {
 		}
 	}
 }
+
+// TestShouldDisableColor pins the precedence rules used by
+// configureColor. The key non-obvious case is "stderr-TTY + stdout-pipe"
+// (e.g. `kojuto scan ... > report.json`) — the verdict block must keep
+// its colors because the user is still watching stderr in a terminal.
+func TestShouldDisableColor(t *testing.T) {
+	cases := []struct {
+		name        string
+		flag        bool
+		env         string
+		stderrIsTTY bool
+		want        bool
+	}{
+		{"flag forces off even with TTY", true, "", true, true},
+		{"flag forces off even with env unset", true, "", false, true},
+		{"NO_COLOR=1 forces off even on TTY", false, "1", true, true},
+		// no-color.org spec: any non-empty value disables, including "0".
+		{"NO_COLOR=0 still forces off (any non-empty)", false, "0", true, true},
+		{"empty env, stderr TTY → color on", false, "", true, false},
+		{"empty env, stderr piped → color off", false, "", false, true},
+		// The bug we fixed: stdout being redirected does not appear in
+		// this decision because configureColor checks stderr only. The
+		// caller can't represent stdout state here, which is intentional.
+		{"stderr TTY wins regardless of stdout state", false, "", true, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := shouldDisableColor(c.flag, c.env, c.stderrIsTTY)
+			if got != c.want {
+				t.Errorf("shouldDisableColor(flag=%v, env=%q, tty=%v) = %v, want %v",
+					c.flag, c.env, c.stderrIsTTY, got, c.want)
+			}
+		})
+	}
+}

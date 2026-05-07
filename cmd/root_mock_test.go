@@ -223,7 +223,7 @@ func TestStartSandbox_EnsureImageFailure(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	_, err := startSandbox(ctx, "/tmp/pkg", "test", methodStraceContainer)
+	_, err := startSandbox(ctx, "/tmp/pkg", []string{"test"}, methodStraceContainer)
 	if err == nil {
 		t.Fatal("expected error")
 	}
