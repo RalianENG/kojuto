@@ -814,6 +814,10 @@ func parseAuditHook(line string) (types.SyscallEvent, bool) {
 		return types.SyscallEvent{}, false
 	}
 
+	// Strip the "+" marker added by sitecustomize.py to flag user-origin
+	// frames; downstream consumers shouldn't see the wire-protocol detail.
+	filename = strings.TrimPrefix(filename, "+")
+
 	return types.SyscallEvent{
 		Timestamp:   time.Now(),
 		Syscall:     types.EventDynamicExec,
@@ -849,6 +853,16 @@ func isBenignAuditEvent(event, filename, snippet string) bool {
 	// They have no filename and must not fall through to the Python
 	// <string> short-snippet filter.
 	if nodeAuditEvents[event] {
+		return false
+	}
+
+	// "+" prefix on the filename is the wire marker emitted by
+	// sitecustomize.py when the call-stack walk located a frame inside
+	// the scanned package (or another user-controlled path like /tmp).
+	// These events bypass the path-based benign filter — the originator
+	// IS the package we're auditing, so the dynamic exec is reportable
+	// regardless of where in site-packages it lives.
+	if strings.HasPrefix(filename, "+") {
 		return false
 	}
 

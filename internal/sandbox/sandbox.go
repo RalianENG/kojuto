@@ -52,11 +52,21 @@ type Sandbox struct {
 	needsPtrace bool
 	localMode   bool   // when true, install from local files (sdist/wheel) directly
 	seccompDir  string // per-instance temp dir for seccomp profile
+	scanPkgs    []string
 }
 
 // SetLocalMode enables local package installation mode (sdist support).
 func (s *Sandbox) SetLocalMode(local bool) {
 	s.localMode = local
+}
+
+// SetScanPkgs records the full list of packages being audited so the
+// audit hook (sitecustomize.py) can identify which call-stack frames
+// originate from the scanned package vs. its dependencies. Without
+// this, every site-packages frame looks alike and dynamic_exec from
+// a malicious target would be mistaken for benign library internals.
+func (s *Sandbox) SetScanPkgs(pkgs []string) {
+	s.scanPkgs = pkgs
 }
 
 // New creates a new Sandbox instance.
@@ -178,6 +188,18 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 	// Audit hook: load kojuto-require.js before any user code in Node.js.
 	// This intercepts eval/Function/vm dynamic code execution.
 	args = append(args, "--env=NODE_OPTIONS=--require /opt/kojuto/kojuto-require.js")
+
+	// Tell sitecustomize.py which packages are being audited so its
+	// frame-walking logic can flag dynamic exec originating in those
+	// packages while suppressing internal exec calls from compat
+	// libraries (six, future, attrs) loaded as dependencies.
+	pkgs := s.scanPkgs
+	if len(pkgs) == 0 && s.pkg != "" {
+		pkgs = []string{s.pkg}
+	}
+	if len(pkgs) > 0 {
+		args = append(args, "--env=KOJUTO_SCAN_PKGS="+strings.Join(pkgs, ","))
+	}
 
 	// Honeypot environment variables: simulate a CI/developer machine to
 	// trigger environment-gated malware (e.g. "if CI: exfiltrate()").

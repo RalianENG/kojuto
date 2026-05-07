@@ -55,11 +55,43 @@ func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
 		suspicious = append(suspicious, events[i])
 	}
 
-	if len(suspicious) > 0 {
-		return types.VerdictSuspicious, suspicious
+	if len(suspicious) == 0 {
+		return types.VerdictClean, nil
 	}
 
-	return types.VerdictClean, nil
+	// Severity-aware verdict. LOW-only event sets (e.g. dynamic_code_exec
+	// from `six`'s internal exec_) stay CLEAN — those patterns appear in
+	// legitimate compat libraries too often to single-handedly condemn a
+	// package. Events still flow into `suspicious` for forensic visibility
+	// in the report.
+	return decideVerdict(suspicious), suspicious
+}
+
+// decideVerdict applies the severity rules: any HIGH event → SUSPICIOUS;
+// two or more MEDIUM events → SUSPICIOUS; otherwise CLEAN. An unmapped
+// category is treated as HIGH so a newly added detector that someone
+// forgot to weight can still trigger the verdict.
+func decideVerdict(events []types.SyscallEvent) string {
+	var hi, med int
+	for i := range events {
+		if events[i].Category == "" {
+			continue
+		}
+		sev, known := types.CategorySeverity[events[i].Category]
+		if !known {
+			sev = types.SeverityHigh
+		}
+		switch sev {
+		case types.SeverityHigh:
+			hi++
+		case types.SeverityMedium:
+			med++
+		}
+		if hi >= 1 || med >= 2 {
+			return types.VerdictSuspicious
+		}
+	}
+	return types.VerdictClean
 }
 
 // collectExecutedPaths builds a set of file paths that appeared as the

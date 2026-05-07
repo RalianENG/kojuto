@@ -336,7 +336,11 @@ func TestAnalyze_DNSTunneling(t *testing.T) {
 
 	for _, tc := range tunnelCases {
 		t.Run(tc.name, func(t *testing.T) {
+			// Two events because dns_tunneling is a MEDIUM-severity
+			// signal — a single high-entropy DNS query can be a CDN
+			// hash, but two from the same scan is a tunneling pattern.
 			events := []types.SyscallEvent{
+				{Syscall: types.EventSendto, DstAddr: "127.0.0.1", DstPort: 53, Family: 2, DNSQuery: tc.query},
 				{Syscall: types.EventSendto, DstAddr: "127.0.0.1", DstPort: 53, Family: 2, DNSQuery: tc.query},
 			}
 			verdict, _ := Analyze(events)
@@ -1025,15 +1029,19 @@ func TestAnalyze_ShellCmdSensitivePath(t *testing.T) {
 }
 
 func TestAnalyze_PtraceTraceme(t *testing.T) {
+	// evasion is a MEDIUM-severity signal; two ptrace events together
+	// is the threshold for SUSPICIOUS (single ptrace can occur in
+	// legitimate debugger-aware code paths).
 	events := []types.SyscallEvent{
+		{Syscall: types.EventPtrace, Comm: "ptrace(PTRACE_TRACEME)"},
 		{Syscall: types.EventPtrace, Comm: "ptrace(PTRACE_TRACEME)"},
 	}
 	verdict, filtered := Analyze(events)
 	if verdict != types.VerdictSuspicious {
 		t.Errorf("expected suspicious for ptrace, got %s", verdict)
 	}
-	if len(filtered) != 1 {
-		t.Fatalf("expected 1 event, got %d", len(filtered))
+	if len(filtered) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(filtered))
 	}
 	if filtered[0].Category != types.CategoryEvasion {
 		t.Errorf("expected category %q, got %q", types.CategoryEvasion, filtered[0].Category)
@@ -1121,6 +1129,10 @@ func TestClassify_DynamicExec(t *testing.T) {
 }
 
 func TestAnalyze_DynamicExecNotFiltered(t *testing.T) {
+	// dynamic_code_execution is LOW severity (legitimate compat libs
+	// like six exec their own internal source). Even a thousand of
+	// these alone don't raise the verdict, but they MUST still flow
+	// through to `filtered` so the report retains forensic context.
 	events := []types.SyscallEvent{
 		{
 			Timestamp:   time.Now(),
@@ -1130,14 +1142,87 @@ func TestAnalyze_DynamicExecNotFiltered(t *testing.T) {
 		},
 	}
 	verdict, filtered := Analyze(events)
-	if verdict != types.VerdictSuspicious {
-		t.Errorf("verdict = %q, want suspicious", verdict)
+	if verdict != types.VerdictClean {
+		t.Errorf("verdict = %q, want clean (LOW severity alone)", verdict)
 	}
 	if len(filtered) != 1 {
-		t.Fatalf("expected 1 event, got %d", len(filtered))
+		t.Fatalf("expected 1 event in report, got %d", len(filtered))
 	}
 	if filtered[0].Category != types.CategoryDynamicExec {
 		t.Errorf("category = %q, want %q", filtered[0].Category, types.CategoryDynamicExec)
+	}
+}
+
+// decideVerdict boundary tests — these encode the rule contract so a
+// future weight change can't silently relax the threshold.
+func TestDecideVerdict_RuleBoundaries(t *testing.T) {
+	cases := []struct {
+		name   string
+		events []types.SyscallEvent
+		want   string
+	}{
+		{
+			name:   "empty",
+			events: nil,
+			want:   types.VerdictClean,
+		},
+		{
+			name: "single HIGH",
+			events: []types.SyscallEvent{
+				{Category: types.CategoryCredentialAccess},
+			},
+			want: types.VerdictSuspicious,
+		},
+		{
+			name: "single MEDIUM",
+			events: []types.SyscallEvent{
+				{Category: types.CategoryDNSTunnel},
+			},
+			want: types.VerdictClean,
+		},
+		{
+			name: "two MEDIUM",
+			events: []types.SyscallEvent{
+				{Category: types.CategoryDNSTunnel},
+				{Category: types.CategoryEvasion},
+			},
+			want: types.VerdictSuspicious,
+		},
+		{
+			name: "many LOW only",
+			events: func() []types.SyscallEvent {
+				out := make([]types.SyscallEvent, 100)
+				for i := range out {
+					out[i].Category = types.CategoryDynamicExec
+				}
+				return out
+			}(),
+			want: types.VerdictClean,
+		},
+		{
+			name: "LOW plus HIGH",
+			events: []types.SyscallEvent{
+				{Category: types.CategoryDynamicExec},
+				{Category: types.CategoryC2},
+			},
+			want: types.VerdictSuspicious,
+		},
+		{
+			name: "unmapped category fails closed",
+			events: []types.SyscallEvent{
+				{Category: "category_we_havent_weighted_yet"},
+			},
+			want: types.VerdictSuspicious,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := decideVerdict(tc.events)
+			if got != tc.want {
+				t.Errorf("decideVerdict = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

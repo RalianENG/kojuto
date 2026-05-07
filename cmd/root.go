@@ -281,7 +281,7 @@ func scanSinglePackage(pkg, version, ecosystem string) (*pinnedDep, error) {
 
 	method := selectProbeMethod()
 
-	sb, err := startSandbox(ctx, dlDir, pkg, method)
+	sb, err := startSandbox(ctx, dlDir, []string{pkg}, method)
 	if err != nil {
 		return nil, err
 	}
@@ -395,7 +395,7 @@ func runBatchScreening(deps []depfile.Dep, ecosystem string) (string, error) {
 	// Start a single sandbox with all packages.
 	method := selectProbeMethod()
 	// Use the first package name as the sandbox label.
-	sb, err := startSandbox(ctx, dlDir, pkgNames[0], method)
+	sb, err := startSandbox(ctx, dlDir, pkgNames, method)
 	if err != nil {
 		return "", err
 	}
@@ -678,7 +678,7 @@ func runLocalScan(_ []string) error {
 
 	method := selectProbeMethod()
 
-	sb, err := startSandbox(ctx, dlDir, pkg, method)
+	sb, err := startSandbox(ctx, dlDir, []string{pkg}, method)
 	if err != nil {
 		return err
 	}
@@ -850,7 +850,7 @@ func selectProbeMethod() string {
 	}
 }
 
-func startSandbox(ctx context.Context, dlDir, pkg, method string) (*sandbox.Sandbox, error) {
+func startSandbox(ctx context.Context, dlDir string, pkgs []string, method string) (*sandbox.Sandbox, error) {
 	phaseInfo("sandbox", "preparing isolated container")
 
 	dockerfilePath := findDockerfile()
@@ -859,7 +859,12 @@ func startSandbox(ctx context.Context, dlDir, pkg, method string) (*sandbox.Sand
 	}
 
 	needsPtrace := method == methodStraceContainer
-	sb := sandboxNew(dlDir, pkg, needsPtrace, flagEcosystem, flagRuntime)
+	label := ""
+	if len(pkgs) > 0 {
+		label = pkgs[0]
+	}
+	sb := sandboxNew(dlDir, label, needsPtrace, flagEcosystem, flagRuntime)
+	sb.SetScanPkgs(pkgs)
 
 	if method == methodEBPF || method == methodStrace {
 		// Create then start-paused to minimize the TOCTOU window
