@@ -869,3 +869,54 @@ func TestParseAuditHook_IntegratedWithParseStraceLine(t *testing.T) {
 		t.Errorf("audit_event = %q, want eval", evt.AuditEvent)
 	}
 }
+
+// TestParseStraceLine_RenameWithEscapedQuotes pins the security fix for
+// the prior `"([^"]+)"` capture pattern, which silently dropped the
+// rename event whenever a filename contained a literal `"` (escaped by
+// strace as `\"`). Without an event the analyzer never sees the hijack
+// and the verdict stays clean — a malicious package could rename
+// `/tmp/x"y` over `/usr/local/bin/python3` invisibly.
+func TestParseStraceLine_RenameWithEscapedQuotes(t *testing.T) {
+	cases := []struct {
+		name    string
+		line    string
+		wantSrc string
+		wantDst string
+	}{
+		{
+			name:    "rename with escaped quote in src",
+			line:    `[pid 100] rename("/tmp/x\"y", "/usr/local/bin/python3") = 0`,
+			wantSrc: `/tmp/x\"y`,
+			wantDst: "/usr/local/bin/python3",
+		},
+		{
+			name:    "renameat with escaped quote in dst",
+			line:    `[pid 101] renameat(AT_FDCWD, "/tmp/legit", AT_FDCWD, "/etc/x\"y") = 0`,
+			wantSrc: "/tmp/legit",
+			wantDst: `/etc/x\"y`,
+		},
+		{
+			name:    "plain rename still parses",
+			line:    `[pid 102] rename("/tmp/a", "/usr/local/bin/node") = 0`,
+			wantSrc: "/tmp/a",
+			wantDst: "/usr/local/bin/node",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			evt, ok := parseStraceLine(tc.line, NewParseState())
+			if !ok {
+				t.Fatalf("expected rename to parse, line=%q", tc.line)
+			}
+			if evt.Syscall != types.EventRename {
+				t.Errorf("syscall = %q, want %q", evt.Syscall, types.EventRename)
+			}
+			if evt.SrcPath != tc.wantSrc {
+				t.Errorf("SrcPath = %q, want %q", evt.SrcPath, tc.wantSrc)
+			}
+			if evt.DstPath != tc.wantDst {
+				t.Errorf("DstPath = %q, want %q", evt.DstPath, tc.wantDst)
+			}
+		})
+	}
+}

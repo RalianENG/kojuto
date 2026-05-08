@@ -128,23 +128,32 @@ func TestHoneypotEnvVars(t *testing.T) {
 
 func TestSanitizeDockerArg(t *testing.T) {
 	cases := []struct {
-		input string
-		want  string
+		input    string
+		fallback string
+		want     string
 	}{
-		{"my-host", "my-host"},
-		{"host.local", "host.local"},
-		{"host name", "hostname"},
-		{"--inject", "--inject"},
-		{"$(evil)", "evil"},
-		{"", "localhost"},
-		{"日本語ホスト", "localhost"},
-		{"valid_host-123.local", "valid_host-123.local"},
+		{"my-host", "localhost", "my-host"},
+		{"host.local", "localhost", "host.local"},
+		{"host name", "localhost", "hostname"},
+		{"--inject", "localhost", "--inject"},
+		{"$(evil)", "localhost", "evil"},
+		{"", "localhost", "localhost"},
+		{"日本語ホスト", "localhost", "localhost"},
+		{"valid_host-123.local", "localhost", "valid_host-123.local"},
+		// Verify the fallback is parameterised, not hardcoded to "localhost".
+		{"", "user", "user"},
+		{"$(evil)", "user", "evil"},
+		{"日本語", "user", "user"},
+		// Shell / volume-spec metacharacters get stripped.
+		{"a;rm -rf /", "user", "arm-rf"},
+		{"a/b", "user", "ab"},
+		{"a:b", "user", "ab"},
 	}
 
 	for _, tc := range cases {
-		got := sanitizeDockerArg(tc.input)
+		got := sanitizeDockerArg(tc.input, tc.fallback)
 		if got != tc.want {
-			t.Errorf("sanitizeDockerArg(%q) = %q, want %q", tc.input, got, tc.want)
+			t.Errorf("sanitizeDockerArg(%q, %q) = %q, want %q", tc.input, tc.fallback, got, tc.want)
 		}
 	}
 }

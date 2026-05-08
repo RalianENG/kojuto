@@ -9,9 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Audit hooks for dynamic code execution detection** — Python PEP 578 hook (`sitecustomize.py`) intercepts `compile`/`exec`/`import`/`ctypes.dlopen`; Node.js `--require` hook (`kojuto-require.js`) intercepts `eval`/`Function`/`vm.runInNewContext`/`vm.runInThisContext`/`vm.Script`. New `dynamic_code_execution` category and `EventDynamicExec` event type
+- **Severity-tiered verdict** — `types.CategorySeverity` classifies each detection category as HIGH (one event raises the verdict to SUSPICIOUS), MEDIUM (two-or-more raise it), or LOW (never raises the verdict alone). `dynamic_code_execution` is LOW, `dns_tunneling` and `evasion` are MEDIUM, all other categories stay HIGH. Unmapped categories fail closed (treated as HIGH). LOW events still appear in `report.events` for forensics — verdict reflects severity, not raw event count. Stops legitimate Python compat libraries (`six`, `attrs`, `future`) from flipping to SUSPICIOUS on benign internal `compile`/`exec` calls
+- **Caller-aware audit hook** — `sitecustomize.py` now walks the Python call stack and reports the actual `.py` file invoking `compile`/`exec`, not the user-controllable `filename` argument (which `six` deliberately sets to `<string>`). When the deepest frame lives inside the scanned package's `site-packages` directory the hook prefixes the wire payload with `+` so the analyzer bypasses path-based benign filtering. Sandbox passes the scan list via `KOJUTO_SCAN_PKGS` so the hook knows which paths count as "user code"
 - **System binary write detection** — `openat` with write flags to trusted system binaries (`python3`, `node`, `pip`, `sh`, etc.) in `/usr/local/bin/` or `/usr/bin/` classified as `binary_hijacking`, preventing benignPaths bypass via tmpfs overwrite
 - **gVisor auto-detection** — `--runtime` default changed from empty (runc) to `auto`: probes `docker info` for runsc availability and uses gVisor if registered, falls back to runc otherwise
 - **npm test package** — `testdata/probe-npm-0.1.0/` with lifecycle hook payloads (preinstall/postinstall) and require-time import phase covering 31 TTPs across 9 attack categories including audit hook validation
+- **GitHub Action inputs** — `config`, `quiet`, and `no-color` exposed as Action inputs to match CLI flags (`--config`, `--quiet`, `--no-color`)
 
 ### Changed
 - Go version requirement lowered from 1.25.0 to 1.24.0 (stable release); `golang.org/x/sys` downgraded from v0.43.0 to v0.41.0

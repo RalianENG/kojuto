@@ -2,6 +2,8 @@ package sandbox
 
 import (
 	"context"
+	"os/exec"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -171,6 +173,32 @@ func TestGetHostUsername(t *testing.T) {
 	u := getHostUsername()
 	if u == "" {
 		t.Error("getHostUsername returned empty string")
+	}
+}
+
+// TestGetHostUsername_Sanitizes pins that an exotic USER value (shell
+// metacharacters, path separators, non-ASCII) is normalised before it
+// flows into mountPoint and from there into -v volume specs and shell
+// command lines.
+func TestGetHostUsername_Sanitizes(t *testing.T) {
+	cases := []struct {
+		userEnv, want string
+	}{
+		{"alice", "alice"},
+		{"a;rm -rf /", "arm-rf"},
+		{"$(id)", "id"},
+		{"a:b", "ab"},
+		{"a/b", "ab"},
+		{"日本語", "user"},
+	}
+
+	for _, tc := range cases {
+		t.Setenv("USER", tc.userEnv)
+		t.Setenv("USERNAME", "")
+		t.Setenv("LOGNAME", "")
+		if got := getHostUsername(); got != tc.want {
+			t.Errorf("USER=%q: getHostUsername() = %q, want %q", tc.userEnv, got, tc.want)
+		}
 	}
 }
 
@@ -347,9 +375,42 @@ func TestNpmLifecycleScript_ScopedPackage(t *testing.T) {
 	// shell command. Regression guard for a bug that would have hidden
 	// scoped-dep lifecycle behavior from strace.
 	got := npmLifecycleScript([]string{"@scope/lib"})
-	want := `"/install/node_modules/@scope/lib"`
+	want := `'/install/node_modules/@scope/lib'`
 	if !strings.Contains(got, want) {
 		t.Errorf("scoped path missing %q in:\n%s", want, got)
+	}
+}
+
+func TestShQuote(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"foo", "'foo'"},
+		{"a b", "'a b'"},
+		{"@scope/pkg", "'@scope/pkg'"},
+		{"$(id)", "'$(id)'"},
+		{"`id`", "'`id`'"},
+		{"a'b", `'a'\''b'`},
+		{"", "''"},
+	}
+	for _, tc := range cases {
+		if got := shQuote(tc.in); got != tc.want {
+			t.Errorf("shQuote(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestNpmLifecycleScript_QuotesShellMetachars(t *testing.T) {
+	// Defense-in-depth: even if a malformed name slips past the depfile
+	// validator, the cd target must be safely single-quoted so shell
+	// metacharacters cannot break out and execute on the sandbox shell.
+	got := npmLifecycleScript([]string{`foo$(id)`})
+	if !strings.Contains(got, `'/install/node_modules/foo$(id)'`) {
+		t.Errorf("metachar payload not single-quoted in:\n%s", got)
+	}
+	// The bare token must NOT appear unquoted between cd and &&.
+	if strings.Contains(got, `cd /install/node_modules/foo$(id) `) {
+		t.Errorf("metachar payload unquoted in:\n%s", got)
 	}
 }
 
@@ -504,5 +565,65 @@ func TestFakeTokens_NotHexOnly(t *testing.T) {
 	}
 	if !hasNonHex {
 		t.Error("10 consecutive fakeAWSKeyID tokens were all hex-only")
+	}
+}
+
+// TestDockerWriteFile_StructureNoHeredoc pins the security invariant that
+// dockerWriteFile delivers content via stdin (`docker exec -i`) instead of
+// the previous `cat << 'KOJUTO_EOF'` heredoc. The heredoc form was a root-
+// in-container injection sink: an attacker-controlled package name with
+// an embedded "\nKOJUTO_EOF\n<cmd>" sequence used to terminate the
+// heredoc early and run <cmd> as root. Stdin delivery removes the body
+// from the shell command line entirely.
+func TestDockerWriteFile_StructureNoHeredoc(t *testing.T) {
+	var captured []string
+	orig := execCommand
+	execCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		captured = append([]string{name}, args...)
+		return exec.CommandContext(ctx, "true")
+	}
+	t.Cleanup(func() { execCommand = orig })
+
+	sb := &Sandbox{containerID: "test-container"}
+	sb.dockerWriteFile(context.Background(), "/tmp/probe.js",
+		"any content with KOJUTO_EOF baked in\nstill not parsed by shell")
+
+	want := []string{
+		"docker", "exec", "-i", "--user=root", "test-container",
+		"sh", "-c", "cat > '/tmp/probe.js'",
+	}
+	if !reflect.DeepEqual(captured, want) {
+		t.Fatalf("docker args mismatch:\n got %q\nwant %q", captured, want)
+	}
+
+	for _, a := range captured {
+		if strings.Contains(a, "<<") {
+			t.Errorf("heredoc syntax leaked into arg %q", a)
+		}
+		if strings.Contains(a, "KOJUTO_EOF") {
+			t.Errorf("KOJUTO_EOF terminator leaked into arg %q", a)
+		}
+	}
+}
+
+// TestDockerWriteFile_QuotesPath confirms the path is single-quoted so a
+// future caller passing a path with shell metacharacters cannot break the
+// command. Every current caller passes a constant path; this test pins
+// the defense-in-depth contract for future code.
+func TestDockerWriteFile_QuotesPath(t *testing.T) {
+	var captured []string
+	orig := execCommand
+	execCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		captured = append([]string{name}, args...)
+		return exec.CommandContext(ctx, "true")
+	}
+	t.Cleanup(func() { execCommand = orig })
+
+	sb := &Sandbox{containerID: "test-container"}
+	sb.dockerWriteFile(context.Background(), "/tmp/$(rm -rf /)/x", "x")
+
+	last := captured[len(captured)-1]
+	if !strings.Contains(last, `'/tmp/$(rm -rf /)/x'`) {
+		t.Errorf("path not single-quoted in shell arg: %q", last)
 	}
 }

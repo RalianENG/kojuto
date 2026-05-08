@@ -167,6 +167,73 @@ func TestParse_InvalidJSON(t *testing.T) {
 	}
 }
 
+func TestParse_RejectsInvalidNpmName(t *testing.T) {
+	cases := map[string]string{
+		"shell metachars":    `{"dependencies": {"foo;rm -rf /": "1.0.0"}}`,
+		"command sub":        `{"dependencies": {"foo$(id)": "1.0.0"}}`,
+		"backtick":           "{\"dependencies\": {\"foo`id`\": \"1.0.0\"}}",
+		"newline":            "{\"dependencies\": {\"foo\\nbar\": \"1.0.0\"}}",
+		"uppercase":          `{"dependencies": {"FooBar": "1.0.0"}}`,
+		"leading dot":        `{"dependencies": {".hidden": "1.0.0"}}`,
+		"space":              `{"dependencies": {"a b": "1.0.0"}}`,
+		"dev shell metachar": `{"devDependencies": {"foo|cat": "1.0.0"}}`,
+	}
+
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "package.json")
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := Parse(path); err == nil {
+				t.Errorf("expected error for invalid name, got nil (content=%q)", content)
+			}
+		})
+	}
+}
+
+func TestParse_AcceptsScopedNpmName(t *testing.T) {
+	content := `{"dependencies": {"@scope/foo-bar": "1.0.0", "lodash": "4.0.0"}}`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "package.json")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	deps, _, err := Parse(path)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+	if len(deps) != 2 {
+		t.Errorf("expected 2 deps, got %d", len(deps))
+	}
+}
+
+func TestParse_RejectsInvalidPyPIName(t *testing.T) {
+	// Note: `;` is not exercised here because the parser strips PEP 508
+	// environment markers (everything after `;`) before validation runs,
+	// so a shell `;` is never seen as part of the name.
+	cases := map[string]string{
+		"command sub": "foo$(id)==1.0.0\n",
+		"backtick":    "foo`id`==1.0.0\n",
+		"pipe":        "foo|cat==1.0.0\n",
+		"space":       "a b==1.0.0\n",
+	}
+
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "requirements.txt")
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := Parse(path); err == nil {
+				t.Errorf("expected error for invalid name, got nil (content=%q)", content)
+			}
+		})
+	}
+}
+
 func TestCleanNpmVersion(t *testing.T) {
 	cases := []struct {
 		input string

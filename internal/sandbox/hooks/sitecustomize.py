@@ -8,7 +8,6 @@ import os
 import sys
 
 _MAX = 200
-_FRAMES = 8
 _P = chr(75) + chr(79) + chr(74) + chr(85) + chr(84) + chr(79) + ":"
 
 # Frames whose co_filename starts with one of these are treated as
@@ -42,13 +41,42 @@ def _is_user(fn):
 
 
 def _t(s):
-    s = str(s).replace("\n", "\\n").replace("\r", "\\r")
+    # Escape every C0 control byte (0x00-0x1f) and DEL (0x7f) to a
+    # printable form. The wire format only needs newline-stripping for
+    # framing safety (handled in _w too), but the snippet field
+    # eventually surfaces in report.json's code_snippet — a downstream
+    # consumer that decodes the JSON and prints the raw string (e.g.
+    # `jq -r .events[].code_snippet`) used to receive an unescaped
+    # ESC (0x1b) byte and let an attacker-supplied payload paint
+    # arbitrary text on the user's terminal via ANSI sequences.
+    out = []
+    for ch in str(s):
+        if ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ord(ch) < 0x20 or ord(ch) == 0x7f:
+            out.append("\\x%02x" % ord(ch))
+        else:
+            out.append(ch)
+    s = "".join(out)
     if len(s) > _MAX:
         return s[:_MAX] + "..."
     return s
 
 
 def _w(tag, body):
+    # Wire-format invariant: each KOJUTO: emission must occupy exactly
+    # one stderr line. The Go parser splits on '\n' and treats every
+    # KOJUTO:-prefixed line as an independent event. Strip line and null
+    # bytes from `body` so an attacker-controlled co_filename or compile
+    # filename arg cannot smuggle a fake follow-up event onto the wire.
+    # _t() already escapes newlines in the snippet field, so this is a
+    # defense for the filename field (which is concatenated raw from
+    # _origin()) and a belt-and-braces guard for any future tag.
+    body = body.replace("\n", "").replace("\r", "").replace("\0", "")
     sys.stderr.write(_P + tag + ":" + body + "\n")
     sys.stderr.flush()
 
@@ -57,28 +85,32 @@ def _origin(fallback):
     """Walk the Python call stack and return the .py file responsible
     for the compile/exec call.
 
-    Returns "+<path>" when the deepest user-code frame is found — the
-    leading "+" tells the Go analyzer this event originates in audited
-    code and must NOT be filtered by the path-based benign list. When
-    no user frame appears, returns the deepest non-internal frame so
-    the existing benign filter (stdlib/site-packages substring match)
-    still works for compat-library noise.
+    Returns "+<path>" when a user-code frame is found anywhere on the
+    stack — the leading "+" tells the Go analyzer this event originates
+    in audited code and must NOT be filtered by the path-based benign
+    list. When no user frame appears, returns the first non-internal
+    frame so the existing benign filter (stdlib/site-packages substring
+    match) still works for compat-library noise.
+
+    The walk is unbounded by design: a depth cap would let a malicious
+    package bury its own frame under stdlib wrappers and evade the
+    user-origin marker. Stack walking is O(depth) on a linked list and
+    early-returns on the first user frame, so the practical cost is
+    negligible compared with the surrounding compile/exec work.
     """
     try:
         f = sys._getframe(2)  # skip _origin + _h
     except ValueError:
         return fallback
     me = __file__
-    seen = 0
     deepest = ""
-    while f is not None and seen < _FRAMES:
+    while f is not None:
         fn = f.f_code.co_filename
         if fn != me:
             if _is_user(fn):
                 return "+" + fn
             if not deepest:
                 deepest = fn
-            seen += 1
         f = f.f_back
     if deepest:
         return deepest

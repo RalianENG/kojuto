@@ -443,6 +443,40 @@ func TestRunLocalScan_NpmAutoDetect(t *testing.T) {
 	}
 }
 
+// TestRunLocalScan_RejectsUnsafeFilename pins the security invariant that
+// a filename whose derived package name contains shell metacharacters or
+// newlines is rejected at the boundary, before any sandbox interaction.
+// Without this gate, a malicious .tgz/.whl filename containing a newline
+// followed by "KOJUTO_EOF" used to terminate dockerWriteFile's predecessor
+// heredoc and execute arbitrary commands as root inside the container.
+// The dockerWriteFile refactor closed the heredoc; this test guards the
+// belt-and-braces input check.
+func TestRunLocalScan_RejectsUnsafeFilename(t *testing.T) {
+	saveAndRestoreFlags(t)
+
+	dir := t.TempDir()
+	// "\n" + "KOJUTO_EOF" payload baked into a .tgz filename. macOS APFS
+	// and Linux ext4/xfs all permit '\n' in filenames; if the underlying
+	// FS rejects it, skip rather than fail.
+	badName := "evil\nKOJUTO_EOF\nrm-1.0.0.tgz"
+	badFile := filepath.Join(dir, badName)
+	if err := os.WriteFile(badFile, []byte("x"), 0o644); err != nil {
+		t.Skipf("filesystem refuses newlines in filenames: %v", err)
+	}
+
+	flagLocal = badFile
+	flagEcosystem = types.EcosystemNpm
+	flagTimeout = 5 * time.Second
+
+	err := runLocalScan(nil)
+	if err == nil {
+		t.Fatal("expected validation error for unsafe local filename")
+	}
+	if !strings.Contains(err.Error(), "unsafe") {
+		t.Errorf("expected 'unsafe' in error, got: %v", err)
+	}
+}
+
 // --- prepareLocalNpm tests ---
 
 func TestPrepareLocalNpm_NoTgz(t *testing.T) {

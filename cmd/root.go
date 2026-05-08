@@ -165,10 +165,21 @@ func preRunLoadConfig(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("loading config %s: %w", cfgPath, err)
 	}
 
-	if flagStrict && len(cfg.SensitivePaths.Exclude) > 0 {
-		fmt.Fprintf(os.Stderr, "warning: --strict ignoring %d excluded path(s) from config: %v\n",
-			len(cfg.SensitivePaths.Exclude), cfg.SensitivePaths.Exclude)
-		cfg.SensitivePaths.Exclude = nil
+	if len(cfg.SensitivePaths.Exclude) > 0 {
+		if flagStrict {
+			fmt.Fprintf(os.Stderr, "warning: --strict ignoring %d excluded path(s) from config: %v\n",
+				len(cfg.SensitivePaths.Exclude), cfg.SensitivePaths.Exclude)
+			cfg.SensitivePaths.Exclude = nil
+		} else {
+			// Without --strict, an attacker-planted or otherwise
+			// untrusted kojuto.yml in the cwd silently shrinks the
+			// detection surface. Surface the exclusions on stderr so
+			// the user can see them in CI logs and interactive output
+			// before trusting a "clean" verdict.
+			fmt.Fprintf(os.Stderr, "warning: %s excludes %d sensitive path(s) from monitoring: %v\n",
+				cfgPath, len(cfg.SensitivePaths.Exclude), cfg.SensitivePaths.Exclude)
+			fmt.Fprintln(os.Stderr, "         pass --strict to ignore these exclusions")
+		}
 	}
 
 	paths := config.MergeSensitivePaths(cfg)
@@ -570,7 +581,12 @@ func writePinnedPyPI(path string, deps []pinnedDep) error {
 			fmt.Fprintf(&b, "%s\n", dep.Name)
 		}
 	}
-	return os.WriteFile(path, []byte(b.String()), 0o644)
+	// 0o600 — pinned files can carry private package names (internal
+	// registry deps) and embedded version metadata; default to user-
+	// only readable so a multi-user host doesn't leak the manifest to
+	// other accounts. Caller can chmod after the fact if they want to
+	// share.
+	return os.WriteFile(path, []byte(b.String()), 0o600)
 }
 
 func writePinnedNpm(path string, deps []pinnedDep) error {
@@ -595,7 +611,9 @@ func writePinnedNpm(path string, deps []pinnedDep) error {
 	}
 	jsonBytes = append(jsonBytes, '\n')
 
-	return os.WriteFile(path, jsonBytes, 0o644)
+	// 0o600 for the same reason as writePinnedPyPI — keep the pinned
+	// manifest from leaking to other users on a shared host.
+	return os.WriteFile(path, jsonBytes, 0o600)
 }
 
 // runLocalScan scans a local package file (.whl, .tgz) or directory.
@@ -644,6 +662,17 @@ func runLocalScan(_ []string) error {
 		}
 
 		pkg = detectPackageName(filepath.Base(localPath))
+	}
+
+	// Validate the derived package name with the same regex as registry
+	// scans. Local mode is the only path where pkg is built from a user-
+	// supplied filesystem path, so the name can carry any byte the OS
+	// allows — including newlines and shell metacharacters that downstream
+	// sandbox helpers used to interpolate into shell heredocs and Python/
+	// JS string literals. The dockerWriteFile refactor closed the heredoc
+	// path, but defending at the boundary keeps every future use site safe.
+	if validateErr := downloaderValidate(pkg, ""); validateErr != nil {
+		return fmt.Errorf("local package name derived from %q is unsafe: %w", localPath, validateErr)
 	}
 
 	// Auto-detect ecosystem from file extension, but only if -e was not explicitly set.
@@ -1115,7 +1144,13 @@ func openOutput() (*os.File, error) {
 		return os.Stdout, nil
 	}
 
-	f, err := os.Create(flagOutput)
+	// 0o600 — the report can carry attacker-supplied code snippets,
+	// inferred file paths, and any internal package names from the
+	// scanned dependency tree. os.Create defaults to 0o666 (then
+	// umask-clipped, typically 0o644), which would leak the report
+	// to other users on a multi-user host. Owner-only by default;
+	// users who explicitly want to share can chmod after the fact.
+	f, err := os.OpenFile(flagOutput, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("creating output file: %w", err)
 	}
