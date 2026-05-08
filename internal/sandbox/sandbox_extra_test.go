@@ -2,6 +2,8 @@ package sandbox
 
 import (
 	"context"
+	"os/exec"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -537,5 +539,65 @@ func TestFakeTokens_NotHexOnly(t *testing.T) {
 	}
 	if !hasNonHex {
 		t.Error("10 consecutive fakeAWSKeyID tokens were all hex-only")
+	}
+}
+
+// TestDockerWriteFile_StructureNoHeredoc pins the security invariant that
+// dockerWriteFile delivers content via stdin (`docker exec -i`) instead of
+// the previous `cat << 'KOJUTO_EOF'` heredoc. The heredoc form was a root-
+// in-container injection sink: an attacker-controlled package name with
+// an embedded "\nKOJUTO_EOF\n<cmd>" sequence used to terminate the
+// heredoc early and run <cmd> as root. Stdin delivery removes the body
+// from the shell command line entirely.
+func TestDockerWriteFile_StructureNoHeredoc(t *testing.T) {
+	var captured []string
+	orig := execCommand
+	execCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		captured = append([]string{name}, args...)
+		return exec.CommandContext(ctx, "true")
+	}
+	t.Cleanup(func() { execCommand = orig })
+
+	sb := &Sandbox{containerID: "test-container"}
+	sb.dockerWriteFile(context.Background(), "/tmp/probe.js",
+		"any content with KOJUTO_EOF baked in\nstill not parsed by shell")
+
+	want := []string{
+		"docker", "exec", "-i", "--user=root", "test-container",
+		"sh", "-c", "cat > '/tmp/probe.js'",
+	}
+	if !reflect.DeepEqual(captured, want) {
+		t.Fatalf("docker args mismatch:\n got %q\nwant %q", captured, want)
+	}
+
+	for _, a := range captured {
+		if strings.Contains(a, "<<") {
+			t.Errorf("heredoc syntax leaked into arg %q", a)
+		}
+		if strings.Contains(a, "KOJUTO_EOF") {
+			t.Errorf("KOJUTO_EOF terminator leaked into arg %q", a)
+		}
+	}
+}
+
+// TestDockerWriteFile_QuotesPath confirms the path is single-quoted so a
+// future caller passing a path with shell metacharacters cannot break the
+// command. Every current caller passes a constant path; this test pins
+// the defense-in-depth contract for future code.
+func TestDockerWriteFile_QuotesPath(t *testing.T) {
+	var captured []string
+	orig := execCommand
+	execCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		captured = append([]string{name}, args...)
+		return exec.CommandContext(ctx, "true")
+	}
+	t.Cleanup(func() { execCommand = orig })
+
+	sb := &Sandbox{containerID: "test-container"}
+	sb.dockerWriteFile(context.Background(), "/tmp/$(rm -rf /)/x", "x")
+
+	last := captured[len(captured)-1]
+	if !strings.Contains(last, `'/tmp/$(rm -rf /)/x'`) {
+		t.Errorf("path not single-quoted in shell arg: %q", last)
 	}
 }

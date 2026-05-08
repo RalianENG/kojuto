@@ -519,44 +519,39 @@ func (s *Sandbox) plantHoneypotFiles(ctx context.Context) {
 
 	// SSH key pair.
 	s.dockerExecRoot(ctx, "mkdir", "-p", home+"/.ssh")
-	s.dockerExecRoot(ctx, "sh", "-c", "cat > "+home+"/.ssh/id_rsa << 'KOJUTO_EOF'\n"+
+	s.dockerWriteFile(ctx, home+"/.ssh/id_rsa",
 		"-----BEGIN OPENSSH PRIVATE KEY-----\n"+
-		"b3BlbnNzaC1rZXktdjEAAAAAFAAAAAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5\n"+
-		"AAAAI"+sshKeyBody+"\n"+
-		"-----END OPENSSH PRIVATE KEY-----\n"+
-		"KOJUTO_EOF")
+			"b3BlbnNzaC1rZXktdjEAAAAAFAAAAAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5\n"+
+			"AAAAI"+sshKeyBody+"\n"+
+			"-----END OPENSSH PRIVATE KEY-----\n")
 	s.dockerExecRoot(ctx, "chmod", "600", home+"/.ssh/id_rsa")
 
 	// AWS credentials.
 	s.dockerExecRoot(ctx, "mkdir", "-p", home+"/.aws")
-	s.dockerExecRoot(ctx, "sh", "-c", "cat > "+home+"/.aws/credentials << 'KOJUTO_EOF'\n"+
+	s.dockerWriteFile(ctx, home+"/.aws/credentials",
 		"[default]\n"+
-		"aws_access_key_id = "+awsKey+"\n"+
-		"aws_secret_access_key = "+awsSecret+"\n"+
-		"KOJUTO_EOF")
+			"aws_access_key_id = "+awsKey+"\n"+
+			"aws_secret_access_key = "+awsSecret+"\n")
 
 	// Git credentials.
-	s.dockerExecRoot(ctx, "sh", "-c", "cat > "+home+"/.git-credentials << 'KOJUTO_EOF'\n"+
-		"https://dev:"+ghToken+"@github.com\n"+
-		"KOJUTO_EOF")
+	s.dockerWriteFile(ctx, home+"/.git-credentials",
+		"https://dev:"+ghToken+"@github.com\n")
 	s.dockerExecRoot(ctx, "chmod", "600", home+"/.git-credentials")
 
 	// Netrc.
-	s.dockerExecRoot(ctx, "sh", "-c", "cat > "+home+"/.netrc << 'KOJUTO_EOF'\n"+
+	s.dockerWriteFile(ctx, home+"/.netrc",
 		"machine github.com\n"+
-		"login dev\n"+
-		"password "+ghToken+"\n"+
-		"KOJUTO_EOF")
+			"login dev\n"+
+			"password "+ghToken+"\n")
 	s.dockerExecRoot(ctx, "chmod", "600", home+"/.netrc")
 
 	// GitHub CLI config.
 	s.dockerExecRoot(ctx, "mkdir", "-p", home+"/.config/gh")
-	s.dockerExecRoot(ctx, "sh", "-c", "cat > "+home+"/.config/gh/hosts.yml << 'KOJUTO_EOF'\n"+
+	s.dockerWriteFile(ctx, home+"/.config/gh/hosts.yml",
 		"github.com:\n"+
-		"    oauth_token: "+ghToken+"\n"+
-		"    user: dev\n"+
-		"    git_protocol: https\n"+
-		"KOJUTO_EOF")
+			"    oauth_token: "+ghToken+"\n"+
+			"    user: dev\n"+
+			"    git_protocol: https\n")
 
 	// Fix ownership so the container user (dev) owns the files.
 	s.dockerExecRoot(ctx, "chown", "-R", "1000:1000", home+"/.ssh", home+"/.aws",
@@ -581,6 +576,22 @@ func (s *Sandbox) eraseFingerprints(ctx context.Context) {
 func (s *Sandbox) dockerExecRoot(ctx context.Context, args ...string) {
 	cmdArgs := append([]string{"exec", "--user=root", s.containerID}, args...)
 	cmd := execCommand(ctx, "docker", cmdArgs...)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	_ = cmd.Run()
+}
+
+// dockerWriteFile writes content into the container at path as root.
+// The body is delivered via stdin to `cat`, which keeps it out of the
+// shell command line entirely — unlike a `<< 'EOF'` heredoc, an attacker
+// who controls part of the body cannot smuggle a stray terminator line
+// to break out of the heredoc and execute arbitrary commands as root in
+// the container. path is single-quoted as defense-in-depth even though
+// every current caller passes a constant.
+func (s *Sandbox) dockerWriteFile(ctx context.Context, path, content string) {
+	cmdArgs := []string{"exec", "-i", "--user=root", s.containerID, "sh", "-c", "cat > " + shQuote(path)}
+	cmd := execCommand(ctx, "docker", cmdArgs...)
+	cmd.Stdin = strings.NewReader(content)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	_ = cmd.Run()
@@ -733,7 +744,7 @@ func (s *Sandbox) WriteProbeScriptsMulti(ctx context.Context, pkgs []string) {
 				p, requires.String(),
 			)
 			filename := "/tmp/_kojuto_probe_all_" + p + ".js"
-			s.dockerExecRoot(ctx, "sh", "-c", "cat > "+filename+" << 'KOJUTO_EOF'\n"+script+"KOJUTO_EOF")
+			s.dockerWriteFile(ctx, filename, script)
 		}
 		return
 	}
@@ -775,7 +786,7 @@ func (s *Sandbox) WriteProbeScriptsMulti(ctx context.Context, pkgs []string) {
 			p.sep, p.pathsep, p.linesep, imports.String(),
 		)
 		filename := "/tmp/_kojuto_probe_all_" + p.sysplatform + ".py"
-		s.dockerExecRoot(ctx, "sh", "-c", "cat > "+filename+" << 'KOJUTO_EOF'\n"+script+"KOJUTO_EOF")
+		s.dockerWriteFile(ctx, filename, script)
 	}
 }
 
@@ -860,7 +871,7 @@ func (s *Sandbox) WriteProbeScripts(ctx context.Context) {
 			p.sep, p.pathsep, p.linesep, importName,
 		)
 		filename := "/tmp/_kojuto_probe_" + p.sysplatform + ".py"
-		s.dockerExecRoot(ctx, "sh", "-c", "cat > "+filename+" << 'KOJUTO_EOF'\n"+script+"KOJUTO_EOF")
+		s.dockerWriteFile(ctx, filename, script)
 	}
 
 	jsPlatforms := []string{"linux", "win32", "darwin"}
@@ -872,7 +883,7 @@ func (s *Sandbox) WriteProbeScripts(ctx context.Context) {
 			p, s.pkg,
 		)
 		filename := "/tmp/_kojuto_probe_" + p + ".js"
-		s.dockerExecRoot(ctx, "sh", "-c", "cat > "+filename+" << 'KOJUTO_EOF'\n"+script+"KOJUTO_EOF")
+		s.dockerWriteFile(ctx, filename, script)
 	}
 }
 

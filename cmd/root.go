@@ -646,6 +646,17 @@ func runLocalScan(_ []string) error {
 		pkg = detectPackageName(filepath.Base(localPath))
 	}
 
+	// Validate the derived package name with the same regex as registry
+	// scans. Local mode is the only path where pkg is built from a user-
+	// supplied filesystem path, so the name can carry any byte the OS
+	// allows — including newlines and shell metacharacters that downstream
+	// sandbox helpers used to interpolate into shell heredocs and Python/
+	// JS string literals. The dockerWriteFile refactor closed the heredoc
+	// path, but defending at the boundary keeps every future use site safe.
+	if err := downloaderValidate(pkg, ""); err != nil {
+		return fmt.Errorf("local package name derived from %q is unsafe: %w", localPath, err)
+	}
+
 	// Auto-detect ecosystem from file extension, but only if -e was not explicitly set.
 	// .tgz is always npm; .tar.gz is ambiguous (could be PyPI sdist), so only
 	// override to npm for .tgz, not .tar.gz.
