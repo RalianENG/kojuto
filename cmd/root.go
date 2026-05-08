@@ -581,7 +581,12 @@ func writePinnedPyPI(path string, deps []pinnedDep) error {
 			fmt.Fprintf(&b, "%s\n", dep.Name)
 		}
 	}
-	return os.WriteFile(path, []byte(b.String()), 0o644)
+	// 0o600 — pinned files can carry private package names (internal
+	// registry deps) and embedded version metadata; default to user-
+	// only readable so a multi-user host doesn't leak the manifest to
+	// other accounts. Caller can chmod after the fact if they want to
+	// share.
+	return os.WriteFile(path, []byte(b.String()), 0o600)
 }
 
 func writePinnedNpm(path string, deps []pinnedDep) error {
@@ -606,7 +611,9 @@ func writePinnedNpm(path string, deps []pinnedDep) error {
 	}
 	jsonBytes = append(jsonBytes, '\n')
 
-	return os.WriteFile(path, jsonBytes, 0o644)
+	// 0o600 for the same reason as writePinnedPyPI — keep the pinned
+	// manifest from leaking to other users on a shared host.
+	return os.WriteFile(path, jsonBytes, 0o600)
 }
 
 // runLocalScan scans a local package file (.whl, .tgz) or directory.
@@ -1137,7 +1144,13 @@ func openOutput() (*os.File, error) {
 		return os.Stdout, nil
 	}
 
-	f, err := os.Create(flagOutput)
+	// 0o600 — the report can carry attacker-supplied code snippets,
+	// inferred file paths, and any internal package names from the
+	// scanned dependency tree. os.Create defaults to 0o666 (then
+	// umask-clipped, typically 0o644), which would leak the report
+	// to other users on a multi-user host. Owner-only by default;
+	// users who explicitly want to share can chmod after the fact.
+	f, err := os.OpenFile(flagOutput, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("creating output file: %w", err)
 	}
