@@ -29,10 +29,14 @@ inputs:
     description: 'Scan a local package file (.whl, .tgz) or directory'
     required: false
     default: ''
-  runtime:
-    description: 'Container runtime: auto (default, use gVisor if available), runsc (force gVisor), runc (force Docker default). Empty string also resolves to auto on the CLI.'
+  config:
+    description: 'Path to kojuto.yml config file (default: kojuto.yml in current directory)'
     required: false
     default: ''
+  runtime:
+    description: 'Container runtime: auto (use gVisor if available), runsc (force gVisor), runc (force Docker default)'
+    required: false
+    default: 'auto'
   probe-method:
     description: 'Probe method: auto, ebpf, strace, strace-container'
     required: false
@@ -45,6 +49,14 @@ inputs:
     description: 'Ignore sensitive_paths.exclude from config (recommended for CI)'
     required: false
     default: 'true'
+  quiet:
+    description: 'Suppress phase progress output; emit only the final verdict block'
+    required: false
+    default: 'false'
+  no-color:
+    description: 'Disable colored output (NO_COLOR env is also respected)'
+    required: false
+    default: 'false'
 
 outputs:
   verdict:
@@ -77,10 +89,13 @@ runs:
         KOJUTO_FILE: ${{ inputs.file }}
         KOJUTO_PIN: ${{ inputs.pin }}
         KOJUTO_LOCAL: ${{ inputs.local }}
+        KOJUTO_CONFIG: ${{ inputs.config }}
         KOJUTO_RUNTIME: ${{ inputs.runtime }}
         KOJUTO_PROBE_METHOD: ${{ inputs.probe-method }}
         KOJUTO_TIMEOUT: ${{ inputs.timeout }}
         KOJUTO_STRICT: ${{ inputs.strict }}
+        KOJUTO_QUIET: ${{ inputs.quiet }}
+        KOJUTO_NO_COLOR: ${{ inputs['no-color'] }}
       run: |
         ARGS=()
 
@@ -111,8 +126,17 @@ runs:
         if [ -n "$KOJUTO_RUNTIME" ]; then
           ARGS+=("--runtime" "$KOJUTO_RUNTIME")
         fi
+        if [ -n "$KOJUTO_CONFIG" ]; then
+          ARGS+=("--config" "$KOJUTO_CONFIG")
+        fi
         if [ "$KOJUTO_STRICT" = "true" ]; then
           ARGS+=("--strict")
+        fi
+        if [ "$KOJUTO_QUIET" = "true" ]; then
+          ARGS+=("--quiet")
+        fi
+        if [ "$KOJUTO_NO_COLOR" = "true" ]; then
+          ARGS+=("--no-color")
         fi
 
         sudo "${{ github.action_path }}/kojuto" scan "${ARGS[@]}" \

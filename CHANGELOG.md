@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **System binary write detection** — `openat` with write flags to trusted system binaries (`python3`, `node`, `pip`, `sh`, etc.) in `/usr/local/bin/` or `/usr/bin/` classified as `binary_hijacking`, preventing benignPaths bypass via tmpfs overwrite
 - **gVisor auto-detection** — `--runtime` default changed from empty (runc) to `auto`: probes `docker info` for runsc availability and uses gVisor if registered, falls back to runc otherwise
 - **npm test package** — `testdata/probe-npm-0.1.0/` with lifecycle hook payloads (preinstall/postinstall) and require-time import phase covering 31 TTPs across 9 attack categories including audit hook validation
+- **GitHub Action inputs** — `config`, `quiet`, and `no-color` exposed as Action inputs to match CLI flags (`--config`, `--quiet`, `--no-color`)
 
 ### Changed
 - Go version requirement lowered from 1.25.0 to 1.24.0 (stable release); `golang.org/x/sys` downgraded from v0.43.0 to v0.41.0
