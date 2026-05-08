@@ -870,7 +870,6 @@ func TestParseAuditHook_IntegratedWithParseStraceLine(t *testing.T) {
 	}
 }
 
-
 // TestParseStraceLine_RenameWithEscapedQuotes pins the security fix for
 // the prior `"([^"]+)"` capture pattern, which silently dropped the
 // rename event whenever a filename contained a literal `"` (escaped by

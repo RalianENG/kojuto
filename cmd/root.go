@@ -671,8 +671,8 @@ func runLocalScan(_ []string) error {
 	// sandbox helpers used to interpolate into shell heredocs and Python/
 	// JS string literals. The dockerWriteFile refactor closed the heredoc
 	// path, but defending at the boundary keeps every future use site safe.
-	if err := downloaderValidate(pkg, ""); err != nil {
-		return fmt.Errorf("local package name derived from %q is unsafe: %w", localPath, err)
+	if validateErr := downloaderValidate(pkg, ""); validateErr != nil {
+		return fmt.Errorf("local package name derived from %q is unsafe: %w", localPath, validateErr)
 	}
 
 	// Auto-detect ecosystem from file extension, but only if -e was not explicitly set.

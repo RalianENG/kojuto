@@ -132,7 +132,7 @@ func TestWriteJSON_StripsAnsiFromAttackerFields(t *testing.T) {
 		t.Fatalf("WriteJSON failed: %v", err)
 	}
 
-	// The serialised JSON must not contain a literal ESC byte (0x1b)
+	// The serialized JSON must not contain a literal ESC byte (0x1b)
 	// or BEL/NUL anywhere, even after JSON decoding.
 	var decoded types.Report
 	if err := json.Unmarshal(buf.Bytes(), &decoded); err != nil {
@@ -147,7 +147,7 @@ func TestWriteJSON_StripsAnsiFromAttackerFields(t *testing.T) {
 			{"FilePath", e.FilePath},
 		}
 		for _, f := range fields {
-			for i := 0; i < len(f.val); i++ {
+			for i := range len(f.val) {
 				c := f.val[i]
 				if c < 0x20 || c == 0x7f {
 					t.Errorf("%s contains raw control byte 0x%02x: %q", f.name, c, f.val)

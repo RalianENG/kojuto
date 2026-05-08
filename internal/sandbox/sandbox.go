@@ -729,7 +729,7 @@ func npmLifecycleScript(pkgs []string) string {
 }
 
 // shQuote wraps s in POSIX single quotes, escaping any embedded single
-// quote with the standard '\'' close-escape-reopen idiom. Safe for use
+// quote with the standard '\” close-escape-reopen idiom. Safe for use
 // in /bin/sh, dash, and bash.
 func shQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"

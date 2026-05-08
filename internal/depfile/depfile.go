@@ -20,7 +20,7 @@ import (
 // validation here gives the user a clear error instead of a silently
 // malformed command.
 var (
-	npmNameRe  = regexp.MustCompile(`^(@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$`)
+	npmNameRe  = regexp.MustCompile(`^(@[a-z0-9][a-z0-9._~-]*/)?[a-z0-9][a-z0-9._~-]*$`)
 	pypiNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 )
 

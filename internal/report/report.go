@@ -65,7 +65,7 @@ func WriteJSON(r *types.Report, w io.Writer) error {
 // their values never contain control bytes.
 func sanitizeEventStrings(e *types.SyscallEvent) {
 	v := reflect.ValueOf(e).Elem()
-	for i := 0; i < v.NumField(); i++ {
+	for i := range v.NumField() {
 		f := v.Field(i)
 		if f.Kind() == reflect.String && f.CanSet() {
 			f.SetString(sanitizeControl(f.String()))
@@ -101,7 +101,7 @@ func sanitizeControl(s string) string {
 }
 
 func needsControlEscape(s string) bool {
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		c := s[i]
 		if c < 0x20 || c == 0x7f {
 			return true

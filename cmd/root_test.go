@@ -389,8 +389,8 @@ func TestOutputFiles_OwnerOnly(t *testing.T) {
 	}
 
 	npmPath := filepath.Join(dir, "package.json")
-	if err := writePinnedNpm(npmPath, deps); err != nil {
-		t.Fatalf("writePinnedNpm: %v", err)
+	if writeErr := writePinnedNpm(npmPath, deps); writeErr != nil {
+		t.Fatalf("writePinnedNpm: %v", writeErr)
 	}
 	npmInfo, err := os.Stat(npmPath)
 	if err != nil {
