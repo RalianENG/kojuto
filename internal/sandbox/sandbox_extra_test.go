@@ -176,6 +176,32 @@ func TestGetHostUsername(t *testing.T) {
 	}
 }
 
+// TestGetHostUsername_Sanitizes pins that an exotic USER value (shell
+// metacharacters, path separators, non-ASCII) is normalised before it
+// flows into mountPoint and from there into -v volume specs and shell
+// command lines.
+func TestGetHostUsername_Sanitizes(t *testing.T) {
+	cases := []struct {
+		userEnv, want string
+	}{
+		{"alice", "alice"},
+		{"a;rm -rf /", "arm-rf"},
+		{"$(id)", "id"},
+		{"a:b", "ab"},
+		{"a/b", "ab"},
+		{"日本語", "user"},
+	}
+
+	for _, tc := range cases {
+		t.Setenv("USER", tc.userEnv)
+		t.Setenv("USERNAME", "")
+		t.Setenv("LOGNAME", "")
+		if got := getHostUsername(); got != tc.want {
+			t.Errorf("USER=%q: getHostUsername() = %q, want %q", tc.userEnv, got, tc.want)
+		}
+	}
+}
+
 func TestGetHostResources(t *testing.T) {
 	cpus, mem := getHostResources()
 

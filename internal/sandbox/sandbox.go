@@ -223,14 +223,17 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 // The result is sanitized to prevent Docker flag injection via hostile hostnames.
 func getHostHostname() string {
 	if h, err := os.Hostname(); err == nil && h != "" {
-		return sanitizeDockerArg(h)
+		return sanitizeDockerArg(h, "localhost")
 	}
 	return "localhost"
 }
 
-// sanitizeDockerArg strips characters that could break Docker CLI arguments.
-// Docker hostnames must match [a-zA-Z0-9][a-zA-Z0-9_.-].
-func sanitizeDockerArg(s string) string {
+// sanitizeDockerArg strips characters that could break Docker CLI
+// arguments. Output is restricted to [a-zA-Z0-9._-] — the intersection
+// of the Docker hostname rule and the chars that are safe to interpolate
+// into shell command lines and -v <src>:<dst> volume specs without
+// quoting. fallback is returned when every byte was stripped.
+func sanitizeDockerArg(s, fallback string) string {
 	var b strings.Builder
 	for _, c := range s {
 		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' {
@@ -238,7 +241,7 @@ func sanitizeDockerArg(s string) string {
 		}
 	}
 	if b.Len() == 0 {
-		return "localhost"
+		return fallback
 	}
 	return b.String()
 }
@@ -285,12 +288,16 @@ func getHostResources() (cpus, memory string) {
 	return cpus, memory
 }
 
-// getHostUsername returns the current OS username.
+// getHostUsername returns the current OS username, sanitized to the same
+// charset as getHostHostname. The result flows into mountPoint =
+// "/home/<user>/projects", which is interpolated into a -v <src>:<dst>:ro
+// volume spec and a `pip install ... <mountPoint>/*` shell glob. Even
+// though env vars are normally trusted, mirroring the hostname sanitizer
+// removes any case where a future runner sets USER to something exotic.
 func getHostUsername() string {
-	// Try common env vars (works on Linux, macOS, Windows).
 	for _, key := range []string{"USER", "USERNAME", "LOGNAME"} {
 		if u := os.Getenv(key); u != "" {
-			return u
+			return sanitizeDockerArg(u, "user")
 		}
 	}
 	return "user"
