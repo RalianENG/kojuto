@@ -87,13 +87,19 @@ var (
 	)
 
 	// rename("/tmp/evil", "/usr/local/bin/python3") = 0.
+	// `(?:\\.|[^"\\])+` accepts strace's C-style backslash escapes
+	// inside the captured filename. The previous `[^"]+` failed on
+	// strace lines whose filename contained a literal `"` (rendered
+	// as `\"` by strace), causing the whole regex to drop the event
+	// — a malicious package could rename `/tmp/x"y` over a trusted
+	// system binary and leave no rename event for the analyzer.
 	straceRenameRe = regexp.MustCompile(
-		`rename\("([^"]+)",\s*"([^"]+)"\)`,
+		`rename\("((?:\\.|[^"\\])+)",\s*"((?:\\.|[^"\\])+)"\)`,
 	)
 
 	// renameat(AT_FDCWD, "old", AT_FDCWD, "new") or renameat2(...)
 	straceRenameatRe = regexp.MustCompile(
-		`renameat2?\([^,]+,\s*"([^"]+)",\s*[^,]+,\s*"([^"]+)"`,
+		`renameat2?\([^,]+,\s*"((?:\\.|[^"\\])+)",\s*[^,]+,\s*"((?:\\.|[^"\\])+)"`,
 	)
 
 	// mmap(NULL, 4096, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f...

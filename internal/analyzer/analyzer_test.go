@@ -279,6 +279,16 @@ func TestAnalyze_RenameTrustedBinary(t *testing.T) {
 		{"new CLI script", "/usr/local/bin/my-tool", types.VerdictClean},
 		{"install dir", "/install/lib/module.so", types.VerdictClean},
 		{"tmp rename", "/tmp/a", types.VerdictClean},
+		// Basename-only DstPath: the eBPF probe captures only the
+		// dentry name from vfs_rename's renamedata, not the parent
+		// path. Without the parent we can't verify the rename is in
+		// a trusted dir, so a basename matching a system binary must
+		// stay suspicious. Otherwise an eBPF-mode scan of a malware
+		// sample that renames over /usr/local/bin/python3 silently
+		// reports CLEAN.
+		{"basename-only python3 (eBPF mode)", "python3", types.VerdictSuspicious},
+		{"basename-only sh (eBPF mode)", "sh", types.VerdictSuspicious},
+		{"basename-only unknown (eBPF mode)", "myapp", types.VerdictClean},
 	}
 
 	for _, tc := range cases {

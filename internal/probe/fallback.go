@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strconv"
 	"sync"
@@ -59,6 +60,7 @@ func (s *StraceFallback) StartWithPID(pid uint32) error {
 		defer close(s.events)
 		state := NewParseState()
 		scanner := bufio.NewScanner(stderr)
+		scanner.Buffer(make([]byte, 64*1024), straceMaxLine)
 		for scanner.Scan() {
 			evt, ok := parseStraceLine(scanner.Text(), state)
 			if ok {
@@ -70,6 +72,13 @@ func (s *StraceFallback) StartWithPID(pid uint32) error {
 					s.dropped++
 				}
 			}
+		}
+		if err := scanner.Err(); err != nil {
+			// See straceMaxLine: an unrecoverable scanner failure
+			// here means subsequent trace lines are lost. Flip to
+			// inconclusive via dropped.
+			s.dropped++
+			fmt.Fprintf(os.Stderr, "warning: strace stderr scanner aborted: %v\n", err)
 		}
 	}()
 

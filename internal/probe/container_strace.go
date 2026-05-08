@@ -6,10 +6,20 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 
 	"github.com/RalianENG/kojuto/internal/types"
 )
+
+// straceMaxLine bounds the size of a single strace stderr line. With
+// `-s 256` the per-arg cap is 256 bytes, so realistic execve+argv lines
+// stay well under 1 MiB. We allow 16 MiB to accommodate exotic kernels
+// or tracee writes interleaved on the shared docker exec stderr; lines
+// longer than this are treated as adversarial (a malicious package
+// trying to overflow bufio.Scanner's default 64 KiB cap so the scan
+// loop exits and subsequent strace events are silently dropped).
+const straceMaxLine = 16 * 1024 * 1024
 
 // ContainerStrace monitors connect(2) syscalls by running strace inside the Docker container.
 // This works on all platforms where Docker is available (Linux, macOS, Windows).
@@ -96,6 +106,7 @@ func (c *ContainerStrace) parseStraceOutput(stderr io.ReadCloser, done chan<- st
 
 	state := NewParseState()
 	scanner := bufio.NewScanner(stderr)
+	scanner.Buffer(make([]byte, 64*1024), straceMaxLine)
 	for scanner.Scan() {
 		evt, ok := parseStraceLine(scanner.Text(), state)
 		if !ok {
@@ -111,6 +122,16 @@ func (c *ContainerStrace) parseStraceOutput(stderr io.ReadCloser, done chan<- st
 			// The caller should treat this as inconclusive.
 			c.dropped++
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		// bufio.ErrTooLong here means the tracee wrote a >16 MiB
+		// chunk to the shared docker-exec stderr without a newline,
+		// most plausibly to disable parsing of subsequent strace
+		// trace lines. Any other error means the pipe died early.
+		// Either way we lost an unknown number of events, so flip
+		// the verdict to inconclusive via the dropped counter.
+		c.dropped++
+		fmt.Fprintf(os.Stderr, "warning: strace stderr scanner aborted: %v\n", err)
 	}
 }
 

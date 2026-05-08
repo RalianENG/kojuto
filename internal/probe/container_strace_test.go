@@ -265,3 +265,55 @@ func TestParseStraceOutput_Done(_ *testing.T) {
 
 	<-parseDone // should complete without hanging
 }
+
+// chunkReader returns the same chunk repeatedly until `remaining` bytes
+// have been served, then EOF. Used to feed bufio.Scanner a giant single
+// "line" without allocating it all up front.
+type chunkReader struct {
+	chunk     []byte
+	remaining int
+}
+
+func (r *chunkReader) Read(p []byte) (int, error) {
+	if r.remaining <= 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.chunk)
+	if n > r.remaining {
+		n = r.remaining
+	}
+	r.remaining -= n
+	return n, nil
+}
+
+func (r *chunkReader) Close() error { return nil }
+
+// TestParseStraceOutput_LongLineFlipsToInconclusive pins the security
+// fix for the prior detection-bypass: a malicious package could write
+// >64 KiB without a newline to the shared docker-exec stderr (which
+// carries strace trace output too), trip bufio.Scanner's default cap,
+// silently terminate the parser loop, and let every subsequent strace
+// event evade the analyzer. The fix raises the cap to straceMaxLine
+// and turns any scanner error into a `dropped++` so the verdict logic
+// flips to inconclusive instead of trusting the truncated trace.
+func TestParseStraceOutput_LongLineFlipsToInconclusive(t *testing.T) {
+	// Slightly more than straceMaxLine, no newlines, so bufio.Scanner
+	// returns ErrTooLong. Use a chunkReader to avoid allocating the
+	// full payload — straceMaxLine is 16 MiB.
+	reader := &chunkReader{
+		chunk:     bytes.Repeat([]byte{'A'}, 4096),
+		remaining: straceMaxLine + 1024,
+	}
+
+	cs := &ContainerStrace{
+		events: make(chan types.SyscallEvent, 16),
+		done:   make(chan struct{}),
+	}
+	parseDone := make(chan struct{})
+	go cs.parseStraceOutput(reader, parseDone)
+	<-parseDone
+
+	if cs.dropped == 0 {
+		t.Error("expected dropped > 0 after scanner overflow, got 0")
+	}
+}

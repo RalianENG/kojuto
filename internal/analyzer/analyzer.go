@@ -942,13 +942,27 @@ var fileOpCommands = map[string]bool{
 // Renames to other destinations (e.g. pip installing a new CLI script) are benign.
 func isBenignRename(evt *types.SyscallEvent) bool {
 	destBase := path.Base(evt.DstPath)
-	destDir := path.Dir(evt.DstPath) + "/"
+	allowedDirs, ok := benignPaths[destBase]
+	if !ok {
+		return true
+	}
 
-	if allowedDirs, ok := benignPaths[destBase]; ok {
-		for _, d := range allowedDirs {
-			if destDir == d {
-				return false
-			}
+	// Basename-only DstPath (no leading "/") means the probe captured
+	// only the dentry name and not the parent directory — the eBPF
+	// probe takes this shape because vfs_rename's renamedata gives us
+	// d_name (a qstr basename) rather than a full path. Without the
+	// parent we cannot prove the rename targets a trusted directory,
+	// so fail-safe: a rename whose basename matches a tracked binary
+	// (python3, node, sh, ...) stays suspicious. Strace mode emits
+	// absolute paths and falls through to the directory check below.
+	if !strings.HasPrefix(evt.DstPath, "/") {
+		return false
+	}
+
+	destDir := path.Dir(evt.DstPath) + "/"
+	for _, d := range allowedDirs {
+		if destDir == d {
+			return false
 		}
 	}
 
