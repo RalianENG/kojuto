@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 
 	"github.com/RalianENG/kojuto/internal/types"
@@ -350,54 +349,12 @@ func TestOpenOutput_File(t *testing.T) {
 		t.Error("expected a file, not os.Stdout")
 	}
 
-	// Verify the file was actually created.
-	info, err := os.Stat(flagOutput)
-	if err != nil {
-		t.Fatalf("output file was not created: %v", err)
-	}
-	// Owner-only mode: gosec G306. Reports embed attacker-supplied
-	// snippets / paths that shouldn't leak to other users on a shared
-	// host. Test under a known umask so we measure the requested mode
-	// rather than the system umask's clipping.
-	oldUmask := syscall.Umask(0)
-	defer syscall.Umask(oldUmask)
-	if mode := info.Mode().Perm(); mode != 0o600 {
-		t.Errorf("output file mode = %o, want 0o600", mode)
-	}
-}
-
-// TestOutputFiles_OwnerOnly pins the 0o600 contract for both pinned-
-// manifest writers as well — they share the same threat model as the
-// main report (multi-user host, package metadata leakage).
-func TestOutputFiles_OwnerOnly(t *testing.T) {
-	oldUmask := syscall.Umask(0)
-	defer syscall.Umask(oldUmask)
-
-	dir := t.TempDir()
-	deps := []pinnedDep{{Name: "lodash", Version: "4.17.21"}}
-
-	pyPath := filepath.Join(dir, "requirements.txt")
-	if err := writePinnedPyPI(pyPath, deps); err != nil {
-		t.Fatalf("writePinnedPyPI: %v", err)
-	}
-	pyInfo, err := os.Stat(pyPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if mode := pyInfo.Mode().Perm(); mode != 0o600 {
-		t.Errorf("pinned requirements.txt mode = %o, want 0o600", mode)
-	}
-
-	npmPath := filepath.Join(dir, "package.json")
-	if writeErr := writePinnedNpm(npmPath, deps); writeErr != nil {
-		t.Fatalf("writePinnedNpm: %v", writeErr)
-	}
-	npmInfo, err := os.Stat(npmPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if mode := npmInfo.Mode().Perm(); mode != 0o600 {
-		t.Errorf("pinned package.json mode = %o, want 0o600", mode)
+	// Verify the file was actually created. The owner-only (0o600)
+	// permission contract is exercised by TestOpenOutput_FileMode and
+	// TestOutputFiles_OwnerOnly in root_unix_test.go — those tests
+	// rely on syscall.Umask, which is not defined on Windows.
+	if _, err := os.Stat(flagOutput); err != nil {
+		t.Errorf("output file was not created: %v", err)
 	}
 }
 
