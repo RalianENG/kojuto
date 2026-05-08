@@ -253,7 +253,7 @@ Of the 300 malicious samples, 238 failed to install (dependencies already remove
 |----------|----------|-----------------|
 | C2 communication (`c2_communication`) | `aiogram-types-v3` → `147.45.124.42:80` | `connect`/`sendto` to non-loopback IPs |
 | Data exfiltration (`data_exfiltration`) | DNS resolution of Discord/Telegram/Pastebin | `sendto` port 53 resolving known exfil services |
-| Credential access (`credential_access`) | `axios-attack-demo` → `.ssh/id_rsa`, `.aws/credentials`, `.solana/id.json` | `openat` on ~50 sensitive paths (SSH, cloud, crypto wallets, browser data) |
+| Credential access (`credential_access`) | `axios-attack-demo` → `.ssh/id_rsa`, `.aws/credentials`, `.solana/id.json` | `openat` on ~60 sensitive paths (SSH, cloud, crypto wallets, browser data) |
 | Code execution (`code_execution`) | `advpruebitaa` → `type nul > prueba11.txt`, `/tmp/ld.py` | `execve` with inline `-c`/`-e` flags or from `/tmp`, `/dev/shm` |
 | Memory execution (`memory_execution`) | `ctypes.mmap(RWX)` shellcode injection | `mmap`/`mprotect` with simultaneous PROT_WRITE+PROT_EXEC |
 | Binary hijacking (`binary_hijacking`) | `rename /tmp/evil /usr/local/bin/python3` | `rename` targeting trusted system binaries |
