@@ -696,15 +696,25 @@ func npmLifecycleScript(pkgs []string) string {
 		if i > 0 {
 			b.WriteString("; ")
 		}
-		// Quote the path so scoped packages like @scope/pkg work
-		// without word-splitting.
-		b.WriteString(`(cd "/install/node_modules/`)
-		b.WriteString(p)
-		b.WriteString(`" && `)
+		// Single-quote the full cd target so any shell metacharacters
+		// in p (which originates from package.json keys, i.e. attacker-
+		// controllable input) cannot break out of the argument. depfile
+		// validates names at parse time; this is defense-in-depth for
+		// any future code path that populates pkgs from another source.
+		b.WriteString(`(cd `)
+		b.WriteString(shQuote("/install/node_modules/" + p))
+		b.WriteString(` && `)
 		b.WriteString(hooks)
 		b.WriteString(`) 2>&1`)
 	}
 	return b.String()
+}
+
+// shQuote wraps s in POSIX single quotes, escaping any embedded single
+// quote with the standard '\'' close-escape-reopen idiom. Safe for use
+// in /bin/sh, dash, and bash.
+func shQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // WriteProbeScriptsMulti writes one combined import probe script per OS identity.

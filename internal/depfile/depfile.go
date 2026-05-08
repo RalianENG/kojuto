@@ -7,9 +7,21 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/RalianENG/kojuto/internal/types"
+)
+
+// Package-name validators. Names flow into shell scripts (npm lifecycle
+// hooks) and environment variables (KOJUTO_SCAN_PKGS) inside the sandbox,
+// so we reject anything outside the registry-allowed character sets at
+// parse time. The sandbox also single-quotes names at the use site, but
+// validation here gives the user a clear error instead of a silently
+// malformed command.
+var (
+	npmNameRe  = regexp.MustCompile(`^(@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$`)
+	pypiNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 )
 
 // Dep represents a single dependency extracted from a file.
@@ -81,6 +93,9 @@ func parseRequirementsTxt(path string) ([]Dep, error) {
 		}
 
 		if dep.Name != "" {
+			if !pypiNameRe.MatchString(dep.Name) {
+				return nil, fmt.Errorf("invalid package name %q in %s", dep.Name, path)
+			}
 			deps = append(deps, dep)
 		}
 	}
@@ -106,9 +121,15 @@ func parsePackageJSON(path string) ([]Dep, error) {
 	var deps []Dep
 
 	for name, ver := range pkg.Dependencies {
+		if !npmNameRe.MatchString(name) {
+			return nil, fmt.Errorf("invalid package name %q in %s", name, path)
+		}
 		deps = append(deps, Dep{Name: name, Version: cleanNpmVersion(ver)})
 	}
 	for name, ver := range pkg.DevDependencies {
+		if !npmNameRe.MatchString(name) {
+			return nil, fmt.Errorf("invalid package name %q in %s", name, path)
+		}
 		deps = append(deps, Dep{Name: name, Version: cleanNpmVersion(ver)})
 	}
 

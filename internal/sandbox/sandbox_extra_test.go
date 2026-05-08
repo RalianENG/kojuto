@@ -347,9 +347,42 @@ func TestNpmLifecycleScript_ScopedPackage(t *testing.T) {
 	// shell command. Regression guard for a bug that would have hidden
 	// scoped-dep lifecycle behavior from strace.
 	got := npmLifecycleScript([]string{"@scope/lib"})
-	want := `"/install/node_modules/@scope/lib"`
+	want := `'/install/node_modules/@scope/lib'`
 	if !strings.Contains(got, want) {
 		t.Errorf("scoped path missing %q in:\n%s", want, got)
+	}
+}
+
+func TestShQuote(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"foo", "'foo'"},
+		{"a b", "'a b'"},
+		{"@scope/pkg", "'@scope/pkg'"},
+		{"$(id)", "'$(id)'"},
+		{"`id`", "'`id`'"},
+		{"a'b", `'a'\''b'`},
+		{"", "''"},
+	}
+	for _, tc := range cases {
+		if got := shQuote(tc.in); got != tc.want {
+			t.Errorf("shQuote(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestNpmLifecycleScript_QuotesShellMetachars(t *testing.T) {
+	// Defense-in-depth: even if a malformed name slips past the depfile
+	// validator, the cd target must be safely single-quoted so shell
+	// metacharacters cannot break out and execute on the sandbox shell.
+	got := npmLifecycleScript([]string{`foo$(id)`})
+	if !strings.Contains(got, `'/install/node_modules/foo$(id)'`) {
+		t.Errorf("metachar payload not single-quoted in:\n%s", got)
+	}
+	// The bare token must NOT appear unquoted between cd and &&.
+	if strings.Contains(got, `cd /install/node_modules/foo$(id) `) {
+		t.Errorf("metachar payload unquoted in:\n%s", got)
 	}
 }
 
