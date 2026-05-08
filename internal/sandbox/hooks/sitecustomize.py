@@ -41,7 +41,27 @@ def _is_user(fn):
 
 
 def _t(s):
-    s = str(s).replace("\n", "\\n").replace("\r", "\\r")
+    # Escape every C0 control byte (0x00-0x1f) and DEL (0x7f) to a
+    # printable form. The wire format only needs newline-stripping for
+    # framing safety (handled in _w too), but the snippet field
+    # eventually surfaces in report.json's code_snippet — a downstream
+    # consumer that decodes the JSON and prints the raw string (e.g.
+    # `jq -r .events[].code_snippet`) used to receive an unescaped
+    # ESC (0x1b) byte and let an attacker-supplied payload paint
+    # arbitrary text on the user's terminal via ANSI sequences.
+    out = []
+    for ch in str(s):
+        if ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ord(ch) < 0x20 or ord(ch) == 0x7f:
+            out.append("\\x%02x" % ord(ch))
+        else:
+            out.append(ch)
+    s = "".join(out)
     if len(s) > _MAX:
         return s[:_MAX] + "..."
     return s
