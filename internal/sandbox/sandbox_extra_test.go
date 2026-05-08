@@ -643,20 +643,6 @@ func withFailingExec(t *testing.T) {
 	t.Cleanup(func() { execCommand = orig })
 }
 
-// TestEraseFingerprints_FailLoud pins the contract that a failing docker
-// command (e.g. `rm -f /.dockerenv` rejected by a corrupted runtime) must
-// surface as an error rather than silently leaving the fingerprint in place.
-// See SECURITY.md "Anti-Fingerprinting" — a swallowed error here would mean
-// sandbox-aware malware could detect the container and produce a false-clean
-// verdict.
-func TestEraseFingerprints_FailLoud(t *testing.T) {
-	withFailingExec(t)
-	sb := &Sandbox{containerID: "test-container"}
-	if err := sb.eraseFingerprints(context.Background()); err == nil {
-		t.Fatal("eraseFingerprints returned nil despite failing docker command")
-	}
-}
-
 func TestPlantHoneypotFiles_FailLoud(t *testing.T) {
 	withFailingExec(t)
 	sb := &Sandbox{containerID: "test-container"}

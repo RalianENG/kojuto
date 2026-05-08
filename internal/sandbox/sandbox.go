@@ -52,7 +52,11 @@ type Sandbox struct {
 	needsPtrace bool
 	localMode   bool   // when true, install from local files (sdist/wheel) directly
 	seccompDir  string // per-instance temp dir for seccomp profile
-	scanPkgs    []string
+	// dockerenvMask is the host-side empty file bind-mounted over
+	// /.dockerenv to mask the docker-injected sentinel. Lives inside
+	// seccompDir so it is cleaned up by the same Cleanup path.
+	dockerenvMask string
+	scanPkgs      []string
 }
 
 // SetLocalMode enables local package installation mode (sdist support).
@@ -103,8 +107,15 @@ func resolveRuntime() string {
 	return RuntimeDefault
 }
 
-// writeSeccompProfile writes the embedded seccomp profile to a temp file
-// and returns the --security-opt flag value to pass to docker.
+// writeSeccompProfile writes the embedded seccomp profile and the empty
+// /.dockerenv mask file to a per-scan temp dir, then returns the
+// --security-opt flag value to pass to docker. The mask path is stashed in
+// s.dockerenvMask for containerArgs to bind-mount.
+//
+// The mask is an empty regular file (not /dev/null) so that
+// stat(/.dockerenv).S_ISREG() inside the container still returns true —
+// using a char device would itself be a fingerprint that distinguishes
+// kojuto's sandbox from a real Docker container.
 func (s *Sandbox) writeSeccompProfile() (string, error) {
 	dir, err := os.MkdirTemp("", "kojuto-seccomp-*")
 	if err != nil {
@@ -116,6 +127,12 @@ func (s *Sandbox) writeSeccompProfile() (string, error) {
 	if err := os.WriteFile(path, seccompProfile, 0o444); err != nil {
 		return "", fmt.Errorf("writing seccomp profile: %w", err)
 	}
+
+	dockerenvMask := filepath.Join(dir, "dockerenv-mask")
+	if err := os.WriteFile(dockerenvMask, nil, 0o444); err != nil {
+		return "", fmt.Errorf("writing dockerenv mask: %w", err)
+	}
+	s.dockerenvMask = dockerenvMask
 
 	return "seccomp=" + path, nil
 }
@@ -174,11 +191,25 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 	// Always apply the restrictive seccomp profile regardless of ptrace needs.
 	// Without it, Docker's default seccomp allows memfd_create, userfaultfd,
 	// open_by_handle_at, and other container-escape vectors.
+	//
+	// writeSeccompProfile also stages the host-side /.dockerenv mask file
+	// (s.dockerenvMask) used by the bind mount below.
 	seccompOpt, err := s.writeSeccompProfile()
 	if err != nil {
 		return nil, err
 	}
 	args = append(args, "--security-opt="+seccompOpt)
+
+	// Mask the docker-injected /.dockerenv sentinel by bind-mounting an
+	// empty file from the host over it. We can't `rm /.dockerenv` post-
+	// start because --read-only blocks rootfs writes (which is exactly
+	// why the previous post-start `rm -f /.dockerenv` always returned
+	// exit 1 — silently, until prepareSandboxState was made fail-loud).
+	// Sandbox-aware payloads that read /.dockerenv now see an empty
+	// regular file. Path-existence checks (`os.path.exists`) still see
+	// something, but those are defeated by --runtime=runsc which
+	// virtualizes the rootfs entirely.
+	args = append(args, "--mount=type=bind,src="+s.dockerenvMask+",dst=/.dockerenv,readonly")
 
 	if s.needsPtrace {
 		// Re-add SYS_PTRACE for strace, CHOWN+FOWNER for tmpfs file setup.
@@ -310,11 +341,14 @@ func getHostUsername() string {
 // rejects all connect()/sendto() syscalls with ENETUNREACH — there is
 // no network stack to exploit.
 //
-// Anti-fingerprinting countermeasures (applied post-start via eraseFingerprints):
-//   - Fake /etc/resolv.conf with a plausible nameserver IP
+// Anti-fingerprinting countermeasures:
+//   - /.dockerenv masked with an empty regular file via bind mount at
+//     create time (see writeSeccompProfile + containerArgs)
+//   - Fake /etc/resolv.conf with a plausible nameserver IP via --dns
 //   - connect() returning ENETUNREACH is indistinguishable from a firewalled
 //     host for most malware (only sophisticated actors check errno values)
-//   - /proc/net/tcp emptiness is mitigated by gVisor (--runtime runsc)
+//   - /proc/1/cgroup, /proc/self/mountinfo, and /proc/net/tcp emptiness
+//     are mitigated by gVisor (--runtime=runsc)
 //
 // Previous design used --internal bridge networks, which left Docker's
 // embedded DNS resolver (127.0.0.11) active inside the container. While
@@ -368,11 +402,12 @@ func (s *Sandbox) Create(ctx context.Context) error {
 // StartPaused starts the container and immediately pauses it.
 // This minimizes the TOCTOU window between container start and probe attachment.
 //
-// Errors from restoreLocalBin / eraseFingerprints / plantHoneypotFiles are
-// surfaced rather than swallowed: if the sandbox can't be brought to a
-// fingerprint-erased, honeypot-planted state, sandbox-aware malware may stay
-// dormant and produce a false-clean verdict. The caller is expected to abort
-// the scan (and surface "inconclusive") on any error returned here.
+// Errors from restoreLocalBin / plantHoneypotFiles are surfaced rather than
+// swallowed: if the sandbox can't be brought to a honeypot-planted state,
+// sandbox-aware malware may stay dormant and produce a false-clean verdict.
+// The caller is expected to abort the scan (and surface "inconclusive") on
+// any error returned here. /.dockerenv masking is handled at create time
+// via bind mount (see writeSeccompProfile + containerArgs).
 func (s *Sandbox) StartPaused(ctx context.Context) error {
 	startCmd := execCommand(ctx, "docker", "start", s.containerID)
 	startCmd.Stdout = io.Discard
@@ -414,15 +449,17 @@ func (s *Sandbox) Start(ctx context.Context) error {
 
 // prepareSandboxState runs the post-start container setup that every scan
 // depends on. Each step is fail-loud: a swallowed error here would let the
-// scan run in a partially-prepared sandbox (e.g. /.dockerenv still present,
-// honeypot files missing) and report "clean" for malware that simply detected
-// the gap and stayed quiet.
+// scan run in a partially-prepared sandbox (e.g. honeypot files missing)
+// and report "clean" for malware that simply detected the gap and stayed
+// quiet.
+//
+// /.dockerenv masking is intentionally NOT here — it's done at create time
+// via a bind mount in containerArgs (see writeSeccompProfile). The previous
+// post-start `rm -f /.dockerenv` could never succeed under --read-only and
+// silently failed for every scan.
 func (s *Sandbox) prepareSandboxState(ctx context.Context) error {
 	if err := s.restoreLocalBin(ctx); err != nil {
 		return fmt.Errorf("restoring sandbox tmpfs overlays: %w", err)
-	}
-	if err := s.eraseFingerprints(ctx); err != nil {
-		return fmt.Errorf("erasing sandbox fingerprints: %w", err)
 	}
 	if err := s.plantHoneypotFiles(ctx); err != nil {
 		return fmt.Errorf("planting honeypot files: %w", err)
@@ -614,27 +651,6 @@ func (s *Sandbox) plantHoneypotFiles(ctx context.Context) error {
 			return err
 		}
 	}
-	return nil
-}
-
-// eraseFingerprints removes or masks signals that reveal the container
-// environment to sandbox-aware malware. A failure here is fatal: leaving
-// /.dockerenv intact lets sandbox-aware payloads stay dormant and produce
-// a false-clean verdict.
-func (s *Sandbox) eraseFingerprints(ctx context.Context) error {
-	// 1. Remove /.dockerenv sentinel file.
-	if err := s.dockerExecRoot(ctx, "rm", "-f", "/.dockerenv"); err != nil {
-		return err
-	}
-
-	// 2. /etc/resolv.conf is injected via --dns=198.51.100.1 at container
-	//    creation time (RFC 5737 TEST-NET-2, guaranteed unreachable).
-	//    This works on --read-only rootfs and prevents fingerprinting.
-
-	// 3. /proc/1/cgroup and /proc/self/mountinfo are kernel-managed and
-	//    cannot be modified without gVisor. Use --runtime=runsc to mask
-	//    these remaining signals.
-
 	return nil
 }
 

@@ -177,6 +177,17 @@ func TestContainerArgs(t *testing.T) {
 		}
 	}
 
+	// /.dockerenv must be masked at create time. Post-start `rm` cannot
+	// succeed on --read-only rootfs, so the bind mount is the only path.
+	if !strings.Contains(joined, ",dst=/.dockerenv,readonly") {
+		t.Errorf("containerArgs missing /.dockerenv bind mount in:\n%s", joined)
+	}
+	if sb.dockerenvMask == "" {
+		t.Error("expected dockerenvMask to be set by writeSeccompProfile")
+	} else if _, statErr := os.Stat(sb.dockerenvMask); statErr != nil {
+		t.Errorf("dockerenvMask file not created: %v", statErr)
+	}
+
 	// Cleanup seccomp temp dir.
 	if sb.seccompDir != "" {
 		os.RemoveAll(sb.seccompDir)
@@ -472,16 +483,6 @@ func TestEnsureImage_Exists(t *testing.T) {
 	err := EnsureImage(context.Background(), "Dockerfile.sandbox")
 	if err != nil {
 		t.Fatalf("EnsureImage: %v", err)
-	}
-}
-
-func TestEraseFingerprints(t *testing.T) {
-	withFakeExec(t)
-	sb := newTestSandbox(t, types.EcosystemPyPI)
-	sb.containerID = fakeContainerID
-
-	if err := sb.eraseFingerprints(context.Background()); err != nil {
-		t.Fatalf("eraseFingerprints: %v", err)
 	}
 }
 
