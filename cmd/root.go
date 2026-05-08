@@ -165,10 +165,21 @@ func preRunLoadConfig(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("loading config %s: %w", cfgPath, err)
 	}
 
-	if flagStrict && len(cfg.SensitivePaths.Exclude) > 0 {
-		fmt.Fprintf(os.Stderr, "warning: --strict ignoring %d excluded path(s) from config: %v\n",
-			len(cfg.SensitivePaths.Exclude), cfg.SensitivePaths.Exclude)
-		cfg.SensitivePaths.Exclude = nil
+	if len(cfg.SensitivePaths.Exclude) > 0 {
+		if flagStrict {
+			fmt.Fprintf(os.Stderr, "warning: --strict ignoring %d excluded path(s) from config: %v\n",
+				len(cfg.SensitivePaths.Exclude), cfg.SensitivePaths.Exclude)
+			cfg.SensitivePaths.Exclude = nil
+		} else {
+			// Without --strict, an attacker-planted or otherwise
+			// untrusted kojuto.yml in the cwd silently shrinks the
+			// detection surface. Surface the exclusions on stderr so
+			// the user can see them in CI logs and interactive output
+			// before trusting a "clean" verdict.
+			fmt.Fprintf(os.Stderr, "warning: %s excludes %d sensitive path(s) from monitoring: %v\n",
+				cfgPath, len(cfg.SensitivePaths.Exclude), cfg.SensitivePaths.Exclude)
+			fmt.Fprintln(os.Stderr, "         pass --strict to ignore these exclusions")
+		}
 	}
 
 	paths := config.MergeSensitivePaths(cfg)

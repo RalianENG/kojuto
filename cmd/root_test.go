@@ -634,6 +634,55 @@ func TestPreRunLoadConfig_StrictIgnoresExclude(t *testing.T) {
 	}
 }
 
+// TestPreRunLoadConfig_LenientWarnsOnExclude pins the visibility
+// guarantee added for surface C: when --strict is OFF and the loaded
+// kojuto.yml carries `exclude` entries, a stderr warning surfaces the
+// reduction in coverage so a CI log or interactive run cannot silently
+// trust a "clean" verdict produced under a tampered config. Without
+// this, an attacker who plants kojuto.yml in the cwd of a target repo
+// can shrink the detection surface invisibly.
+func TestPreRunLoadConfig_LenientWarnsOnExclude(t *testing.T) {
+	origConfig := flagConfig
+	origStrict := flagStrict
+	defer func() { flagConfig = origConfig; flagStrict = origStrict }()
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "kojuto.yml")
+	if err := os.WriteFile(cfgPath, []byte("sensitive_paths:\n  exclude:\n    - \"/.ssh/\"\n    - \"/.aws/\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	flagConfig = cfgPath
+	flagStrict = false
+
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = oldStderr })
+
+	runErr := preRunLoadConfig(nil, nil)
+	w.Close()
+
+	data, _ := io.ReadAll(r)
+	got := string(data)
+
+	if runErr != nil {
+		t.Fatalf("preRunLoadConfig returned error: %v", runErr)
+	}
+	if !strings.Contains(got, "excludes 2 sensitive path(s)") {
+		t.Errorf("stderr missing exclusion-count warning, got:\n%s", got)
+	}
+	if !strings.Contains(got, "/.ssh/") || !strings.Contains(got, "/.aws/") {
+		t.Errorf("stderr missing the actual excluded paths, got:\n%s", got)
+	}
+	if !strings.Contains(got, "--strict") {
+		t.Errorf("stderr missing pointer to --strict flag, got:\n%s", got)
+	}
+}
+
 func TestPreRunLoadConfig_InvalidConfig(t *testing.T) {
 	origConfig := flagConfig
 	origStrict := flagStrict
