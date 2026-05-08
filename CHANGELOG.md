@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation aligned with implementation: README/SPECIFICATION/SECURITY now describe the actual `--network=none` sandbox (previously claimed an isolated bridge); Python audit hook list corrected (`compile`/`exec`/`import` — `eval` is a Node.js-only event); SPECIFICATION test-data section rewritten around `probe-alpha`/`probe-npm`/`evasion-test` (the obsolete `axios-demo` entry was stale)
 
 ### Fixed
+- **Sandbox preparation no longer fails silently** — `eraseFingerprints`, `plantHoneypotFiles`, `restoreLocalBin`, `WriteProbeScripts`, and `WriteProbeScriptsMulti` now return errors instead of swallowing the result of every `docker exec`. A failure during fingerprint-erasure (e.g. `/.dockerenv` removal failing) used to leave the container detectably-a-sandbox but the scan would continue and report `clean` for any sandbox-aware payload that simply stayed dormant. The errors are propagated through `Start` / `StartPaused` and surfaced to the CLI, which aborts the scan rather than producing a false-clean verdict
 - 21 linter errors: gofmt (15 files), importShadow (2), ifElseChain (1), godot (1), intrange (1), staticcheck De Morgan (1)
 
 ## [0.5.0]

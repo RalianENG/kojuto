@@ -585,8 +585,10 @@ func TestDockerWriteFile_StructureNoHeredoc(t *testing.T) {
 	t.Cleanup(func() { execCommand = orig })
 
 	sb := &Sandbox{containerID: "test-container"}
-	sb.dockerWriteFile(context.Background(), "/tmp/probe.js",
-		"any content with KOJUTO_EOF baked in\nstill not parsed by shell")
+	if err := sb.dockerWriteFile(context.Background(), "/tmp/probe.js",
+		"any content with KOJUTO_EOF baked in\nstill not parsed by shell"); err != nil {
+		t.Fatalf("dockerWriteFile: %v", err)
+	}
 
 	want := []string{
 		"docker", "exec", "-i", "--user=root", "test-container",
@@ -620,10 +622,69 @@ func TestDockerWriteFile_QuotesPath(t *testing.T) {
 	t.Cleanup(func() { execCommand = orig })
 
 	sb := &Sandbox{containerID: "test-container"}
-	sb.dockerWriteFile(context.Background(), "/tmp/$(rm -rf /)/x", "x")
+	if err := sb.dockerWriteFile(context.Background(), "/tmp/$(rm -rf /)/x", "x"); err != nil {
+		t.Fatalf("dockerWriteFile: %v", err)
+	}
 
 	last := captured[len(captured)-1]
 	if !strings.Contains(last, `'/tmp/$(rm -rf /)/x'`) {
 		t.Errorf("path not single-quoted in shell arg: %q", last)
+	}
+}
+
+// withFailingExec replaces execCommand with one that always exits non-zero,
+// simulating a docker daemon hiccup or an in-container command failure.
+func withFailingExec(t *testing.T) {
+	t.Helper()
+	orig := execCommand
+	execCommand = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "false")
+	}
+	t.Cleanup(func() { execCommand = orig })
+}
+
+// TestEraseFingerprints_FailLoud pins the contract that a failing docker
+// command (e.g. `rm -f /.dockerenv` rejected by a corrupted runtime) must
+// surface as an error rather than silently leaving the fingerprint in place.
+// See SECURITY.md "Anti-Fingerprinting" — a swallowed error here would mean
+// sandbox-aware malware could detect the container and produce a false-clean
+// verdict.
+func TestEraseFingerprints_FailLoud(t *testing.T) {
+	withFailingExec(t)
+	sb := &Sandbox{containerID: "test-container"}
+	if err := sb.eraseFingerprints(context.Background()); err == nil {
+		t.Fatal("eraseFingerprints returned nil despite failing docker command")
+	}
+}
+
+func TestPlantHoneypotFiles_FailLoud(t *testing.T) {
+	withFailingExec(t)
+	sb := &Sandbox{containerID: "test-container"}
+	if err := sb.plantHoneypotFiles(context.Background()); err == nil {
+		t.Fatal("plantHoneypotFiles returned nil despite failing docker command")
+	}
+}
+
+func TestRestoreLocalBin_FailLoud(t *testing.T) {
+	withFailingExec(t)
+	sb := &Sandbox{containerID: "test-container", ecosystem: types.EcosystemPyPI}
+	if err := sb.restoreLocalBin(context.Background()); err == nil {
+		t.Fatal("restoreLocalBin returned nil despite failing docker command")
+	}
+}
+
+func TestWriteProbeScripts_FailLoud(t *testing.T) {
+	withFailingExec(t)
+	sb := &Sandbox{containerID: "test-container", pkg: "x", ecosystem: types.EcosystemPyPI}
+	if err := sb.WriteProbeScripts(context.Background()); err == nil {
+		t.Fatal("WriteProbeScripts returned nil despite failing docker command")
+	}
+}
+
+func TestWriteProbeScriptsMulti_FailLoud(t *testing.T) {
+	withFailingExec(t)
+	sb := &Sandbox{containerID: "test-container", ecosystem: types.EcosystemPyPI}
+	if err := sb.WriteProbeScriptsMulti(context.Background(), []string{"x"}); err == nil {
+		t.Fatal("WriteProbeScriptsMulti returned nil despite failing docker command")
 	}
 }

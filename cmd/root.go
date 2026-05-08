@@ -434,7 +434,9 @@ func runBatchScreening(deps []depfile.Dep, ecosystem string) (string, error) {
 	}
 
 	// Import all packages under simulated OS identities (3 scripts total).
-	sb.WriteProbeScriptsMulti(ctx, pkgNames)
+	if err := sb.WriteProbeScriptsMulti(ctx, pkgNames); err != nil {
+		return "", fmt.Errorf("writing batch probe scripts: %w", err)
+	}
 	importCmds := sb.ImportCommandsMulti(pkgNames)
 	osNames := []string{"Linux", "Windows", "macOS"}
 
@@ -966,7 +968,10 @@ func runEBPFProbe(ctx context.Context, sb *sandbox.Sandbox, _ string) (*scanResu
 	// platform-gated payloads. Without this, eBPF mode misses every
 	// __init__.py-resident attack — most pypi malware lives here, not
 	// in setup.py.
-	sb.WriteProbeScripts(ctx)
+	if err := sb.WriteProbeScripts(ctx); err != nil {
+		_ = ep.Close()
+		return nil, fmt.Errorf("writing probe scripts: %w", err)
+	}
 	importCmds := sb.ImportCommands()
 	osNames := []string{"Linux", "Windows", "macOS"}
 	for i, cmd := range importCmds {
@@ -1045,7 +1050,9 @@ func runContainerStraceProbe(ctx context.Context, sb *sandbox.Sandbox, _ string)
 
 	// Phase 2: Import under each simulated OS to defeat platform-gated payloads.
 	// Write probe scripts to /tmp first (outside strace), then execute them.
-	sb.WriteProbeScripts(ctx)
+	if err := sb.WriteProbeScripts(ctx); err != nil {
+		return nil, fmt.Errorf("writing probe scripts: %w", err)
+	}
 
 	importCmds := sb.ImportCommands()
 	osNames := []string{"Linux", "Windows", "macOS"}
