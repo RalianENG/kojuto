@@ -60,7 +60,7 @@ kojuto is a security tool that intentionally runs untrusted code in an isolated 
 ### Anti-Fingerprinting
 
 - Host hostname, username, CPU count, and memory are mirrored into the container
-- `/.dockerenv` is removed on startup
+- `/.dockerenv` is masked at container creation time by bind-mounting an empty regular file from the host over it (`--read-only` rootfs makes post-start `rm` impossible, so masking is the only mechanism)
 - Package mount path mirrors host directory layout
 - `/etc/resolv.conf` is populated via `--dns=198.51.100.1` (RFC 5737 TEST-NET-2, guaranteed unreachable) so the file is non-empty even under `--network=none` — prevents the empty-resolv-conf signal that would reveal isolation. `connect()` returns `ENETUNREACH`; combine with `--runtime runsc` to mask remaining `/proc/1/cgroup` and `/proc/self/mountinfo` signals
 

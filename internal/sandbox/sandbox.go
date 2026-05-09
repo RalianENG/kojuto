@@ -52,7 +52,11 @@ type Sandbox struct {
 	needsPtrace bool
 	localMode   bool   // when true, install from local files (sdist/wheel) directly
 	seccompDir  string // per-instance temp dir for seccomp profile
-	scanPkgs    []string
+	// dockerenvMask is the host-side empty file bind-mounted over
+	// /.dockerenv to mask the docker-injected sentinel. Lives inside
+	// seccompDir so it is cleaned up by the same Cleanup path.
+	dockerenvMask string
+	scanPkgs      []string
 }
 
 // SetLocalMode enables local package installation mode (sdist support).
@@ -103,8 +107,15 @@ func resolveRuntime() string {
 	return RuntimeDefault
 }
 
-// writeSeccompProfile writes the embedded seccomp profile to a temp file
-// and returns the --security-opt flag value to pass to docker.
+// writeSeccompProfile writes the embedded seccomp profile and the empty
+// /.dockerenv mask file to a per-scan temp dir, then returns the
+// --security-opt flag value to pass to docker. The mask path is stashed in
+// s.dockerenvMask for containerArgs to bind-mount.
+//
+// The mask is an empty regular file (not /dev/null) so that
+// stat(/.dockerenv).S_ISREG() inside the container still returns true —
+// using a char device would itself be a fingerprint that distinguishes
+// kojuto's sandbox from a real Docker container.
 func (s *Sandbox) writeSeccompProfile() (string, error) {
 	dir, err := os.MkdirTemp("", "kojuto-seccomp-*")
 	if err != nil {
@@ -116,6 +127,12 @@ func (s *Sandbox) writeSeccompProfile() (string, error) {
 	if err := os.WriteFile(path, seccompProfile, 0o444); err != nil {
 		return "", fmt.Errorf("writing seccomp profile: %w", err)
 	}
+
+	dockerenvMask := filepath.Join(dir, "dockerenv-mask")
+	if err := os.WriteFile(dockerenvMask, nil, 0o444); err != nil {
+		return "", fmt.Errorf("writing dockerenv mask: %w", err)
+	}
+	s.dockerenvMask = dockerenvMask
 
 	return "seccomp=" + path, nil
 }
@@ -174,11 +191,26 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 	// Always apply the restrictive seccomp profile regardless of ptrace needs.
 	// Without it, Docker's default seccomp allows memfd_create, userfaultfd,
 	// open_by_handle_at, and other container-escape vectors.
+	//
+	// writeSeccompProfile also stages the host-side /.dockerenv mask file
+	// (s.dockerenvMask) used by the bind mount below.
 	seccompOpt, err := s.writeSeccompProfile()
 	if err != nil {
 		return nil, err
 	}
-	args = append(args, "--security-opt="+seccompOpt)
+	// Mask the docker-injected /.dockerenv sentinel by bind-mounting an
+	// empty file from the host over it. We can't `rm /.dockerenv` post-
+	// start because --read-only blocks rootfs writes (which is exactly
+	// why the previous post-start `rm -f /.dockerenv` always returned
+	// exit 1 — silently, until prepareSandboxState was made fail-loud).
+	// Sandbox-aware payloads that read /.dockerenv now see an empty
+	// regular file. Path-existence checks (`os.path.exists`) still see
+	// something, but those are defeated by --runtime=runsc which
+	// virtualizes the rootfs entirely.
+	args = append(args,
+		"--security-opt="+seccompOpt,
+		"--mount=type=bind,src="+s.dockerenvMask+",dst=/.dockerenv,readonly",
+	)
 
 	if s.needsPtrace {
 		// Re-add SYS_PTRACE for strace, CHOWN+FOWNER for tmpfs file setup.
@@ -310,11 +342,14 @@ func getHostUsername() string {
 // rejects all connect()/sendto() syscalls with ENETUNREACH — there is
 // no network stack to exploit.
 //
-// Anti-fingerprinting countermeasures (applied post-start via eraseFingerprints):
-//   - Fake /etc/resolv.conf with a plausible nameserver IP
+// Anti-fingerprinting countermeasures:
+//   - /.dockerenv masked with an empty regular file via bind mount at
+//     create time (see writeSeccompProfile + containerArgs)
+//   - Fake /etc/resolv.conf with a plausible nameserver IP via --dns
 //   - connect() returning ENETUNREACH is indistinguishable from a firewalled
 //     host for most malware (only sophisticated actors check errno values)
-//   - /proc/net/tcp emptiness is mitigated by gVisor (--runtime runsc)
+//   - /proc/1/cgroup, /proc/self/mountinfo, and /proc/net/tcp emptiness
+//     are mitigated by gVisor (--runtime=runsc)
 //
 // Previous design used --internal bridge networks, which left Docker's
 // embedded DNS resolver (127.0.0.11) active inside the container. While
@@ -367,6 +402,13 @@ func (s *Sandbox) Create(ctx context.Context) error {
 
 // StartPaused starts the container and immediately pauses it.
 // This minimizes the TOCTOU window between container start and probe attachment.
+//
+// Errors from restoreLocalBin / plantHoneypotFiles are surfaced rather than
+// swallowed: if the sandbox can't be brought to a honeypot-planted state,
+// sandbox-aware malware may stay dormant and produce a false-clean verdict.
+// The caller is expected to abort the scan (and surface "inconclusive") on
+// any error returned here. /.dockerenv masking is handled at create time
+// via bind mount (see writeSeccompProfile + containerArgs).
 func (s *Sandbox) StartPaused(ctx context.Context) error {
 	startCmd := execCommand(ctx, "docker", "start", s.containerID)
 	startCmd.Stdout = io.Discard
@@ -376,14 +418,9 @@ func (s *Sandbox) StartPaused(ctx context.Context) error {
 		return fmt.Errorf("docker start failed: %w", err)
 	}
 
-	// Restore /usr/local/bin contents that were hidden by the tmpfs overlay.
-	s.restoreLocalBin(ctx)
-
-	// Erase container fingerprints that sandbox-detection code looks for.
-	s.eraseFingerprints(ctx)
-
-	// Plant fake credential files to trigger credential-harvesting malware.
-	s.plantHoneypotFiles(ctx)
+	if err := s.prepareSandboxState(ctx); err != nil {
+		return err
+	}
 
 	if err := s.Pause(ctx); err != nil {
 		return fmt.Errorf("immediate pause after start: %w", err)
@@ -393,7 +430,8 @@ func (s *Sandbox) StartPaused(ctx context.Context) error {
 }
 
 // Start creates and starts the sandbox container (convenience for strace-container mode
-// which does not need the pause-before-probe pattern).
+// which does not need the pause-before-probe pattern). See StartPaused for the
+// rationale on surfacing prep errors.
 func (s *Sandbox) Start(ctx context.Context) error {
 	if err := s.Create(ctx); err != nil {
 		return err
@@ -407,34 +445,61 @@ func (s *Sandbox) Start(ctx context.Context) error {
 		return fmt.Errorf("docker start failed: %w", err)
 	}
 
-	// Restore /usr/local/bin contents that were hidden by the tmpfs overlay.
-	s.restoreLocalBin(ctx)
+	return s.prepareSandboxState(ctx)
+}
 
-	// Erase container fingerprints that sandbox-detection code looks for.
-	s.eraseFingerprints(ctx)
-
-	// Plant fake credential files to trigger credential-harvesting malware.
-	s.plantHoneypotFiles(ctx)
-
+// prepareSandboxState runs the post-start container setup that every scan
+// depends on. Each step is fail-loud: a swallowed error here would let the
+// scan run in a partially-prepared sandbox (e.g. honeypot files missing)
+// and report "clean" for malware that simply detected the gap and stayed
+// quiet.
+//
+// /.dockerenv masking is intentionally NOT here — it's done at create time
+// via a bind mount in containerArgs (see writeSeccompProfile). The previous
+// post-start `rm -f /.dockerenv` could never succeed under --read-only and
+// silently failed for every scan.
+func (s *Sandbox) prepareSandboxState(ctx context.Context) error {
+	if err := s.restoreLocalBin(ctx); err != nil {
+		return fmt.Errorf("restoring sandbox tmpfs overlays: %w", err)
+	}
+	if err := s.plantHoneypotFiles(ctx); err != nil {
+		return fmt.Errorf("planting honeypot files: %w", err)
+	}
 	return nil
 }
 
 // restoreTmpfsOverlays copies backed-up contents into tmpfs-mounted directories
 // so that pip, python3, setuptools, etc. are available after the overlay hides them.
 // Also fixes permissions so the container user (dev) can write to site-packages.
-func (s *Sandbox) restoreLocalBin(ctx context.Context) {
-	s.dockerExecRoot(ctx, "cp", "-a", "/usr/local/bin.bak/.", "/usr/local/bin/")
-	s.dockerExecRoot(ctx, "chmod", "-R", "a+rw", "/usr/local/bin")
+//
+// Failures are fatal: if pip/python3 are not present at the expected paths the
+// install phase will fail in a confusing way, and a missing chmod can leave
+// site-packages read-only so the install silently produces no events.
+func (s *Sandbox) restoreLocalBin(ctx context.Context) error {
+	if err := s.dockerExecRoot(ctx, "cp", "-a", "/usr/local/bin.bak/.", "/usr/local/bin/"); err != nil {
+		return err
+	}
+	if err := s.dockerExecRoot(ctx, "chmod", "-R", "a+rw", "/usr/local/bin"); err != nil {
+		return err
+	}
 
 	sitePackages := "/usr/local/lib/python" + SandboxPythonVersion + "/site-packages"
-	s.dockerExecRoot(ctx, "cp", "-a", sitePackages+".bak/.", sitePackages+"/")
-	s.dockerExecRoot(ctx, "chmod", "-R", "a+rw", sitePackages)
+	if err := s.dockerExecRoot(ctx, "cp", "-a", sitePackages+".bak/.", sitePackages+"/"); err != nil {
+		return err
+	}
+	if err := s.dockerExecRoot(ctx, "chmod", "-R", "a+rw", sitePackages); err != nil {
+		return err
+	}
 
 	// npm: packageDir is mounted directly as writable /install,
 	// so no copy is needed. Just fix ownership for the dev user.
 	if s.ecosystem == types.EcosystemNpm {
-		s.dockerExecRoot(ctx, "chown", "-R", "1000:1000", "/install")
+		if err := s.dockerExecRoot(ctx, "chown", "-R", "1000:1000", "/install"); err != nil {
+			return err
+		}
 	}
+
+	return nil
 }
 
 // base62Chars is the character set used by real AWS/GitHub/npm tokens.
@@ -515,7 +580,11 @@ func honeypotEnvVars() []string {
 // When malware reads these via openat, the access is detected by the
 // sensitive-path monitor. If it then tries to exfiltrate the contents,
 // the connect/sendto monitor catches the network activity.
-func (s *Sandbox) plantHoneypotFiles(ctx context.Context) {
+//
+// Failure here is fatal: a partially-planted set of honeypots leaves the
+// detection contract ("if you read .ssh/id_rsa, you tripped the monitor")
+// unenforceable for the missing files.
+func (s *Sandbox) plantHoneypotFiles(ctx context.Context) error {
 	home := "/home/dev"
 
 	// Generate random credentials for this scan.
@@ -524,68 +593,81 @@ func (s *Sandbox) plantHoneypotFiles(ctx context.Context) {
 	ghToken := fakeGitHubToken()
 	sshKeyBody := randHex(64)
 
-	// SSH key pair.
-	s.dockerExecRoot(ctx, "mkdir", "-p", home+"/.ssh")
-	s.dockerWriteFile(ctx, home+"/.ssh/id_rsa",
-		"-----BEGIN OPENSSH PRIVATE KEY-----\n"+
-			"b3BlbnNzaC1rZXktdjEAAAAAFAAAAAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5\n"+
-			"AAAAI"+sshKeyBody+"\n"+
-			"-----END OPENSSH PRIVATE KEY-----\n")
-	s.dockerExecRoot(ctx, "chmod", "600", home+"/.ssh/id_rsa")
+	steps := []func() error{
+		// SSH key pair.
+		func() error { return s.dockerExecRoot(ctx, "mkdir", "-p", home+"/.ssh") },
+		func() error {
+			return s.dockerWriteFile(ctx, home+"/.ssh/id_rsa",
+				"-----BEGIN OPENSSH PRIVATE KEY-----\n"+
+					"b3BlbnNzaC1rZXktdjEAAAAAFAAAAAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5\n"+
+					"AAAAI"+sshKeyBody+"\n"+
+					"-----END OPENSSH PRIVATE KEY-----\n")
+		},
+		func() error { return s.dockerExecRoot(ctx, "chmod", "600", home+"/.ssh/id_rsa") },
 
-	// AWS credentials.
-	s.dockerExecRoot(ctx, "mkdir", "-p", home+"/.aws")
-	s.dockerWriteFile(ctx, home+"/.aws/credentials",
-		"[default]\n"+
-			"aws_access_key_id = "+awsKey+"\n"+
-			"aws_secret_access_key = "+awsSecret+"\n")
+		// AWS credentials.
+		func() error { return s.dockerExecRoot(ctx, "mkdir", "-p", home+"/.aws") },
+		func() error {
+			return s.dockerWriteFile(ctx, home+"/.aws/credentials",
+				"[default]\n"+
+					"aws_access_key_id = "+awsKey+"\n"+
+					"aws_secret_access_key = "+awsSecret+"\n")
+		},
 
-	// Git credentials.
-	s.dockerWriteFile(ctx, home+"/.git-credentials",
-		"https://dev:"+ghToken+"@github.com\n")
-	s.dockerExecRoot(ctx, "chmod", "600", home+"/.git-credentials")
+		// Git credentials.
+		func() error {
+			return s.dockerWriteFile(ctx, home+"/.git-credentials",
+				"https://dev:"+ghToken+"@github.com\n")
+		},
+		func() error { return s.dockerExecRoot(ctx, "chmod", "600", home+"/.git-credentials") },
 
-	// Netrc.
-	s.dockerWriteFile(ctx, home+"/.netrc",
-		"machine github.com\n"+
-			"login dev\n"+
-			"password "+ghToken+"\n")
-	s.dockerExecRoot(ctx, "chmod", "600", home+"/.netrc")
+		// Netrc.
+		func() error {
+			return s.dockerWriteFile(ctx, home+"/.netrc",
+				"machine github.com\n"+
+					"login dev\n"+
+					"password "+ghToken+"\n")
+		},
+		func() error { return s.dockerExecRoot(ctx, "chmod", "600", home+"/.netrc") },
 
-	// GitHub CLI config.
-	s.dockerExecRoot(ctx, "mkdir", "-p", home+"/.config/gh")
-	s.dockerWriteFile(ctx, home+"/.config/gh/hosts.yml",
-		"github.com:\n"+
-			"    oauth_token: "+ghToken+"\n"+
-			"    user: dev\n"+
-			"    git_protocol: https\n")
+		// GitHub CLI config.
+		func() error { return s.dockerExecRoot(ctx, "mkdir", "-p", home+"/.config/gh") },
+		func() error {
+			return s.dockerWriteFile(ctx, home+"/.config/gh/hosts.yml",
+				"github.com:\n"+
+					"    oauth_token: "+ghToken+"\n"+
+					"    user: dev\n"+
+					"    git_protocol: https\n")
+		},
 
-	// Fix ownership so the container user (dev) owns the files.
-	s.dockerExecRoot(ctx, "chown", "-R", "1000:1000", home+"/.ssh", home+"/.aws",
-		home+"/.git-credentials", home+"/.netrc", home+"/.config")
+		// Fix ownership so the container user (dev) owns the files.
+		func() error {
+			return s.dockerExecRoot(ctx, "chown", "-R", "1000:1000", home+"/.ssh", home+"/.aws",
+				home+"/.git-credentials", home+"/.netrc", home+"/.config")
+		},
+	}
+
+	for _, step := range steps {
+		if err := step(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// eraseFingerprints removes or masks signals that reveal the container
-// environment to sandbox-aware malware.
-func (s *Sandbox) eraseFingerprints(ctx context.Context) {
-	// 1. Remove /.dockerenv sentinel file.
-	s.dockerExecRoot(ctx, "rm", "-f", "/.dockerenv")
-
-	// 2. /etc/resolv.conf is injected via --dns=198.51.100.1 at container
-	//    creation time (RFC 5737 TEST-NET-2, guaranteed unreachable).
-	//    This works on --read-only rootfs and prevents fingerprinting.
-
-	// 3. /proc/1/cgroup and /proc/self/mountinfo are kernel-managed and
-	//    cannot be modified without gVisor. Use --runtime=runsc to mask
-	//    these remaining signals.
-}
-
-func (s *Sandbox) dockerExecRoot(ctx context.Context, args ...string) {
+// dockerExecRoot runs the given command inside the sandbox as root.
+// Returns an error wrapped with the sandbox-internal command (not the
+// container ID, which is noise for the user) so callers can surface a
+// useful message when fingerprint-erasure or honeypot-planting fails.
+func (s *Sandbox) dockerExecRoot(ctx context.Context, args ...string) error {
 	cmdArgs := append([]string{"exec", "--user=root", s.containerID}, args...)
 	cmd := execCommand(ctx, "docker", cmdArgs...)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
-	_ = cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("docker exec %s: %w", strings.Join(args, " "), err)
+	}
+	return nil
 }
 
 // dockerWriteFile writes content into the container at path as root.
@@ -595,13 +677,19 @@ func (s *Sandbox) dockerExecRoot(ctx context.Context, args ...string) {
 // to break out of the heredoc and execute arbitrary commands as root in
 // the container. path is single-quoted as defense-in-depth even though
 // every current caller passes a constant.
-func (s *Sandbox) dockerWriteFile(ctx context.Context, path, content string) {
+//
+// The content is omitted from the error to avoid spilling honeypot
+// credentials or large probe scripts into logs.
+func (s *Sandbox) dockerWriteFile(ctx context.Context, path, content string) error {
 	cmdArgs := []string{"exec", "-i", "--user=root", s.containerID, "sh", "-c", "cat > " + shQuote(path)}
 	cmd := execCommand(ctx, "docker", cmdArgs...)
 	cmd.Stdin = strings.NewReader(content)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
-	_ = cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("docker write %s: %w", path, err)
+	}
+	return nil
 }
 
 // Exec runs a command inside the sandbox container and returns the combined output.
@@ -737,7 +825,11 @@ func shQuote(s string) string {
 
 // WriteProbeScriptsMulti writes one combined import probe script per OS identity.
 // This reduces Python/Node process launches from N*3 to just 3.
-func (s *Sandbox) WriteProbeScriptsMulti(ctx context.Context, pkgs []string) {
+//
+// Returns an error if any script fails to land in the container. A missing
+// probe script silently skips the corresponding OS-identity import phase,
+// hiding platform-gated payloads — that is itself a false-clean vector.
+func (s *Sandbox) WriteProbeScriptsMulti(ctx context.Context, pkgs []string) error {
 	if s.ecosystem == types.EcosystemNpm {
 		for _, p := range []string{"linux", "win32", "darwin"} {
 			var requires strings.Builder
@@ -751,9 +843,11 @@ func (s *Sandbox) WriteProbeScriptsMulti(ctx context.Context, pkgs []string) {
 				p, requires.String(),
 			)
 			filename := "/tmp/_kojuto_probe_all_" + p + ".js"
-			s.dockerWriteFile(ctx, filename, script)
+			if err := s.dockerWriteFile(ctx, filename, script); err != nil {
+				return err
+			}
 		}
-		return
+		return nil
 	}
 
 	type pyPlatform struct {
@@ -793,8 +887,11 @@ func (s *Sandbox) WriteProbeScriptsMulti(ctx context.Context, pkgs []string) {
 			p.sep, p.pathsep, p.linesep, imports.String(),
 		)
 		filename := "/tmp/_kojuto_probe_all_" + p.sysplatform + ".py"
-		s.dockerWriteFile(ctx, filename, script)
+		if err := s.dockerWriteFile(ctx, filename, script); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // ImportCommandsMulti returns 3 import commands (one per OS identity) that import all packages.
@@ -831,8 +928,9 @@ func (s *Sandbox) ImportCommands() [][]string {
 }
 
 // WriteProbeScripts writes the OS-simulation import scripts into the container's
-// /tmp directory. Must be called before ImportCommands.
-func (s *Sandbox) WriteProbeScripts(ctx context.Context) {
+// /tmp directory. Must be called before ImportCommands. Returns an error if any
+// script fails to land — see WriteProbeScriptsMulti for the rationale.
+func (s *Sandbox) WriteProbeScripts(ctx context.Context) error {
 	importName := strings.ReplaceAll(s.pkg, "-", "_")
 
 	// Each simulated OS must be consistent across ALL platform detection APIs.
@@ -878,7 +976,9 @@ func (s *Sandbox) WriteProbeScripts(ctx context.Context) {
 			p.sep, p.pathsep, p.linesep, importName,
 		)
 		filename := "/tmp/_kojuto_probe_" + p.sysplatform + ".py"
-		s.dockerWriteFile(ctx, filename, script)
+		if err := s.dockerWriteFile(ctx, filename, script); err != nil {
+			return err
+		}
 	}
 
 	jsPlatforms := []string{"linux", "win32", "darwin"}
@@ -890,8 +990,11 @@ func (s *Sandbox) WriteProbeScripts(ctx context.Context) {
 			p, s.pkg,
 		)
 		filename := "/tmp/_kojuto_probe_" + p + ".js"
-		s.dockerWriteFile(ctx, filename, script)
+		if err := s.dockerWriteFile(ctx, filename, script); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // faketimeEnv returns environment variable prefix that activates libfaketime.

@@ -26,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation aligned with implementation: README/SPECIFICATION/SECURITY now describe the actual `--network=none` sandbox (previously claimed an isolated bridge); Python audit hook list corrected (`compile`/`exec`/`import` — `eval` is a Node.js-only event); SPECIFICATION test-data section rewritten around `probe-alpha`/`probe-npm`/`evasion-test` (the obsolete `axios-demo` entry was stale)
 
 ### Fixed
+- **`/.dockerenv` masking actually works now** — the post-start `rm -f /.dockerenv` had been silently failing on every scan since `--read-only` rootfs was introduced (the rootfs is, by design, not writable). `/.dockerenv` is now masked at container creation time by bind-mounting an empty regular file from the host over the path. Sandbox-aware payloads that read `/.dockerenv` see empty content; gVisor (`--runtime=runsc`) is still recommended to also defeat path-existence checks
+- **Sandbox preparation no longer fails silently** — `plantHoneypotFiles`, `restoreLocalBin`, `WriteProbeScripts`, and `WriteProbeScriptsMulti` now return errors instead of swallowing the result of every `docker exec`. A swallowed honeypot-write or probe-script-write failure used to leave the container partially prepared, and any sandbox-aware payload that detected the gap and stayed dormant would surface as `clean`. The errors propagate through `Start` / `StartPaused` and abort the scan
 - 21 linter errors: gofmt (15 files), importShadow (2), ifElseChain (1), godot (1), intrange (1), staticcheck De Morgan (1)
 
 ## [0.5.0]

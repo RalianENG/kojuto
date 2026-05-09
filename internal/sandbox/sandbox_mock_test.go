@@ -177,6 +177,17 @@ func TestContainerArgs(t *testing.T) {
 		}
 	}
 
+	// /.dockerenv must be masked at create time. Post-start `rm` cannot
+	// succeed on --read-only rootfs, so the bind mount is the only path.
+	if !strings.Contains(joined, ",dst=/.dockerenv,readonly") {
+		t.Errorf("containerArgs missing /.dockerenv bind mount in:\n%s", joined)
+	}
+	if sb.dockerenvMask == "" {
+		t.Error("expected dockerenvMask to be set by writeSeccompProfile")
+	} else if _, statErr := os.Stat(sb.dockerenvMask); statErr != nil {
+		t.Errorf("dockerenvMask file not created: %v", statErr)
+	}
+
 	// Cleanup seccomp temp dir.
 	if sb.seccompDir != "" {
 		os.RemoveAll(sb.seccompDir)
@@ -322,8 +333,9 @@ func TestDockerExecRoot(t *testing.T) {
 	sb := newTestSandbox(t, types.EcosystemPyPI)
 	sb.containerID = fakeContainerID
 
-	// Should not panic or error (errors are silently discarded).
-	sb.dockerExecRoot(context.Background(), "ls", "-la")
+	if err := sb.dockerExecRoot(context.Background(), "ls", "-la"); err != nil {
+		t.Fatalf("dockerExecRoot: %v", err)
+	}
 }
 
 func TestExec(t *testing.T) {
@@ -369,8 +381,9 @@ func TestWriteProbeScripts(t *testing.T) {
 	sb := newTestSandbox(t, types.EcosystemPyPI)
 	sb.containerID = fakeContainerID
 
-	// Should not panic.
-	sb.WriteProbeScripts(context.Background())
+	if err := sb.WriteProbeScripts(context.Background()); err != nil {
+		t.Fatalf("WriteProbeScripts: %v", err)
+	}
 }
 
 func TestWriteProbeScripts_Npm(t *testing.T) {
@@ -378,7 +391,9 @@ func TestWriteProbeScripts_Npm(t *testing.T) {
 	sb := New(t.TempDir(), "lodash", false, types.EcosystemNpm, "")
 	sb.containerID = fakeContainerID
 
-	sb.WriteProbeScripts(context.Background())
+	if err := sb.WriteProbeScripts(context.Background()); err != nil {
+		t.Fatalf("WriteProbeScripts (npm): %v", err)
+	}
 }
 
 func TestPID(t *testing.T) {
@@ -471,22 +486,14 @@ func TestEnsureImage_Exists(t *testing.T) {
 	}
 }
 
-func TestEraseFingerprints(t *testing.T) {
-	withFakeExec(t)
-	sb := newTestSandbox(t, types.EcosystemPyPI)
-	sb.containerID = fakeContainerID
-
-	// Should not panic.
-	sb.eraseFingerprints(context.Background())
-}
-
 func TestPlantHoneypotFiles(t *testing.T) {
 	withFakeExec(t)
 	sb := newTestSandbox(t, types.EcosystemPyPI)
 	sb.containerID = fakeContainerID
 
-	// Should not panic.
-	sb.plantHoneypotFiles(context.Background())
+	if err := sb.plantHoneypotFiles(context.Background()); err != nil {
+		t.Fatalf("plantHoneypotFiles: %v", err)
+	}
 }
 
 func TestRestoreLocalBin_PyPI(t *testing.T) {
@@ -495,7 +502,9 @@ func TestRestoreLocalBin_PyPI(t *testing.T) {
 	sb.containerID = fakeContainerID
 	sb.mountPoint = testMountPoint
 
-	sb.restoreLocalBin(context.Background())
+	if err := sb.restoreLocalBin(context.Background()); err != nil {
+		t.Fatalf("restoreLocalBin: %v", err)
+	}
 }
 
 func TestRestoreLocalBin_Npm(t *testing.T) {
@@ -505,7 +514,9 @@ func TestRestoreLocalBin_Npm(t *testing.T) {
 	sb.mountPoint = testMountPoint
 
 	// For npm, restoreLocalBin also copies node_modules.
-	sb.restoreLocalBin(context.Background())
+	if err := sb.restoreLocalBin(context.Background()); err != nil {
+		t.Fatalf("restoreLocalBin (npm): %v", err)
+	}
 }
 
 func TestStart_Npm(t *testing.T) {
