@@ -198,8 +198,6 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	args = append(args, "--security-opt="+seccompOpt)
-
 	// Mask the docker-injected /.dockerenv sentinel by bind-mounting an
 	// empty file from the host over it. We can't `rm /.dockerenv` post-
 	// start because --read-only blocks rootfs writes (which is exactly
@@ -209,7 +207,10 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 	// regular file. Path-existence checks (`os.path.exists`) still see
 	// something, but those are defeated by --runtime=runsc which
 	// virtualizes the rootfs entirely.
-	args = append(args, "--mount=type=bind,src="+s.dockerenvMask+",dst=/.dockerenv,readonly")
+	args = append(args,
+		"--security-opt="+seccompOpt,
+		"--mount=type=bind,src="+s.dockerenvMask+",dst=/.dockerenv,readonly",
+	)
 
 	if s.needsPtrace {
 		// Re-add SYS_PTRACE for strace, CHOWN+FOWNER for tmpfs file setup.

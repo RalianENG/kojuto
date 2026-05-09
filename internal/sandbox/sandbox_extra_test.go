@@ -11,10 +11,11 @@ import (
 )
 
 const (
-	testMountPoint = "/home/dev/projects"
-	envCmd         = "env"
-	python3Bin     = "python3"
-	nodeBin        = "node"
+	testMountPoint  = "/home/dev/projects"
+	envCmd          = "env"
+	python3Bin      = "python3"
+	nodeBin         = "node"
+	testContainerID = "test-container"
 )
 
 func TestNew(t *testing.T) {
@@ -584,14 +585,14 @@ func TestDockerWriteFile_StructureNoHeredoc(t *testing.T) {
 	}
 	t.Cleanup(func() { execCommand = orig })
 
-	sb := &Sandbox{containerID: "test-container"}
+	sb := &Sandbox{containerID: testContainerID}
 	if err := sb.dockerWriteFile(context.Background(), "/tmp/probe.js",
 		"any content with KOJUTO_EOF baked in\nstill not parsed by shell"); err != nil {
 		t.Fatalf("dockerWriteFile: %v", err)
 	}
 
 	want := []string{
-		"docker", "exec", "-i", "--user=root", "test-container",
+		"docker", "exec", "-i", "--user=root", testContainerID,
 		"sh", "-c", "cat > '/tmp/probe.js'",
 	}
 	if !reflect.DeepEqual(captured, want) {
@@ -621,7 +622,7 @@ func TestDockerWriteFile_QuotesPath(t *testing.T) {
 	}
 	t.Cleanup(func() { execCommand = orig })
 
-	sb := &Sandbox{containerID: "test-container"}
+	sb := &Sandbox{containerID: testContainerID}
 	if err := sb.dockerWriteFile(context.Background(), "/tmp/$(rm -rf /)/x", "x"); err != nil {
 		t.Fatalf("dockerWriteFile: %v", err)
 	}
@@ -645,7 +646,7 @@ func withFailingExec(t *testing.T) {
 
 func TestPlantHoneypotFiles_FailLoud(t *testing.T) {
 	withFailingExec(t)
-	sb := &Sandbox{containerID: "test-container"}
+	sb := &Sandbox{containerID: testContainerID}
 	if err := sb.plantHoneypotFiles(context.Background()); err == nil {
 		t.Fatal("plantHoneypotFiles returned nil despite failing docker command")
 	}
@@ -653,7 +654,7 @@ func TestPlantHoneypotFiles_FailLoud(t *testing.T) {
 
 func TestRestoreLocalBin_FailLoud(t *testing.T) {
 	withFailingExec(t)
-	sb := &Sandbox{containerID: "test-container", ecosystem: types.EcosystemPyPI}
+	sb := &Sandbox{containerID: testContainerID, ecosystem: types.EcosystemPyPI}
 	if err := sb.restoreLocalBin(context.Background()); err == nil {
 		t.Fatal("restoreLocalBin returned nil despite failing docker command")
 	}
@@ -661,7 +662,7 @@ func TestRestoreLocalBin_FailLoud(t *testing.T) {
 
 func TestWriteProbeScripts_FailLoud(t *testing.T) {
 	withFailingExec(t)
-	sb := &Sandbox{containerID: "test-container", pkg: "x", ecosystem: types.EcosystemPyPI}
+	sb := &Sandbox{containerID: testContainerID, pkg: "x", ecosystem: types.EcosystemPyPI}
 	if err := sb.WriteProbeScripts(context.Background()); err == nil {
 		t.Fatal("WriteProbeScripts returned nil despite failing docker command")
 	}
@@ -669,7 +670,7 @@ func TestWriteProbeScripts_FailLoud(t *testing.T) {
 
 func TestWriteProbeScriptsMulti_FailLoud(t *testing.T) {
 	withFailingExec(t)
-	sb := &Sandbox{containerID: "test-container", ecosystem: types.EcosystemPyPI}
+	sb := &Sandbox{containerID: testContainerID, ecosystem: types.EcosystemPyPI}
 	if err := sb.WriteProbeScriptsMulti(context.Background(), []string{"x"}); err == nil {
 		t.Fatal("WriteProbeScriptsMulti returned nil despite failing docker command")
 	}
