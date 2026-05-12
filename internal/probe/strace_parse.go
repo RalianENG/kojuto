@@ -599,7 +599,13 @@ func extractPID(line string) uint32 {
 		return 0
 	}
 
-	p, err := strconv.ParseUint(pidStr[:endIdx], 10, 32)
+	// strace right-pads the PID with spaces to align columns, e.g.
+	// "[pid    12]" or "[pid     1]". strconv.ParseUint is strict and
+	// rejects leading spaces, so without TrimSpace every PID under 5
+	// digits parses as 0 — which historically broke PID-aware analysis
+	// (V8 JIT filtering, process-tree correlation) for every container
+	// PID, since container PIDs are almost always small.
+	p, err := strconv.ParseUint(strings.TrimSpace(pidStr[:endIdx]), 10, 32)
 	if err != nil {
 		return 0
 	}

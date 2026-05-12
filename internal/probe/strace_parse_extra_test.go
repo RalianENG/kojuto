@@ -220,6 +220,13 @@ func TestExtractPID(t *testing.T) {
 		{`connect(...)`, 0},
 		{`[pid abc] connect(...)`, 0},
 		{`[pid ] connect(...)`, 0},
+		// strace right-pads small PIDs with spaces to align columns.
+		// Without TrimSpace handling, ParseUint would reject these and
+		// every container PID (almost always small) would extract as
+		// 0, silently disabling all PID-aware analysis downstream.
+		{`[pid    12] mprotect(0x7f..., 4096, PROT_READ|PROT_WRITE|PROT_EXEC) = 0`, 12},
+		{`[pid     1] execve("/usr/bin/sh", ...) = 0`, 1},
+		{`[pid   999] openat(AT_FDCWD, "/etc/passwd", ...) = 3`, 999},
 	}
 
 	for _, tc := range cases {
