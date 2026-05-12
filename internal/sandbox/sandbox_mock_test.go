@@ -171,6 +171,12 @@ func TestContainerArgs(t *testing.T) {
 		"--cap-add=SYS_PTRACE", // needsPtrace=true
 		SandboxImage,
 		"sleep",
+		// Package-manager caches must be pinned outside /home/ so the
+		// persistence backstop can stay strict (any /home/ write is
+		// illegitimate). See containerArgs cache-redirect block.
+		"--tmpfs=/var/cache/kojuto:",
+		"--env=NPM_CONFIG_CACHE=/var/cache/kojuto/npm",
+		"--env=PIP_CACHE_DIR=/var/cache/kojuto/pip",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("containerArgs missing %q in:\n%s", want, joined)

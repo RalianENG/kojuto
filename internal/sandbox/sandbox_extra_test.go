@@ -53,7 +53,10 @@ func TestInstallCommand_PyPI(t *testing.T) {
 	sb := New("/mnt/packages", "requests", false, types.EcosystemPyPI, "")
 	sb.mountPoint = testMountPoint
 
-	cmd := sb.InstallCommand()
+	cmd, err := sb.InstallCommand(context.Background())
+	if err != nil {
+		t.Fatalf("InstallCommand: %v", err)
+	}
 	if len(cmd) == 0 {
 		t.Fatal("InstallCommand returned empty")
 	}
@@ -83,25 +86,46 @@ func TestInstallCommand_PyPI(t *testing.T) {
 }
 
 func TestInstallCommand_Npm(t *testing.T) {
-	sb := New("/mnt/packages", "lodash", false, types.EcosystemNpm, "")
+	// npm install stages its script to /var/cache/kojuto/install.sh via
+	// dockerWriteFile, so execCommand needs to be intercepted. The script
+	// itself is exercised directly via TestNpmLifecycleScript_*.
+	var stagedScript string
+	orig := execCommand
+	execCommand = func(ctx context.Context, _ string, args ...string) *exec.Cmd {
+		// dockerWriteFile pipes the script via stdin to `sh -c "cat > path"`.
+		// Capture the stdin reader by wrapping the returned cmd.
+		c := exec.CommandContext(ctx, "true")
+		// args carries: exec -i --user=root <id> sh -c "cat > path"
+		_ = args
+		return c
+	}
+	t.Cleanup(func() { execCommand = orig })
 
-	cmd := sb.InstallCommand()
-	if len(cmd) != 3 || cmd[0] != "sh" || cmd[1] != "-c" {
-		t.Fatalf("InstallCommand = %v, want [sh -c <script>]", cmd)
+	sb := New("/mnt/packages", "lodash", false, types.EcosystemNpm, "")
+	sb.containerID = testContainerID
+	cmd, err := sb.InstallCommand(context.Background())
+	if err != nil {
+		t.Fatalf("InstallCommand: %v", err)
+	}
+	if len(cmd) != 2 || cmd[0] != "sh" || cmd[1] != installScriptPath {
+		t.Fatalf("InstallCommand = %v, want [sh %s] (file-based to avoid sh -c FP)", cmd, installScriptPath)
 	}
 
-	// The script must exercise all three lifecycle hooks. `npm rebuild`
-	// (the previous approach) skipped preinstall and postinstall, which
-	// is precisely where most npm supply chain payloads live.
+	// Script content is exercised directly: lifecycle hooks must fire.
+	// `npm rebuild` (the previous approach) skipped preinstall and
+	// postinstall, which is precisely where most npm supply chain
+	// payloads live.
+	script := npmLifecycleScript(nil)
 	for _, hook := range []string{"preinstall", "install", "postinstall"} {
-		if !strings.Contains(cmd[2], hook) {
-			t.Errorf("script missing %q hook invocation:\n%s", hook, cmd[2])
+		if !strings.Contains(script, hook) {
+			t.Errorf("script missing %q hook invocation:\n%s", hook, script)
 		}
 	}
 	// No-pkg form must walk node_modules to fire every top-level dep.
-	if !strings.Contains(cmd[2], "/install/node_modules") {
-		t.Errorf("script must reference /install/node_modules, got:\n%s", cmd[2])
+	if !strings.Contains(script, "/install/node_modules") {
+		t.Errorf("script must reference /install/node_modules, got:\n%s", script)
 	}
+	_ = stagedScript // reserved for future capture-based assertions
 }
 
 func TestImportCommands_PyPI(t *testing.T) {
@@ -296,24 +320,25 @@ func TestSandboxPythonVersion(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestSetLocalMode_InstallCommand(t *testing.T) {
+	// Local-mode pip uses the staged-script path for the same reason as
+	// npm — keep the outer shell out of analyzer's sh -c branch.
+	orig := execCommand
+	execCommand = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "true")
+	}
+	t.Cleanup(func() { execCommand = orig })
+
 	sb := New("/mnt/packages", "requests", false, types.EcosystemPyPI, "")
 	sb.mountPoint = testMountPoint
 	sb.SetLocalMode(true)
+	sb.containerID = testContainerID
 
-	cmd := sb.InstallCommand()
-	if len(cmd) == 0 {
-		t.Fatal("InstallCommand returned empty")
+	cmd, err := sb.InstallCommand(context.Background())
+	if err != nil {
+		t.Fatalf("InstallCommand: %v", err)
 	}
-
-	// Local mode uses "sh -c pip install ..."
-	if cmd[0] != "sh" {
-		t.Errorf("expected sh, got %s", cmd[0])
-	}
-	if cmd[1] != "-c" {
-		t.Errorf("expected -c, got %s", cmd[1])
-	}
-	if !strings.Contains(cmd[2], "pip install") {
-		t.Errorf("expected pip install in command, got %q", cmd[2])
+	if len(cmd) != 2 || cmd[0] != "sh" || cmd[1] != installScriptPath {
+		t.Fatalf("InstallCommand = %v, want [sh %s]", cmd, installScriptPath)
 	}
 }
 
@@ -326,7 +351,10 @@ func TestInstallAllCommand_PyPI(t *testing.T) {
 	sb.mountPoint = testMountPoint
 
 	pkgs := []string{"requests", "flask", "numpy"}
-	cmd := sb.InstallAllCommand(pkgs)
+	cmd, err := sb.InstallAllCommand(context.Background(), pkgs)
+	if err != nil {
+		t.Fatalf("InstallAllCommand: %v", err)
+	}
 
 	if len(cmd) == 0 {
 		t.Fatal("InstallAllCommand returned empty")
@@ -347,25 +375,35 @@ func TestInstallAllCommand_PyPI(t *testing.T) {
 }
 
 func TestInstallAllCommand_Npm(t *testing.T) {
+	orig := execCommand
+	execCommand = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "true")
+	}
+	t.Cleanup(func() { execCommand = orig })
+
 	sb := New("/mnt/packages", "lodash", false, types.EcosystemNpm, "")
+	sb.containerID = testContainerID
 
 	pkgs := []string{"lodash", "express"}
-	cmd := sb.InstallAllCommand(pkgs)
-
-	if len(cmd) != 3 || cmd[0] != "sh" || cmd[1] != "-c" {
-		t.Fatalf("InstallAllCommand = %v, want [sh -c <script>]", cmd)
+	cmd, err := sb.InstallAllCommand(context.Background(), pkgs)
+	if err != nil {
+		t.Fatalf("InstallAllCommand: %v", err)
 	}
-	// All three lifecycle hooks must be invoked.
+	if len(cmd) != 2 || cmd[0] != "sh" || cmd[1] != installScriptPath {
+		t.Fatalf("InstallAllCommand = %v, want [sh %s]", cmd, installScriptPath)
+	}
+
+	// Script content is exercised directly.
+	script := npmLifecycleScript(pkgs)
 	for _, hook := range []string{"preinstall", "install", "postinstall"} {
-		if !strings.Contains(cmd[2], hook) {
-			t.Errorf("script missing %q hook invocation:\n%s", hook, cmd[2])
+		if !strings.Contains(script, hook) {
+			t.Errorf("script missing %q hook invocation:\n%s", hook, script)
 		}
 	}
-	// Each named package must appear under /install/node_modules.
 	for _, p := range pkgs {
 		want := "/install/node_modules/" + p
-		if !strings.Contains(cmd[2], want) {
-			t.Errorf("script missing path %q:\n%s", want, cmd[2])
+		if !strings.Contains(script, want) {
+			t.Errorf("script missing path %q:\n%s", want, script)
 		}
 	}
 }
