@@ -59,6 +59,13 @@ const (
 	CategoryMemExec          = "memory_execution"
 	CategoryAntiForensics    = "anti_forensics"
 	CategoryDynamicExec      = "dynamic_code_execution"
+	// CategoryUnknownBinary records execve events that do not match a
+	// positively-defined attack pattern (suspicious path, inline -c/-e
+	// flag, shell -c with sensitive args). The category exists for chain
+	// visibility in the forensic report but does not flip the verdict on
+	// its own — see the rationale block above classifyExecve in
+	// internal/analyzer/analyzer.go.
+	CategoryUnknownBinary = "unknown_binary"
 )
 
 // Category severity tiers drive verdict assignment in analyzer.Analyze.
@@ -91,6 +98,7 @@ var CategorySeverity = map[string]string{
 	CategoryDNSTunnel:        SeverityMedium,
 	CategoryEvasion:          SeverityMedium,
 	CategoryDynamicExec:      SeverityLow,
+	CategoryUnknownBinary:    SeverityLow,
 }
 
 // Scan phases.

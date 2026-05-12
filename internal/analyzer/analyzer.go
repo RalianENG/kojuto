@@ -30,9 +30,24 @@ func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
 	// were written (openat O_CREAT/O_WRONLY) to correlate with unlinks.
 	executedPaths := collectExecutedPaths(events)
 
+	// Pre-pass: build PID → comm map from execve events so later
+	// syscalls (mprotect, mmap) can be attributed back to the process
+	// that issued them. Strace mprotect lines do not carry the
+	// process name; only the PID. This map is the missing link.
+	pidComm := collectPIDComm(events)
+
 	var suspicious []types.SyscallEvent
 
 	for i := range events {
+		// V8 JIT filter: simultaneous RWX mprotect/mmap from a Node
+		// interpreter is legitimate JIT page management, not shellcode
+		// injection. The detection comment in strace_parse.go has been
+		// documenting this as a known false-positive source; this is
+		// the implementation it pointed at.
+		if isV8JITPageOp(&events[i], pidComm) {
+			continue
+		}
+
 		if isBenign(&events[i]) {
 			continue
 		}
@@ -92,6 +107,73 @@ func decideVerdict(events []types.SyscallEvent) string {
 		}
 	}
 	return types.VerdictClean
+}
+
+// jitInterpreters lists program names whose JIT engine routinely
+// allocates simultaneous PROT_READ|PROT_WRITE|PROT_EXEC pages as a
+// normal part of code generation. Detecting mprotect/mmap RWX from
+// these processes as "shellcode injection" produces a guaranteed FP
+// on every package that imports any Node-family interpreter — see
+// the long-standing comment in strace_parse.go documenting this.
+//
+// The list is bounded: it is the set of interpreters that ship with
+// the sandbox image (or that a package install can drag in via
+// node-gyp / native modules) and that use simultaneous RWX. CPython
+// and Lua do not; they are deliberately absent.
+var jitInterpreters = map[string]bool{
+	"node":   true,
+	"nodejs": true,
+	"deno":   true,
+	"bun":    true,
+}
+
+// collectPIDComm builds a PID → comm map from execve events. Used to
+// retroactively identify which process emitted a syscall whose parser
+// did not populate the comm field (strace mprotect/mmap lines carry
+// the PID but not the process name).
+//
+// Only the basename of the binary is recorded — execve events report
+// the full path (e.g. "/usr/bin/node") but lookups need to match
+// generic names (e.g. "node").
+func collectPIDComm(events []types.SyscallEvent) map[uint32]string {
+	m := make(map[uint32]string)
+	for i := range events {
+		evt := &events[i]
+		if evt.Syscall != types.EventExecve || evt.PID == 0 || evt.Comm == "" {
+			continue
+		}
+		m[evt.PID] = path.Base(evt.Comm)
+	}
+	return m
+}
+
+// isV8JITPageOp returns true if the event is a simultaneous RWX
+// mprotect or mmap call from a known JIT-using interpreter PID.
+// Such calls are JIT page management, not shellcode injection.
+//
+// Two safety properties:
+//  1. The PID must appear as the target of a prior execve event in
+//     this same scan — i.e. kojuto observed the interpreter launch.
+//     An attacker cannot inject a fake PID into the strace stream.
+//  2. The execve comm must be a known JIT interpreter. Any other
+//     binary's RWX mprotect remains HIGH-severity memory_execution.
+//
+// PIDs that did not produce an execve in the scan (PID = 0 from the
+// main strace target, or PIDs missed by the parser) fall through to
+// the existing detection, preserving the original behavior for the
+// shellcode-injection attack class.
+func isV8JITPageOp(evt *types.SyscallEvent, pidComm map[uint32]string) bool {
+	if evt.Syscall != types.EventMprotect && evt.Syscall != types.EventMmap {
+		return false
+	}
+	if evt.PID == 0 {
+		return false
+	}
+	comm, ok := pidComm[evt.PID]
+	if !ok {
+		return false
+	}
+	return jitInterpreters[comm]
 }
 
 // collectExecutedPaths builds a set of file paths that appeared as the
@@ -216,6 +298,8 @@ func categoryShortDesc(c string) string {
 		return "create-execute-delete chain"
 	case types.CategoryDynamicExec:
 		return "eval / Function() / vm.runIn*Context (audit hook)"
+	case types.CategoryUnknownBinary:
+		return "execve without positive attack signature (info)"
 	}
 	return c
 }
@@ -535,12 +619,71 @@ func isHomeDir(filePath string) bool {
 	return strings.HasPrefix(filePath, "/home/") || strings.HasPrefix(filePath, "/root/")
 }
 
+// classifyExecve categorizes an execve event that survived isBenignExec.
+//
+// Design decision (2026-05): the residual "default" branch — execve of
+// any binary that doesn't match a positive attack signature — is
+// recorded as CategoryUnknownBinary / LOW rather than HIGH. The change
+// addresses two problems surfaced by clean-corpus FP measurement:
+//
+//  1. There is no closed positive definition of "legitimate execve
+//     during install" — the legitimate set spans coreutils, language
+//     runtimes, compiler toolchains (gcc/cc/ld/as/ar/make/cmake/ninja/
+//     autoconf/...), VCS tools, and arbitrary preinstall hook commands.
+//     Maintaining an allowlist of binary names would be open-ended and
+//     brittle; every new ecosystem or build tool would force a list
+//     update.
+//
+//  2. The harm-firing syscalls of every meaningful execve-driven attack
+//     (network connect, sensitive-path openat, persistence write,
+//     mprotect RWX, /tmp exec, bind/listen) are observed independently
+//     and carry their own HIGH categories. Treating "execve of an
+//     unrecognized binary" as suspicious by itself produces noise
+//     (build toolchain, package-manager scaffolding) without unique
+//     signal — the actual harm, if any, is caught by other rules when
+//     the binary actually does something.
+//
+// What stays HIGH (each has a positive attack signature):
+//   - execve from /dev/shm or /proc/self/fd  → fileless attack
+//   - interpreter with inline -c/-e flag     → inline code injection
+//   - sh -c that fails isShellCmdBenign      → already negative-space-
+//     filtered for env/curl, find -exec, $()/“ substitution, cp/ln/mv
+//     to /usr/local/bin, sensitive-path args, etc. (see
+//     isShellCmdBenign). The benign-check failure itself encodes an
+//     attack signature, so reaching this branch is meaningful even
+//     without observing the side-effect syscalls.
+//
+// What is now LOW (CategoryUnknownBinary):
+//   - default "unrecognized binary execve"   → harm-firing rules catch
+//     anything the binary actually does. The event is still emitted
+//     for forensic chain visibility.
+//
+// Static-analysis tooling (GuardDog and similar) covers orthogonal
+// gaps that kojuto cannot reach at runtime: time-bombed payloads
+// beyond the scan timeout, function-call-gated logic that import does
+// not exercise, typosquatting, and registry metadata anomalies. The
+// dynamic/static split is intentional; this decision keeps dynamic
+// detection focused on what only dynamic can see.
+//
+// What is lost: "execve a native binary that performs only
+// undetectable computation" (mining without a pool, local fork-bombs,
+// time-delay only). These are out of scope per SECURITY.md known
+// limitations and are addressed by sandbox containment
+// (--network=none, --read-only, pids-limit) rather than by detection
+// rules.
+//
+// Probe-scaffolding handling: kojuto's own outer shell that drives
+// the install will be invoked by a file path rather than `sh -c
+// <inline>`, so the outer event is filtered as benign at isBenignExec
+// time. That refactor is tracked as a separate change in sandbox.go
+// and is NOT covered by this rule — see InstallCommand for the launch
+// contract.
 func classifyExecve(evt *types.SyscallEvent) {
 	cmdline := evt.Cmdline
 	base := path.Base(evt.Comm)
 	dir := path.Dir(evt.Comm) + "/"
 
-	// Execution from suspicious directories (fileless attack).
+	// Execution from suspicious directories (fileless attack). HIGH.
 	for _, d := range suspiciousExecDirs {
 		if strings.HasPrefix(dir, d) {
 			evt.Category = types.CategoryCodeExecution
@@ -550,7 +693,7 @@ func classifyExecve(evt *types.SyscallEvent) {
 		}
 	}
 
-	// Inline code execution.
+	// Inline code execution via interpreter -c/-e flag. HIGH.
 	if hasInlineExecFlag(cmdline, interpreterExecFlags[base]) {
 		evt.Category = types.CategoryCodeExecution
 		evt.Reason = base + " executed with inline code flag (-c/-e). " +
@@ -558,7 +701,11 @@ func classifyExecve(evt *types.SyscallEvent) {
 		return
 	}
 
-	// Shell command analysis.
+	// Shell command analysis. Reaching here means isShellCmdBenign
+	// already returned false — the command contains a non-shellSafe
+	// token, a sensitive-path arg, a binary-hijack file op, or a
+	// substitution construct. Any of those is itself an attack
+	// signature. HIGH.
 	if shells[base] && hasInlineExecFlag(cmdline, []string{" -c "}) {
 		evt.Category = types.CategoryCodeExecution
 		evt.Reason = "Shell command: " + truncate(cmdline, 200) +
@@ -566,10 +713,13 @@ func classifyExecve(evt *types.SyscallEvent) {
 		return
 	}
 
-	// Unknown binary.
-	evt.Category = types.CategoryCodeExecution
-	evt.Reason = "Unexpected process execution: " + truncate(cmdline, 200) +
-		" — binary not in the allowed list for package installation."
+	// Residual execve. Recorded for chain visibility; verdict decided by
+	// the syscall-level rules that observe the binary's actual behavior.
+	evt.Category = types.CategoryUnknownBinary
+	evt.Reason = "Unrecognized binary execution: " + truncate(cmdline, 200) +
+		" — recorded for forensic chain visibility. No positive attack " +
+		"signature in the execve itself; verdict is decided by the " +
+		"syscall-level rules that observe the binary's runtime behavior."
 }
 
 // knownDoHServers are IP addresses of public DNS-over-HTTPS providers.
@@ -755,6 +905,7 @@ var shellSafeCommands = map[string]bool{
 // suspiciousExecDirs are directories where legitimate binaries should never run from.
 // Execution from these paths indicates fileless attacks or payload drops.
 var suspiciousExecDirs = []string{
+	"/tmp/",          // world-writable tmpfs — classic payload drop target
 	"/dev/shm/",      // tmpfs — fileless execution
 	"/proc/self/fd/", // fd-based execution bypass
 }
