@@ -1121,12 +1121,12 @@ func TestAnalyze_ShellCmdSensitivePath(t *testing.T) {
 // TestAnalyze_V8JITFilter documents the PID-based filter for V8 JIT
 // pages: simultaneous RWX mprotect/mmap from a Node interpreter is
 // legitimate code generation, not shellcode injection. The filter
-// requires that the same PID appear as the target of a prior execve
-// for a known JIT interpreter — an attacker cannot inject fake PIDs
-// into the strace stream, so this cannot be bypassed by spoofing.
+// requires (a) the same PID appears as the target of a prior execve,
+// (b) that execve's basename is a known JIT interpreter, and (c) the
+// execve came from a trusted system directory — an attacker cannot
+// bypass by planting a binary named "node" under /install/.
 func TestAnalyze_V8JITFilter(t *testing.T) {
-	// Node JIT pattern: execve /usr/bin/node, then the same PID
-	// emits RWX mprotect/mmap. Must NOT flip the verdict.
+	// Node JIT pattern from /usr/bin/node. Must NOT flip the verdict.
 	nodePID := uint32(1234)
 	jitFromNode := []types.SyscallEvent{
 		{Syscall: types.EventExecve, Comm: "/usr/bin/node", Cmdline: "node /install/node_modules/lodash/index.js", PID: nodePID},
@@ -1135,7 +1135,20 @@ func TestAnalyze_V8JITFilter(t *testing.T) {
 	}
 	verdict, _ := Analyze(jitFromNode)
 	if verdict != types.VerdictClean {
-		t.Errorf("expected clean when RWX comes from node PID (V8 JIT), got %s", verdict)
+		t.Errorf("expected clean when RWX comes from /usr/bin/node, got %s", verdict)
+	}
+
+	// npm symlink (Linux binfmt_script transparently re-execs node;
+	// strace only sees the npm execve). The filter must treat npm
+	// from a trusted directory as JIT-equivalent.
+	npmPID := uint32(2345)
+	jitFromNpm := []types.SyscallEvent{
+		{Syscall: types.EventExecve, Comm: "/usr/local/bin/npm", Cmdline: "npm run --silent --if-present preinstall", PID: npmPID},
+		{Syscall: types.EventMprotect, MemProt: "PROT_READ|PROT_WRITE|PROT_EXEC", PID: npmPID},
+	}
+	verdict, _ = Analyze(jitFromNpm)
+	if verdict != types.VerdictClean {
+		t.Errorf("expected clean when RWX comes from /usr/local/bin/npm (V8 JIT via shebang), got %s", verdict)
 	}
 
 	// Shellcode injection pattern: RWX from a PID whose execve was NOT
@@ -1158,6 +1171,27 @@ func TestAnalyze_V8JITFilter(t *testing.T) {
 	}
 	if !sawMemExec {
 		t.Errorf("expected memory_execution event in %v", filtered)
+	}
+
+	// Bypass attempt: attacker plants a binary named "npm" or "node"
+	// under /install/ and exec's it. The basename matches
+	// jitInterpreters, but the directory is NOT in
+	// jitInterpreterTrustedDirs, so the filter MUST NOT suppress
+	// these events. Tests the path-constraint half of the filter.
+	for _, fakePath := range []string{
+		"/install/node_modules/evil/bin/npm",
+		"/install/node_modules/evil/bin/node",
+		"/tmp/node",
+	} {
+		bypassPID := uint32(9000)
+		bypassAttempt := []types.SyscallEvent{
+			{Syscall: types.EventExecve, Comm: fakePath, Cmdline: "fake-node", PID: bypassPID},
+			{Syscall: types.EventMprotect, MemProt: "PROT_READ|PROT_WRITE|PROT_EXEC", PID: bypassPID},
+		}
+		verdict, _ = Analyze(bypassAttempt)
+		if verdict != types.VerdictSuspicious {
+			t.Errorf("filter bypassed by %q — RWX from attacker-controlled path must NOT be filtered, got %s", fakePath, verdict)
+		}
 	}
 
 	// PID=0 (main strace target, parser miss) does NOT get the JIT

@@ -109,32 +109,51 @@ func decideVerdict(events []types.SyscallEvent) string {
 	return types.VerdictClean
 }
 
-// jitInterpreters lists program names whose JIT engine routinely
-// allocates simultaneous PROT_READ|PROT_WRITE|PROT_EXEC pages as a
-// normal part of code generation. Detecting mprotect/mmap RWX from
-// these processes as "shellcode injection" produces a guaranteed FP
-// on every package that imports any Node-family interpreter — see
-// the long-standing comment in strace_parse.go documenting this.
+// jitInterpreters lists program names that run JS via the V8 engine
+// (or compatible RWX-using JIT). RWX mmap/mprotect from one of these
+// processes is JIT page management, not shellcode injection.
 //
-// The list is bounded: it is the set of interpreters that ship with
-// the sandbox image (or that a package install can drag in via
-// node-gyp / native modules) and that use simultaneous RWX. CPython
-// and Lua do not; they are deliberately absent.
+// node-ecosystem launchers (npm, npx, yarn, pnpm) are JS scripts with
+// a `#!/usr/bin/env node` shebang. Linux's binfmt_script handles the
+// shebang internally, so strace sees only the original execve (e.g.
+// /usr/local/bin/npm) — the kernel-internal re-exec of node is not
+// emitted as a separate syscall. The process is, in fact, running
+// node code at that PID. Treating these as V8-equivalent is what
+// makes the filter cover npm scan flows.
+//
+// CPython, Lua, Ruby are deliberately absent — they do not allocate
+// simultaneous RWX pages.
 var jitInterpreters = map[string]bool{
 	"node":   true,
 	"nodejs": true,
 	"deno":   true,
 	"bun":    true,
+	"npm":    true,
+	"npx":    true,
+	"yarn":   true,
+	"pnpm":   true,
 }
 
-// collectPIDComm builds a PID → comm map from execve events. Used to
-// retroactively identify which process emitted a syscall whose parser
-// did not populate the comm field (strace mprotect/mmap lines carry
-// the PID but not the process name).
+// jitInterpreterTrustedDirs are the directories whose binaries are
+// trusted to be legitimate JIT interpreters. A binary named "npm" or
+// "node" launched from any other directory (e.g.
+// /install/node_modules/<pkg>/bin/npm) is NOT trusted — that path is
+// attacker-controlled and could host a payload that does real
+// shellcode injection while masquerading as a JIT interpreter.
+var jitInterpreterTrustedDirs = map[string]bool{
+	"/usr/bin/":       true,
+	"/usr/local/bin/": true,
+	"/bin/":           true,
+}
+
+// collectPIDComm builds a PID → execve binary path map. Used to
+// retroactively identify which process emitted a syscall whose
+// parser did not populate the comm field (strace mprotect/mmap lines
+// carry the PID but not the process name).
 //
-// Only the basename of the binary is recorded — execve events report
-// the full path (e.g. "/usr/bin/node") but lookups need to match
-// generic names (e.g. "node").
+// The full path is stored, not just the basename, so the V8 JIT
+// filter can require both name match AND a trusted directory before
+// suppressing an event.
 func collectPIDComm(events []types.SyscallEvent) map[uint32]string {
 	m := make(map[uint32]string)
 	for i := range events {
@@ -142,7 +161,7 @@ func collectPIDComm(events []types.SyscallEvent) map[uint32]string {
 		if evt.Syscall != types.EventExecve || evt.PID == 0 || evt.Comm == "" {
 			continue
 		}
-		m[evt.PID] = path.Base(evt.Comm)
+		m[evt.PID] = evt.Comm
 	}
 	return m
 }
@@ -151,17 +170,20 @@ func collectPIDComm(events []types.SyscallEvent) map[uint32]string {
 // mprotect or mmap call from a known JIT-using interpreter PID.
 // Such calls are JIT page management, not shellcode injection.
 //
-// Two safety properties:
-//  1. The PID must appear as the target of a prior execve event in
-//     this same scan — i.e. kojuto observed the interpreter launch.
-//     An attacker cannot inject a fake PID into the strace stream.
-//  2. The execve comm must be a known JIT interpreter. Any other
-//     binary's RWX mprotect remains HIGH-severity memory_execution.
+// Three safety properties:
+//  1. The PID must appear as the target of a prior execve in this
+//     same scan — kojuto observed the interpreter launch. An
+//     attacker cannot inject fake PIDs into the strace stream.
+//  2. The execve binary's basename must match jitInterpreters.
+//  3. The execve binary's directory must be in
+//     jitInterpreterTrustedDirs. A binary named "npm" placed under
+//     /install/<pkg>/bin/ does NOT get the filter — that path is
+//     attacker-controlled and would otherwise let a malicious
+//     package launch real shellcode and have it suppressed.
 //
-// PIDs that did not produce an execve in the scan (PID = 0 from the
-// main strace target, or PIDs missed by the parser) fall through to
-// the existing detection, preserving the original behavior for the
-// shellcode-injection attack class.
+// PIDs that did not produce an execve (PID = 0 from the main strace
+// target, or parser misses) fall through to the existing detection,
+// preserving the original behavior for shellcode injection.
 func isV8JITPageOp(evt *types.SyscallEvent, pidComm map[uint32]string) bool {
 	if evt.Syscall != types.EventMprotect && evt.Syscall != types.EventMmap {
 		return false
@@ -169,11 +191,14 @@ func isV8JITPageOp(evt *types.SyscallEvent, pidComm map[uint32]string) bool {
 	if evt.PID == 0 {
 		return false
 	}
-	comm, ok := pidComm[evt.PID]
+	binPath, ok := pidComm[evt.PID]
 	if !ok {
 		return false
 	}
-	return jitInterpreters[comm]
+	if !jitInterpreters[path.Base(binPath)] {
+		return false
+	}
+	return jitInterpreterTrustedDirs[path.Dir(binPath)+"/"]
 }
 
 // collectExecutedPaths builds a set of file paths that appeared as the
