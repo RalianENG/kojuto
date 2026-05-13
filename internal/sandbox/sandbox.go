@@ -176,6 +176,13 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 		"--tmpfs=/usr/local/bin:nosuid,exec,mode=0755,size=32m",
 		"--tmpfs=/run:nosuid,size=1m",
 		"--tmpfs=/home/dev:nosuid,mode=1777,size=32m",
+		// Dedicated cache tmpfs outside HOME. npm and pip are pinned here via
+		// NPM_CONFIG_CACHE / PIP_CACHE_DIR so their legitimate writes (logs,
+		// _cacache, wheel cache) never land under /home/ and never trip the
+		// persistence backstop. Keeps the "no /home/ writes" structural
+		// guarantee strict without path-based allowlists, which would let
+		// malicious packages smuggle artifacts under a benign-looking prefix.
+		"--tmpfs=/var/cache/kojuto:nosuid,mode=1777,size=200m",
 		"--memory="+mem,
 		"--cpus="+cpus,
 		"--pids-limit=256",
@@ -219,7 +226,19 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 
 	// Audit hook: load kojuto-require.js before any user code in Node.js.
 	// This intercepts eval/Function/vm dynamic code execution.
-	args = append(args, "--env=NODE_OPTIONS=--require /opt/kojuto/kojuto-require.js")
+	//
+	// NPM_CONFIG_CACHE / PIP_CACHE_DIR pin package-manager caches to the
+	// dedicated /var/cache/kojuto tmpfs. Without these, npm writes
+	// /home/dev/.npm/_logs and pip writes /home/dev/.cache/pip — both
+	// correctly flagged as persistence by the /home/ structural backstop
+	// in the analyzer. Redirecting at the sandbox layer is preferable to
+	// relaxing the detection rule: the rule stays strict, while
+	// legitimate cache I/O goes to a path the analyzer never inspects.
+	args = append(args,
+		"--env=NODE_OPTIONS=--require /opt/kojuto/kojuto-require.js",
+		"--env=NPM_CONFIG_CACHE=/var/cache/kojuto/npm",
+		"--env=PIP_CACHE_DIR=/var/cache/kojuto/pip",
+	)
 
 	// Tell sitecustomize.py which packages are being audited so its
 	// frame-walking logic can flag dynamic exec originating in those
@@ -707,11 +726,52 @@ func (s *Sandbox) Exec(ctx context.Context, command []string) ([]byte, error) {
 
 // InstallPackage runs the install command inside the sandbox.
 func (s *Sandbox) InstallPackage(ctx context.Context) ([]byte, error) {
-	return s.Exec(ctx, s.InstallCommand())
+	cmd, err := s.InstallCommand(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.Exec(ctx, cmd)
 }
 
-// InstallCommand returns the install command for the ecosystem.
-func (s *Sandbox) InstallCommand() []string {
+// installScriptPath is the in-container location where the probe stages
+// its install script before strace attaches. Sits on the dedicated
+// /var/cache/kojuto tmpfs configured in containerArgs.
+//
+// The probe is invoked as `sh <installScriptPath>` rather than the
+// previous `sh -c <inline script>`. The shape difference matters: the
+// analyzer's classifyExecve treats `sh -c ...` as a positive attack
+// signature when the contents fail isShellCmdBenign, which produces a
+// guaranteed false positive on every npm scan because kojuto's own
+// install loop (find + while + npm run ...) cannot pass the benign
+// check. Switching to `sh <path>` lets isBenignExec recognize sh from
+// /bin/ as benign and filter the outer probe shell entirely without
+// any allowlist, marker, or PID-based filtering.
+//
+// Attackers cannot mimic this shape: the cmdline of a shell spawned
+// from a package's preinstall hook is determined by npm/yarn/pnpm
+// (`sh -c <package script>`), not by the package itself.
+const installScriptPath = "/var/cache/kojuto/install.sh"
+
+// stageInstallScript writes content to installScriptPath inside the
+// running container. Used by InstallCommand/InstallAllCommand to stage
+// the probe script before strace attaches. The write happens via a
+// separate docker exec session, so the syscalls it produces are not
+// observed by the install-phase strace.
+func (s *Sandbox) stageInstallScript(ctx context.Context, content string) ([]string, error) {
+	if err := s.dockerWriteFile(ctx, installScriptPath, content); err != nil {
+		return nil, fmt.Errorf("stage install script: %w", err)
+	}
+	return []string{"sh", installScriptPath}, nil
+}
+
+// InstallCommand returns the install command for the ecosystem. For
+// ecosystems that need a shell-driven install (npm lifecycle hooks,
+// local-mode pip glob expansion), this method writes the install
+// script to the container's tmpfs first and returns a file-path-based
+// command so the outer probe shell does not trigger the analyzer's
+// `sh -c` attack-signature branch. See installScriptPath for the
+// design rationale.
+func (s *Sandbox) InstallCommand(ctx context.Context) ([]string, error) {
 	if s.ecosystem == types.EcosystemNpm {
 		// The host has already resolved deps into node_modules (with
 		// --ignore-scripts). Inside the sandbox we fire each package's
@@ -720,7 +780,7 @@ func (s *Sandbox) InstallCommand() []string {
 		// script and rebuilds native modules — it skips preinstall and
 		// postinstall, which is exactly where most npm supply chain
 		// attacks place their payload (axios, crypto-js, Shai-Hulud).
-		return []string{"sh", "-c", npmLifecycleScript(nil)}
+		return s.stageInstallScript(ctx, npmLifecycleScript(nil))
 	}
 
 	// Local mode: install directly from the file in the mount point.
@@ -729,10 +789,8 @@ func (s *Sandbox) InstallCommand() []string {
 	if s.localMode {
 		// Find the actual file in the mount point and install it directly.
 		// This handles both wheels (.whl) and source distributions (.tar.gz).
-		return []string{
-			"sh", "-c",
-			"pip install --no-index --no-deps --no-build-isolation " + s.mountPoint + "/*",
-		}
+		return s.stageInstallScript(ctx,
+			"pip install --no-index --no-deps --no-build-isolation "+s.mountPoint+"/*")
 	}
 
 	// Install with dependencies — all wheels in the mount point are installed
@@ -743,17 +801,20 @@ func (s *Sandbox) InstallCommand() []string {
 		"--no-index",
 		"--find-links=" + s.mountPoint,
 		"--", s.pkg,
-	}
+	}, nil
 }
 
 // InstallAllCommand returns a pip install command that installs multiple packages at once.
 // All wheels must already be in the mount point directory.
-func (s *Sandbox) InstallAllCommand(pkgs []string) []string {
+//
+// For npm, this writes the install script to the container tmpfs and
+// returns a file-path-based command — see InstallCommand for rationale.
+func (s *Sandbox) InstallAllCommand(ctx context.Context, pkgs []string) ([]string, error) {
 	if s.ecosystem == types.EcosystemNpm {
 		// Fire lifecycle scripts only for the target packages (not all
 		// transitive deps). Transitive deps without lifecycle scripts
 		// are covered by the import phase which loads them via require().
-		return []string{"sh", "-c", npmLifecycleScript(pkgs)}
+		return s.stageInstallScript(ctx, npmLifecycleScript(pkgs))
 	}
 
 	cmd := []string{
@@ -762,7 +823,7 @@ func (s *Sandbox) InstallAllCommand(pkgs []string) []string {
 		"--find-links=" + s.mountPoint,
 		"--",
 	}
-	return append(cmd, pkgs...)
+	return append(cmd, pkgs...), nil
 }
 
 // npmLifecycleScript builds a /bin/sh script that fires preinstall +

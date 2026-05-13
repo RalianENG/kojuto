@@ -316,6 +316,19 @@ func scanSinglePackage(pkg, version, ecosystem string) (*pinnedDep, error) {
 	return &pinnedDep{Name: pkg, Version: resolvedVersion}, nil
 }
 
+// benchLog emits a single stderr line with event count and heap stats when
+// KOJUTO_BENCH=1. Used by bench/ harness to chart analyzer load and memory
+// ceiling across install/import/analyze phases. No-op outside bench mode.
+func benchLog(phase string, eventCount int) {
+	if os.Getenv("KOJUTO_BENCH") != "1" {
+		return
+	}
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	fmt.Fprintf(os.Stderr, "BENCH phase=%s events=%d heap_mb=%d sys_mb=%d\n",
+		phase, eventCount, ms.HeapAlloc/(1024*1024), ms.Sys/(1024*1024))
+}
+
 func runBatchScan(_ []string) error {
 	deps, ecosystem, err := depfileParse(flagFile)
 	if err != nil {
@@ -421,7 +434,11 @@ func runBatchScreening(deps []depfile.Dep, ecosystem string) (string, error) {
 	// Install all packages at once with strace.
 	installPhase := startPhase("install", fmt.Sprintf("%d packages", len(pkgNames)))
 	cp := probe.NewContainerStrace()
-	installOut, installErr := cp.StartAndInstall(ctx, sb.ContainerID(), sb.InstallAllCommand(pkgNames))
+	installCmd, installCmdErr := sb.InstallAllCommand(ctx, pkgNames)
+	if installCmdErr != nil {
+		return "", fmt.Errorf("staging install command: %w", installCmdErr)
+	}
+	installOut, installErr := cp.StartAndInstall(ctx, sb.ContainerID(), installCmd)
 	if installErr != nil {
 		fmt.Fprintf(os.Stderr, "[!] Install output:\n%s\n", string(installOut))
 		return "", fmt.Errorf("batch install failed: %w", installErr)
@@ -432,6 +449,7 @@ func runBatchScreening(deps []depfile.Dep, ecosystem string) (string, error) {
 	for evt := range cp.Events() {
 		events = append(events, evt)
 	}
+	benchLog("install_drain", len(events))
 
 	// Import all packages under simulated OS identities (3 scripts total).
 	if err := sb.WriteProbeScriptsMulti(ctx, pkgNames); err != nil {
@@ -453,9 +471,11 @@ func runBatchScreening(deps []depfile.Dep, ecosystem string) (string, error) {
 			events = append(events, evt)
 		}
 		importPhase.end()
+		benchLog("import_drain_"+osNames[i], len(events))
 	}
 
 	verdict, filtered := analyzer.Analyze(events)
+	benchLog("analyze_done", len(filtered))
 	phaseInfo("screening", fmt.Sprintf("verdict=%s (%d events)", verdict, len(filtered)))
 
 	return verdict, nil
@@ -1034,7 +1054,11 @@ func runContainerStraceProbe(ctx context.Context, sb *sandbox.Sandbox, _ string)
 	cp := probe.NewContainerStrace()
 	installPhase := startPhase("install", "")
 
-	installOut, err := cp.StartAndInstall(ctx, sb.ContainerID(), sb.InstallCommand())
+	installCmd, err := sb.InstallCommand(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("staging install command: %w", err)
+	}
+	installOut, err := cp.StartAndInstall(ctx, sb.ContainerID(), installCmd)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[!] Install output:\n%s\n", string(installOut))
 

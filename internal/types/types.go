@@ -19,6 +19,13 @@ const (
 	EventMprotect    = "mprotect"
 	EventUnlink      = "unlink"
 	EventDynamicExec = "dynamic_exec"
+	// EventClone records a clone/clone3/fork/vfork call. The parent
+	// PID lives in PID; the new child PID lives in ChildPID. The
+	// analyzer's PID-attribution pre-pass uses these to propagate
+	// the parent's execve comm to children that never call execve
+	// (V8 worker threads, fork-without-exec helpers), which is the
+	// missing link that lets the V8 JIT filter cover thread-PIDs.
+	EventClone = "clone"
 )
 
 // SyscallEvent represents a suspicious syscall captured by the probe.
@@ -41,6 +48,7 @@ type SyscallEvent struct {
 	Reason      string    `json:"reason,omitempty"`
 	Phase       string    `json:"phase,omitempty"`
 	PID         uint32    `json:"pid"`
+	ChildPID    uint32    `json:"child_pid,omitempty"` // populated for EventClone — see types.EventClone
 	Family      uint16    `json:"family,omitempty"`
 	DstPort     uint16    `json:"dst_port,omitempty"`
 }
@@ -59,6 +67,13 @@ const (
 	CategoryMemExec          = "memory_execution"
 	CategoryAntiForensics    = "anti_forensics"
 	CategoryDynamicExec      = "dynamic_code_execution"
+	// CategoryUnknownBinary records execve events that do not match a
+	// positively-defined attack pattern (suspicious path, inline -c/-e
+	// flag, shell -c with sensitive args). The category exists for chain
+	// visibility in the forensic report but does not flip the verdict on
+	// its own — see the rationale block above classifyExecve in
+	// internal/analyzer/analyzer.go.
+	CategoryUnknownBinary = "unknown_binary"
 )
 
 // Category severity tiers drive verdict assignment in analyzer.Analyze.
@@ -91,6 +106,7 @@ var CategorySeverity = map[string]string{
 	CategoryDNSTunnel:        SeverityMedium,
 	CategoryEvasion:          SeverityMedium,
 	CategoryDynamicExec:      SeverityLow,
+	CategoryUnknownBinary:    SeverityLow,
 }
 
 // Scan phases.

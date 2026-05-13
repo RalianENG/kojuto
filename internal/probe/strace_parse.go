@@ -123,6 +123,18 @@ var (
 		`mprotect\(0x[0-9a-f]+,\s*\d+,\s*(PROT_[A-Z_|]+PROT_WRITE[A-Z_|]*PROT_EXEC[A-Z_|]*|PROT_[A-Z_|]*PROT_EXEC[A-Z_|]*PROT_WRITE[A-Z_|]*)`,
 	)
 
+	// clone(child_stack=..., flags=..., ...) = 12345
+	// clone3({flags=..., ...}, 88) = 12345
+	// vfork() = 12345
+	// The return value at the end is the new child PID. Negative
+	// return = failed clone, not emitted as an event. The analyzer
+	// uses these events to propagate the parent's execve comm to the
+	// new child (V8 worker threads never execve, so without this the
+	// PID-attribution lookup misses them).
+	straceCloneRe = regexp.MustCompile(
+		`\b(clone3?|vfork)\([^)]*\)\s*=\s*(\d+)\b`,
+	)
+
 	// unlink("/tmp/.ld-linux-x86-64.py") = 0.
 	straceUnlinkRe = regexp.MustCompile(
 		`unlink\("([^"]+)"\)`,
@@ -243,6 +255,10 @@ func parseStraceLine(line string, state *ParseState) (types.SyscallEvent, bool) 
 	}
 
 	if evt, ok := parseExecve(line); ok {
+		return evt, true
+	}
+
+	if evt, ok := parseClone(line); ok {
 		return evt, true
 	}
 
@@ -538,6 +554,33 @@ func parseConnectOrSendto(line string, re *regexp.Regexp, syscall string) (types
 // (e.g. "= -1 ENOENT", "= -1 EACCES"). These are harmless PATH lookups.
 var execveFailedRe = regexp.MustCompile(`=\s*-1\s+E[A-Z]+`)
 
+// parseClone extracts the (parent PID, child PID) pair from a strace
+// clone/clone3/vfork line. The parent PID comes from the line's
+// "[pid X]" prefix (or 0 for the main strace target); the child PID
+// is the syscall's return value. Failed clones (negative return) do
+// not match the regex (it requires `\d+`).
+//
+// The emitted event carries no Comm or Cmdline — the analyzer's
+// collectPIDComm uses the parent→child mapping to copy the parent's
+// execve comm to the child, which lets the V8 JIT filter cover
+// worker threads that never call execve themselves.
+func parseClone(line string) (types.SyscallEvent, bool) {
+	matches := straceCloneRe.FindStringSubmatch(line)
+	if matches == nil {
+		return types.SyscallEvent{}, false
+	}
+	childPID, err := strconv.ParseUint(matches[2], 10, 32)
+	if err != nil || childPID == 0 {
+		return types.SyscallEvent{}, false
+	}
+	return types.SyscallEvent{
+		Timestamp: time.Now().UTC(),
+		PID:       extractPID(line),
+		ChildPID:  uint32(childPID),
+		Syscall:   types.EventClone,
+	}, true
+}
+
 func parseExecve(line string) (types.SyscallEvent, bool) {
 	matches := straceExecveRe.FindStringSubmatch(line)
 	if matches == nil {
@@ -599,7 +642,13 @@ func extractPID(line string) uint32 {
 		return 0
 	}
 
-	p, err := strconv.ParseUint(pidStr[:endIdx], 10, 32)
+	// strace right-pads the PID with spaces to align columns, e.g.
+	// "[pid    12]" or "[pid     1]". strconv.ParseUint is strict and
+	// rejects leading spaces, so without TrimSpace every PID under 5
+	// digits parses as 0 — which historically broke PID-aware analysis
+	// (V8 JIT filtering, process-tree correlation) for every container
+	// PID, since container PIDs are almost always small.
+	p, err := strconv.ParseUint(strings.TrimSpace(pidStr[:endIdx]), 10, 32)
 	if err != nil {
 		return 0
 	}

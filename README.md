@@ -237,12 +237,13 @@ This approach detects environment-aware and delayed-execution supply chain attac
 
 ## Detection Benchmarks
 
-Validated against 300 randomly sampled malicious packages from [Datadog's malicious-software-packages-dataset](https://github.com/DataDog/malicious-software-packages-dataset) (seed=42, reproducible) and 70 known-clean packages.
+True-positive rate validated against 300 randomly sampled malicious packages from [Datadog's malicious-software-packages-dataset](https://github.com/DataDog/malicious-software-packages-dataset) (seed=42, reproducible). False-positive rate re-measured (2026-05) against 100 popular non-corporate PyPI packages + 100 popular non-corporate npm packages.
 
 | Metric | Result |
 |--------|--------|
 | True Positive Rate | **100%** (61/61 installable malicious packages detected) |
-| False Positive Rate | **0%** (0/70 clean packages flagged) |
+| False Positive Rate — PyPI | **0%** (0/84 clean PyPI packages flagged, 16 install-resolution failures excluded as scan-infrastructure issue) |
+| False Positive Rate — npm | **0%** within in-scope detection categories (0/89 across `code_execution`/`memory_execution`/`persistence`/`binary_hijacking`/`credential_access`/`backdoor`/`anti_forensics`); 2/91 across the entire taxonomy from a documented `c2_communication` issue (install-time DNS lookups by `bull`/`bullmq` register as outbound intent — see Known Limitations) |
 | Batch screening speed | **50 PyPI packages in 98s** (single sandbox) |
 
 Of the 300 malicious samples, 238 failed to install (dependencies already removed from PyPI) and 1 timed out — expected for archived malware. All 61 that installed successfully were detected.
@@ -254,8 +255,8 @@ Of the 300 malicious samples, 238 failed to install (dependencies already remove
 | C2 communication (`c2_communication`) | `aiogram-types-v3` → `147.45.124.42:80` | `connect`/`sendto` to non-loopback IPs |
 | Data exfiltration (`data_exfiltration`) | DNS resolution of Discord/Telegram/Pastebin | `sendto` port 53 resolving known exfil services |
 | Credential access (`credential_access`) | `axios-attack-demo` → `.ssh/id_rsa`, `.aws/credentials`, `.solana/id.json` | `openat` on ~60 sensitive paths (SSH, cloud, crypto wallets, browser data) |
-| Code execution (`code_execution`) | `advpruebitaa` → `type nul > prueba11.txt`, `/tmp/ld.py` | `execve` with inline `-c`/`-e` flags or from `/tmp`, `/dev/shm` |
-| Memory execution (`memory_execution`) | `ctypes.mmap(RWX)` shellcode injection | `mmap`/`mprotect` with simultaneous PROT_WRITE+PROT_EXEC |
+| Code execution (`code_execution`) | `advpruebitaa` → `/tmp/ld.py` | `execve` with inline `-c`/`-e` flags, or from `/tmp`/`/dev/shm`/`/proc/self/fd`. `sh -c` content and unrecognized binaries are recorded as `unknown_binary` (LOW) — their harm fires via the dedicated rules below |
+| Memory execution (`memory_execution`) | `ctypes.mmap(RWX)` shellcode injection | `mmap`/`mprotect` with simultaneous PROT_WRITE+PROT_EXEC, attributed by PID to filter V8/JIT noise from `node`/`npm`/`npx`/`yarn`/`pnpm`/`deno`/`bun` running from trusted system directories |
 | Binary hijacking (`binary_hijacking`) | `rename /tmp/evil /usr/local/bin/python3` | `rename` targeting trusted system binaries |
 | Backdoor (`backdoor`) | `bind` + `listen` + `accept` on attacker-controlled port | Server socket operations during install |
 | Persistence (`persistence`) | Write to `.bashrc`, `.config/systemd/user/`, any `/home/` path | `openat` with write flags to shell startup files or user home directory |
@@ -278,7 +279,7 @@ sensitive_paths:
 
 ### False positive verification
 
-50 popular PyPI packages (flask, django, requests, cryptography, pydantic, etc.) and 20 npm packages (lodash, express, axios, etc.) scanned with zero false positives.
+100 popular non-corporate PyPI packages and 100 popular non-corporate npm packages scanned. PyPI: 84 returned a verdict, all clean (0 in-scope FP); 16 hit a pre-existing pip dep-resolution failure unrelated to detection logic. npm: 91 returned a verdict, 89 clean within in-scope categories and 2 flagged by the documented `bull`/`bullmq` install-time DNS lookup issue (Known Limitations); 9 errored on native build failures unrelated to detection logic.
 
 ## Known Limitations
 

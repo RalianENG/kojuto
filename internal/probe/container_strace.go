@@ -92,7 +92,19 @@ func (c *ContainerStrace) buildCommand(ctx context.Context, containerID string, 
 		"exec", containerID,
 		"strace", "-f",
 		"-s", "256",
-		"-e", "trace=connect,sendto,sendmsg,sendmmsg,bind,listen,accept,accept4,execve,openat,rename,renameat,renameat2,sendfile,ptrace,mmap,mprotect,unlink,unlinkat",
+		// --quiet=attach suppresses the "strace: Process N attached"
+		// message that strace -f otherwise prints when it attaches to a
+		// new child. The message would be inserted INLINE in the middle
+		// of the originating clone() trace, splitting it across two
+		// lines and breaking single-line regex parsers. Without this
+		// flag, parseClone fails to match every real clone event,
+		// nullifying the V8 worker-thread propagation pass.
+		"--quiet=attach",
+		// clone/clone3 are traced to propagate execve comm across thread
+		// boundaries (V8 spawns worker threads via clone — they never
+		// execve so the analyzer's PID→comm map cannot attribute their
+		// mprotect events without seeing the parent relationship).
+		"-e", "trace=connect,sendto,sendmsg,sendmmsg,bind,listen,accept,accept4,execve,clone,clone3,openat,rename,renameat,renameat2,sendfile,ptrace,mmap,mprotect,unlink,unlinkat",
 		"-e", "signal=none",
 		"--",
 	}
@@ -107,6 +119,7 @@ func (c *ContainerStrace) parseStraceOutput(stderr io.ReadCloser, done chan<- st
 	state := NewParseState()
 	scanner := bufio.NewScanner(stderr)
 	scanner.Buffer(make([]byte, 64*1024), straceMaxLine)
+
 	for scanner.Scan() {
 		evt, ok := parseStraceLine(scanner.Text(), state)
 		if !ok {

