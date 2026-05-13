@@ -22,6 +22,29 @@ func SetSensitivePaths(patterns []string) {
 	sensitivePathPatterns = patterns
 }
 
+// scannedPkgs is the set of packages whose own files the analyzer treats
+// as legitimate write targets. Used by the library_hijacking rule to
+// distinguish "scanned package writes its own build output" from
+// "scanned package writes into a sibling package's source". Set via
+// SetScanPkgs at scan-start; empty by default so older code paths
+// (and tests) are unaffected until they opt in.
+var scannedPkgs = make(map[string]bool)
+
+// SetScanPkgs records the packages currently being scanned so the
+// library_hijacking rule can identify cross-package writes. Pass the
+// same list given to Sandbox.SetScanPkgs. A nil or empty list disables
+// the rule (all node_modules writes flow through the default openat
+// classification).
+func SetScanPkgs(pkgs []string) {
+	m := make(map[string]bool, len(pkgs))
+	for _, p := range pkgs {
+		if p != "" {
+			m[p] = true
+		}
+	}
+	scannedPkgs = m
+}
+
 // Analyze determines a verdict based on captured events.
 // Events matching known-benign patterns are filtered out first.
 // Suspicious events are enriched with Category and Reason fields.
@@ -588,6 +611,25 @@ func classifyOpenat(evt *types.SyscallEvent) {
 		strings.Contains(evt.OpenFlags, "O_RDWR") ||
 		strings.Contains(evt.OpenFlags, "O_CREAT")
 
+	// Library hijack: write to /install/node_modules/<other_pkg>/... where
+	// <other_pkg> is not one of the packages being scanned. The hijacked
+	// package's source gets backdoored; harm fires when a later workflow
+	// imports it, outside kojuto's scan window. Placement is the only
+	// chance to detect this attack class.
+	//
+	// Disabled when scannedPkgs is empty (no SetScanPkgs called), so
+	// existing call sites and tests are unaffected.
+	if isWrite && len(scannedPkgs) > 0 {
+		if pkg := extractNpmInstalledPkg(evt.FilePath); pkg != "" && !scannedPkgs[pkg] {
+			evt.Category = types.CategoryLibraryHijack
+			evt.Reason = "Cross-package write into installed sibling: " + evt.FilePath +
+				" — scanned package wrote into " + pkg + "'s source tree. " +
+				"Backdoor placement targeting a sibling dependency; harm fires when " +
+				"a later workflow imports the hijacked package."
+			return
+		}
+	}
+
 	// Binary hijack: overwriting a system binary that benignPaths trusts.
 	// Attacker writes /usr/local/bin/python3 → subsequent execve passes
 	// the whitelist check → arbitrary code runs as "trusted" binary.
@@ -702,6 +744,97 @@ func isSystemBinaryTarget(filePath string) bool {
 // isHomeDir returns true if the path is inside a user home directory.
 func isHomeDir(filePath string) bool {
 	return strings.HasPrefix(filePath, "/home/") || strings.HasPrefix(filePath, "/root/")
+}
+
+// isBenignInstalledPackageWrite filters openat events whose target is
+// either (a) a directory belonging to one of the scanned packages
+// themselves (self-write — legitimate build output, native compile
+// artifacts) or (b) npm's own bookkeeping under
+// /install/node_modules/.<x> (.package-lock.json, .bin/, .cache/).
+//
+// Cross-package writes — the target package is NOT in scannedPkgs —
+// fall through to classifyOpenat where the library_hijacking rule
+// classifies them HIGH. Sensitive-path, home-dir, and system-binary
+// writes never match the node_modules prefix and remain suspicious.
+func isBenignInstalledPackageWrite(evt *types.SyscallEvent) bool {
+	if !strings.HasPrefix(evt.FilePath, "/install/node_modules/") {
+		// Not a node_modules write — sensitive/home/system-binary
+		// event, unconditionally suspicious.
+		return false
+	}
+	// npm bookkeeping under .<x> — never an attacker-installed package.
+	rest := evt.FilePath[len("/install/node_modules/"):]
+	if rest == "" || rest[0] == '.' {
+		return true
+	}
+	// Self-write: the target package is in the scan set.
+	if pkg := extractNpmInstalledPkg(evt.FilePath); pkg != "" && scannedPkgs[pkg] {
+		return true
+	}
+	// Cross-package write — let classifyOpenat handle it.
+	return false
+}
+
+// extractNpmInstalledPkg returns the npm package name written into when
+// filePath is under /install/node_modules/, or "" otherwise.
+//
+// Examples:
+//
+//	/install/node_modules/lodash/index.js          -> "lodash"
+//	/install/node_modules/@babel/core/lib/index.js -> "@babel/core"
+//	/install/node_modules/.package-lock.json       -> ""  (npm bookkeeping)
+//	/install/node_modules/.bin/foo                 -> ""  (npm internal)
+//	/install/node_modules/                         -> ""  (no package)
+//	/install/node_modules                          -> ""  (no trailing slash content)
+//	/install/foo                                   -> ""  (not under node_modules)
+//
+// Scoped packages (`@scope/name`) are returned with the `@scope/` prefix
+// so the caller can match against scan-target names that retain the
+// scope, which is the convention npm and yarn use throughout.
+//
+// `.`-prefixed entries (`/install/node_modules/.package-lock.json`,
+// `/install/node_modules/.bin/foo`, `/install/node_modules/.cache/...`)
+// are npm's own bookkeeping and never represent attacker-installed
+// packages, so they return "" rather than being treated as either self
+// or a hijack target. An attacker who placed a malicious binary under
+// `.bin/` would be caught by the system-binary write rule when the
+// install eventually places it on PATH.
+func extractNpmInstalledPkg(filePath string) string {
+	const prefix = "/install/node_modules/"
+	if !strings.HasPrefix(filePath, prefix) {
+		return ""
+	}
+	rest := filePath[len(prefix):]
+	if rest == "" {
+		return ""
+	}
+	// Scoped package: @scope/name/...
+	if rest[0] == '@' {
+		// Need at least "@scope/name" — two segments separated by /.
+		first := strings.IndexByte(rest, '/')
+		if first <= 0 || first == len(rest)-1 {
+			return ""
+		}
+		second := strings.IndexByte(rest[first+1:], '/')
+		if second < 0 {
+			// `/install/node_modules/@scope/name` with no trailing slash
+			// is still a valid package directory write target.
+			return rest
+		}
+		return rest[:first+1+second]
+	}
+	// Regular package: name/... or just "name" with no trailing slash.
+	end := strings.IndexByte(rest, '/')
+	pkg := rest
+	if end >= 0 {
+		pkg = rest[:end]
+	}
+	// npm internal entries always start with `.` (`.package-lock.json`,
+	// `.bin/`, `.cache/`, etc.). Real package names cannot start with `.`.
+	if pkg == "" || pkg[0] == '.' {
+		return ""
+	}
+	return pkg
 }
 
 // classifyExecve categorizes an execve event that survived isBenignExec.
@@ -870,9 +1003,15 @@ func isBenign(evt *types.SyscallEvent) bool {
 	case types.EventExecve:
 		return isBenignExec(evt)
 	case types.EventOpenat:
-		// Only emitted for sensitive paths (credentials, keys, etc.)
-		// by the parser's pre-filter — always suspicious in install context.
-		return false
+		// Parser emits openat for sensitive paths, home writes, system
+		// binary writes, and installed-package writes. The first three
+		// are unconditionally suspicious in install context. Installed-
+		// package writes split: self-pkg writes are legitimate build
+		// output (e.g. argon2/build/Release/argon2.node), npm
+		// bookkeeping (.package-lock.json, .bin/) is also legitimate,
+		// and only cross-package writes flow on to classifyOpenat
+		// where the library_hijacking rule fires.
+		return isBenignInstalledPackageWrite(evt)
 	case types.EventRename:
 		return isBenignRename(evt)
 	case types.EventMmap, types.EventMprotect:

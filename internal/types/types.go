@@ -74,6 +74,15 @@ const (
 	// its own — see the rationale block above classifyExecve in
 	// internal/analyzer/analyzer.go.
 	CategoryUnknownBinary = "unknown_binary"
+	// CategoryLibraryHijack records writes from a scanned package into
+	// ANOTHER installed package's directory (a sibling under
+	// /install/node_modules/<other>/). The installed package's source
+	// gets backdoored; harm fires when a later workflow imports it,
+	// outside kojuto's scan window — placement is the only opportunity
+	// to detect it. Pairs with static analysis (which catches obvious
+	// AST patterns): the dynamic rule also catches runtime-decoded
+	// target paths that static cannot resolve.
+	CategoryLibraryHijack = "library_hijacking"
 )
 
 // Category severity tiers drive verdict assignment in analyzer.Analyze.
@@ -103,6 +112,7 @@ var CategorySeverity = map[string]string{
 	CategoryPersistence:      SeverityHigh,
 	CategoryMemExec:          SeverityHigh,
 	CategoryAntiForensics:    SeverityHigh,
+	CategoryLibraryHijack:    SeverityHigh,
 	CategoryDNSTunnel:        SeverityMedium,
 	CategoryEvasion:          SeverityMedium,
 	CategoryDynamicExec:      SeverityLow,

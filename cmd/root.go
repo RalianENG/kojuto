@@ -916,6 +916,11 @@ func startSandbox(ctx context.Context, dlDir string, pkgs []string, method strin
 	}
 	sb := sandboxNew(dlDir, label, needsPtrace, flagEcosystem, flagRuntime)
 	sb.SetScanPkgs(pkgs)
+	// Feed the same list to the analyzer so the library_hijacking rule
+	// can identify cross-package writes inside /install/node_modules/.
+	// Writes targeting one of the scanned packages are self (legitimate
+	// build output); writes targeting a sibling are HIGH-severity.
+	analyzer.SetScanPkgs(pkgs)
 
 	if method == methodEBPF || method == methodStrace {
 		// Create then start-paused to minimize the TOCTOU window

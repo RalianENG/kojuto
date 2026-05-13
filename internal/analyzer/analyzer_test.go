@@ -1484,6 +1484,181 @@ func TestClassify_DynamicExec(t *testing.T) {
 	}
 }
 
+func TestExtractNpmInstalledPkg(t *testing.T) {
+	cases := []struct {
+		path string
+		want string
+	}{
+		// Regular package.
+		{"/install/node_modules/lodash/index.js", "lodash"},
+		{"/install/node_modules/lodash/lib/sub/file.js", "lodash"},
+		{"/install/node_modules/lodash", "lodash"},
+		// Scoped package — the "@scope/name" identifier is returned
+		// intact so callers can match against scan-target names that
+		// retain the scope.
+		{"/install/node_modules/@babel/core/lib/index.js", "@babel/core"},
+		{"/install/node_modules/@babel/core", "@babel/core"},
+		// npm bookkeeping under `.`-prefixed entries — never an
+		// attacker-installed package; return empty so the caller
+		// neither treats it as self nor as a hijack target.
+		{"/install/node_modules/.package-lock.json", ""},
+		{"/install/node_modules/.bin/foo", ""},
+		{"/install/node_modules/.cache/registry/lodash-4.17.21.tgz", ""},
+		// Malformed / non-matching inputs.
+		{"/install/node_modules/", ""},
+		{"/install/node_modules", ""},
+		{"/install/foo/bar", ""},
+		{"/home/dev/.npm/_logs/x.log", ""},
+		{"", ""},
+		// Scoped package without name segment is not a valid package
+		// directory — treat as no-match rather than misclassify.
+		{"/install/node_modules/@scope", ""},
+		{"/install/node_modules/@scope/", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			got := extractNpmInstalledPkg(tc.path)
+			if got != tc.want {
+				t.Errorf("extractNpmInstalledPkg(%q) = %q, want %q", tc.path, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAnalyze_LibraryHijackCrossWrite documents the cross-package write
+// detection: a scanned package writes into a sibling installed
+// package's source tree. Harm fires when a later workflow imports the
+// hijacked package, outside kojuto's scan window — placement is the
+// only opportunity to detect it.
+func TestAnalyze_LibraryHijackCrossWrite(t *testing.T) {
+	orig := scannedPkgs
+	defer func() { scannedPkgs = orig }()
+	SetScanPkgs([]string{"argon2"})
+
+	events := []types.SyscallEvent{
+		{
+			Syscall:   types.EventOpenat,
+			FilePath:  "/install/node_modules/lodash/index.js",
+			OpenFlags: "O_WRONLY|O_TRUNC",
+		},
+	}
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictSuspicious {
+		t.Errorf("expected suspicious for cross-package write, got %s", verdict)
+	}
+	if len(filtered) != 1 || filtered[0].Category != types.CategoryLibraryHijack {
+		t.Errorf("expected single library_hijacking event, got %+v", filtered)
+	}
+}
+
+// TestAnalyze_LibraryHijackSelfWrite documents that writes to the
+// scanned package's OWN directory are not library hijacks. Native-
+// module packages legitimately write build output (e.g. `.node`
+// binaries) into their own /install/node_modules/<self>/build/.
+func TestAnalyze_LibraryHijackSelfWrite(t *testing.T) {
+	orig := scannedPkgs
+	defer func() { scannedPkgs = orig }()
+	SetScanPkgs([]string{"argon2"})
+
+	events := []types.SyscallEvent{
+		{
+			Syscall:   types.EventOpenat,
+			FilePath:  "/install/node_modules/argon2/build/Release/argon2.node",
+			OpenFlags: "O_WRONLY|O_CREAT",
+		},
+	}
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictClean {
+		t.Errorf("expected clean for self-write to own build output, got %s", verdict)
+	}
+	for _, e := range filtered {
+		if e.Category == types.CategoryLibraryHijack {
+			t.Errorf("self-write must not be library_hijacking, got %+v", e)
+		}
+	}
+}
+
+// TestAnalyze_LibraryHijackScoped documents that scoped packages
+// (@scope/name) are matched against the scan target list using their
+// full @scope/name identifier — that is how npm/yarn store them and
+// how dep-file declarations write them.
+func TestAnalyze_LibraryHijackScoped(t *testing.T) {
+	orig := scannedPkgs
+	defer func() { scannedPkgs = orig }()
+	SetScanPkgs([]string{"@babel/core"})
+
+	selfWrite := []types.SyscallEvent{
+		{
+			Syscall:   types.EventOpenat,
+			FilePath:  "/install/node_modules/@babel/core/lib/generated.js",
+			OpenFlags: "O_WRONLY|O_CREAT",
+		},
+	}
+	verdict, filtered := Analyze(selfWrite)
+	if verdict != types.VerdictClean {
+		t.Errorf("expected clean for scoped self-write, got %s — events=%+v", verdict, filtered)
+	}
+
+	crossScopeWrite := []types.SyscallEvent{
+		{
+			Syscall:   types.EventOpenat,
+			FilePath:  "/install/node_modules/@babel/traverse/lib/index.js",
+			OpenFlags: "O_WRONLY|O_TRUNC",
+		},
+	}
+	verdict, filtered = Analyze(crossScopeWrite)
+	if verdict != types.VerdictSuspicious {
+		t.Errorf("expected suspicious for cross-package scoped write, got %s", verdict)
+	}
+	if len(filtered) != 1 || filtered[0].Category != types.CategoryLibraryHijack {
+		t.Errorf("expected single library_hijacking event, got %+v", filtered)
+	}
+}
+
+// TestAnalyze_LibraryHijackNpmBookkeepingIgnored documents that npm's
+// own bookkeeping entries (`.package-lock.json`, `.bin/`, `.cache/`)
+// do not fire the rule. They are npm internals, not attacker-installed
+// packages.
+func TestAnalyze_LibraryHijackNpmBookkeepingIgnored(t *testing.T) {
+	orig := scannedPkgs
+	defer func() { scannedPkgs = orig }()
+	SetScanPkgs([]string{"argon2"})
+
+	events := []types.SyscallEvent{
+		{Syscall: types.EventOpenat, FilePath: "/install/node_modules/.package-lock.json", OpenFlags: "O_WRONLY|O_CREAT"},
+		{Syscall: types.EventOpenat, FilePath: "/install/node_modules/.bin/node-gyp-build", OpenFlags: "O_WRONLY|O_CREAT"},
+		{Syscall: types.EventOpenat, FilePath: "/install/node_modules/.cache/foo", OpenFlags: "O_WRONLY|O_CREAT"},
+	}
+	verdict, _ := Analyze(events)
+	if verdict != types.VerdictClean {
+		t.Errorf("expected clean for npm bookkeeping writes, got %s", verdict)
+	}
+}
+
+// TestAnalyze_LibraryHijackDisabledWithoutSetScanPkgs documents that
+// the rule is inert when SetScanPkgs has not been called. This
+// preserves the behavior of existing call sites and tests that
+// predate the rule.
+func TestAnalyze_LibraryHijackDisabledWithoutSetScanPkgs(t *testing.T) {
+	orig := scannedPkgs
+	defer func() { scannedPkgs = orig }()
+	SetScanPkgs(nil)
+
+	events := []types.SyscallEvent{
+		{
+			Syscall:   types.EventOpenat,
+			FilePath:  "/install/node_modules/lodash/index.js",
+			OpenFlags: "O_WRONLY|O_TRUNC",
+		},
+	}
+	_, filtered := Analyze(events)
+	for _, e := range filtered {
+		if e.Category == types.CategoryLibraryHijack {
+			t.Errorf("rule must be inert when scannedPkgs is empty, got %+v", e)
+		}
+	}
+}
+
 func TestAnalyze_DynamicExecNotFiltered(t *testing.T) {
 	// dynamic_code_execution is LOW severity (legitimate compat libs
 	// like six exec their own internal source). Even a thousand of

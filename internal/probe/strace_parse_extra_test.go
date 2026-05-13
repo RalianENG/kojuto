@@ -934,6 +934,64 @@ func TestParseOpenat_SystemBinaryWrite(t *testing.T) {
 	}
 }
 
+func TestIsInstalledPackageWrite(t *testing.T) {
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{"/install/node_modules/lodash/index.js", true},
+		{"/install/node_modules/@babel/core/lib/index.js", true},
+		// npm bookkeeping — never a real package, do not emit.
+		{"/install/node_modules/.package-lock.json", false},
+		{"/install/node_modules/.bin/foo", false},
+		// Boundary cases.
+		{"/install/node_modules/", false},
+		{"/install/node_modules", false},
+		{"/install/foo/bar", false},
+		{"/home/dev/.npm/_logs/x.log", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			if got := isInstalledPackageWrite(tc.path); got != tc.want {
+				t.Errorf("isInstalledPackageWrite(%q) = %v, want %v", tc.path, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseOpenat_InstalledPackageWrite(t *testing.T) {
+	saved := sensitivePathPatterns
+	defer func() { sensitivePathPatterns = saved }()
+	SetSensitivePaths([]string{})
+	state := NewParseState()
+
+	// Write to a package directory under /install/node_modules/ — emitted
+	// so the analyzer can apply the library_hijacking rule.
+	line := `openat(AT_FDCWD, "/install/node_modules/lodash/index.js", O_WRONLY|O_CREAT|O_TRUNC, 0644) = 3`
+	evt, ok := parseStraceLine(line, state)
+	if !ok {
+		t.Fatal("write into installed package directory should be emitted")
+	}
+	if evt.FilePath != "/install/node_modules/lodash/index.js" {
+		t.Errorf("file_path = %q", evt.FilePath)
+	}
+
+	// Read from a package directory — NOT emitted; the rule is about
+	// placement (writes), and read events would flood every install.
+	readLine := `openat(AT_FDCWD, "/install/node_modules/lodash/index.js", O_RDONLY|O_CLOEXEC) = 3`
+	if _, ok := parseStraceLine(readLine, state); ok {
+		t.Error("read from installed package directory must not be emitted")
+	}
+
+	// npm bookkeeping write — NOT emitted; .package-lock.json is npm
+	// internal, not an attacker-installed package.
+	bookkeeping := `openat(AT_FDCWD, "/install/node_modules/.package-lock.json", O_WRONLY|O_CREAT, 0644) = 3`
+	if _, ok := parseStraceLine(bookkeeping, state); ok {
+		t.Error("write to npm bookkeeping under node_modules/.<x> must not be emitted")
+	}
+}
+
 func TestParseAuditHook_IntegratedWithParseStraceLine(t *testing.T) {
 	state := NewParseState()
 
