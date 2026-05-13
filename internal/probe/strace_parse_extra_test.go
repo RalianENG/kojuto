@@ -210,6 +210,80 @@ func TestParseStraceLine_OpenatConfigGh(t *testing.T) {
 	}
 }
 
+func TestParseClone(t *testing.T) {
+	cases := []struct {
+		name      string
+		line      string
+		wantPID   uint32 // parent PID (0 = main strace target)
+		wantChild uint32
+		wantOK    bool
+	}{
+		{
+			name:      "clone from main strace target",
+			line:      `clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x7f...) = 12`,
+			wantPID:   0,
+			wantChild: 12,
+			wantOK:    true,
+		},
+		{
+			name:      "clone from child PID",
+			line:      `[pid   220] clone(child_stack=NULL, flags=CLONE_VM|CLONE_FS, child_tidptr=0x...) = 633`,
+			wantPID:   220,
+			wantChild: 633,
+			wantOK:    true,
+		},
+		{
+			name:      "clone3 with structured args",
+			line:      `[pid   220] clone3({flags=CLONE_VM|CLONE_FS|CLONE_THREAD, child_tid=0x..., parent_tid=0x..., exit_signal=0, stack=0x..., stack_size=0x...}, 88) = 634`,
+			wantPID:   220,
+			wantChild: 634,
+			wantOK:    true,
+		},
+		{
+			name:      "vfork",
+			line:      `[pid    50] vfork() = 51`,
+			wantPID:   50,
+			wantChild: 51,
+			wantOK:    true,
+		},
+		{
+			name:      "failed clone — negative return rejected by regex",
+			line:      `[pid   220] clone(...) = -1 EAGAIN`,
+			wantPID:   0,
+			wantChild: 0,
+			wantOK:    false,
+		},
+		{
+			name:      "not a clone line",
+			line:      `[pid   220] execve("/usr/bin/node", ["node"], ...) = 0`,
+			wantPID:   0,
+			wantChild: 0,
+			wantOK:    false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			evt, ok := parseClone(tc.line)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if evt.PID != tc.wantPID {
+				t.Errorf("PID = %d, want %d", evt.PID, tc.wantPID)
+			}
+			if evt.ChildPID != tc.wantChild {
+				t.Errorf("ChildPID = %d, want %d", evt.ChildPID, tc.wantChild)
+			}
+			if evt.Syscall != "clone" {
+				t.Errorf("Syscall = %q, want %q", evt.Syscall, "clone")
+			}
+		})
+	}
+}
+
 func TestExtractPID(t *testing.T) {
 	cases := []struct {
 		line string

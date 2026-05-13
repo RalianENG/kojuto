@@ -92,7 +92,11 @@ func (c *ContainerStrace) buildCommand(ctx context.Context, containerID string, 
 		"exec", containerID,
 		"strace", "-f",
 		"-s", "256",
-		"-e", "trace=connect,sendto,sendmsg,sendmmsg,bind,listen,accept,accept4,execve,openat,rename,renameat,renameat2,sendfile,ptrace,mmap,mprotect,unlink,unlinkat",
+		// clone/clone3 are traced to propagate execve comm across thread
+		// boundaries (V8 spawns worker threads via clone — they never
+		// execve so the analyzer's PID→comm map cannot attribute their
+		// mprotect events without seeing the parent relationship).
+		"-e", "trace=connect,sendto,sendmsg,sendmmsg,bind,listen,accept,accept4,execve,clone,clone3,openat,rename,renameat,renameat2,sendfile,ptrace,mmap,mprotect,unlink,unlinkat",
 		"-e", "signal=none",
 		"--",
 	}

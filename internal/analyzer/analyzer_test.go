@@ -1205,6 +1205,55 @@ func TestAnalyze_V8JITFilter(t *testing.T) {
 	if verdict != types.VerdictSuspicious {
 		t.Errorf("expected suspicious for unattributed RWX (PID=0), got %s", verdict)
 	}
+
+	// V8 worker thread pattern: node clones a thread that never
+	// execve's, then the thread does RWX mprotect for JIT pages.
+	// The clone event propagates the parent's comm to the child PID
+	// so the filter recognizes it. Without clone propagation, every
+	// real npm scan flips suspicious because V8 worker mprotect events
+	// leak past the filter.
+	parentNodePID := uint32(220)
+	workerPID := uint32(633)
+	jitFromWorkerThread := []types.SyscallEvent{
+		{Syscall: types.EventExecve, Comm: "/usr/bin/node", PID: parentNodePID},
+		{Syscall: types.EventClone, PID: parentNodePID, ChildPID: workerPID},
+		{Syscall: types.EventMprotect, MemProt: "PROT_READ|PROT_WRITE|PROT_EXEC", PID: workerPID},
+	}
+	verdict, _ = Analyze(jitFromWorkerThread)
+	if verdict != types.VerdictClean {
+		t.Errorf("expected clean when V8 worker thread (cloned from node) does RWX, got %s", verdict)
+	}
+
+	// Clone chain: node → helper → grandchild. The propagation pass
+	// is fixed-point so the grandchild also inherits node's comm,
+	// regardless of clone-event order in the stream.
+	helperPID := uint32(800)
+	grandchildPID := uint32(801)
+	jitFromGrandchild := []types.SyscallEvent{
+		{Syscall: types.EventExecve, Comm: "/usr/bin/node", PID: parentNodePID},
+		{Syscall: types.EventClone, PID: helperPID, ChildPID: grandchildPID}, // listed FIRST
+		{Syscall: types.EventClone, PID: parentNodePID, ChildPID: helperPID}, // listed AFTER
+		{Syscall: types.EventMprotect, MemProt: "PROT_READ|PROT_WRITE|PROT_EXEC", PID: grandchildPID},
+	}
+	verdict, _ = Analyze(jitFromGrandchild)
+	if verdict != types.VerdictClean {
+		t.Errorf("expected clean for clone-chain JIT (grandchild of node), got %s", verdict)
+	}
+
+	// A child that does its own execve overrides any clone-inherited
+	// comm. If sh forks a child and the child execs a malicious
+	// binary, the child's mprotect RWX must NOT be filtered as JIT.
+	maliciousPID := uint32(900)
+	childExecveWins := []types.SyscallEvent{
+		{Syscall: types.EventExecve, Comm: "/usr/bin/node", PID: parentNodePID},
+		{Syscall: types.EventClone, PID: parentNodePID, ChildPID: maliciousPID},
+		{Syscall: types.EventExecve, Comm: "/install/payload", PID: maliciousPID},
+		{Syscall: types.EventMprotect, MemProt: "PROT_READ|PROT_WRITE|PROT_EXEC", PID: maliciousPID},
+	}
+	verdict, _ = Analyze(childExecveWins)
+	if verdict != types.VerdictSuspicious {
+		t.Errorf("clone-then-execve must keep execve attribution, got %s — payload exec'd from clone'd child must still fire shellcode rule", verdict)
+	}
 }
 
 // Unrecognized binary execve (find, dirname, arbitrary tools) that

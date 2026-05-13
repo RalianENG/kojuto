@@ -151,11 +151,28 @@ var jitInterpreterTrustedDirs = map[string]bool{
 // parser did not populate the comm field (strace mprotect/mmap lines
 // carry the PID but not the process name).
 //
-// The full path is stored, not just the basename, so the V8 JIT
-// filter can require both name match AND a trusted directory before
-// suppressing an event.
+// Two passes:
+//
+//  1. Direct execve attribution: PID → execve binary path. Stores the
+//     full path (not just the basename) so the V8 JIT filter can
+//     require both name match AND a trusted directory before
+//     suppressing an event.
+//
+//  2. Clone propagation: when a child PID has no execve of its own
+//     (V8 worker thread, fork-without-exec helper), it inherits the
+//     parent's process image. Copy the parent's comm to the child.
+//     Iterates to a fixed point so chains (parent → child → grand-
+//     child) resolve regardless of event order. Without this pass
+//     the V8 JIT filter misses every worker thread spawned by node,
+//     leaving the verdict suspicious on every clean npm scan.
+//
+// A child that later execve's its own binary keeps the execve entry
+// from pass 1 — the propagation pass only writes when the child has
+// no existing entry.
 func collectPIDComm(events []types.SyscallEvent) map[uint32]string {
 	m := make(map[uint32]string)
+
+	// Pass 1: direct execve attribution.
 	for i := range events {
 		evt := &events[i]
 		if evt.Syscall != types.EventExecve || evt.PID == 0 || evt.Comm == "" {
@@ -163,6 +180,30 @@ func collectPIDComm(events []types.SyscallEvent) map[uint32]string {
 		}
 		m[evt.PID] = evt.Comm
 	}
+
+	// Pass 2: propagate parent comm to clone children. Repeat until
+	// no new entries are added — handles parent → child → grandchild
+	// chains regardless of clone-event order in the stream.
+	for {
+		changed := false
+		for i := range events {
+			evt := &events[i]
+			if evt.Syscall != types.EventClone || evt.PID == 0 || evt.ChildPID == 0 {
+				continue
+			}
+			if _, exists := m[evt.ChildPID]; exists {
+				continue
+			}
+			if parentComm, ok := m[evt.PID]; ok {
+				m[evt.ChildPID] = parentComm
+				changed = true
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+
 	return m
 }
 
@@ -805,6 +846,11 @@ func isBenign(evt *types.SyscallEvent) bool {
 	case types.EventUnlink:
 		// Parser already filters to only emit deletions from suspicious dirs.
 		return false
+	case types.EventClone:
+		// Clone events are pure PID-correlation signal consumed by
+		// collectPIDComm; they carry no harm and never flip the verdict
+		// even if they reach the report. Drop them here.
+		return true
 	default:
 		return false
 	}
