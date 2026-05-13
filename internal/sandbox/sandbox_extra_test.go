@@ -439,6 +439,54 @@ func TestShQuote(t *testing.T) {
 	}
 }
 
+// TestNpmLifecycleScript_ParallelDispatch pins the xargs -P invocation
+// structure for both the discovery (nil pkgs) and named-pkgs paths.
+// Sequential `;`-joined subshells previously dominated batch scan wall
+// time on npm CLI startup overhead (~1s per `npm run --silent
+// --if-present` no-op × 300 invocations across 100 packages). xargs
+// -P bounds peak concurrency at npmLifecycleParallelism so the
+// container's --pids-limit and memory ceiling are respected while
+// hooks run in parallel.
+func TestNpmLifecycleScript_ParallelDispatch(t *testing.T) {
+	// Discovery path: find -print0 piped to xargs -0 -P N. -print0
+	// + -0 avoids the dash-incompatible `read -d ""` form the old
+	// loop went out of its way to skirt around.
+	discovery := npmLifecycleScript(nil)
+	for _, want := range []string{
+		"find /install/node_modules",
+		"-print0",
+		"| xargs -0 -P 4 -I{}",
+		`sh -c 'd=$(dirname "{}") && cd "$d" && `,
+	} {
+		if !strings.Contains(discovery, want) {
+			t.Errorf("discovery script missing %q in:\n%s", want, discovery)
+		}
+	}
+	// The old sequential `while IFS= read -r pj` shape must NOT reappear.
+	if strings.Contains(discovery, "while IFS=") {
+		t.Errorf("discovery script regressed to sequential while-read loop:\n%s", discovery)
+	}
+
+	// Named-pkgs path: printf '%s\n' ... | xargs -P N -I{} sh -c ...
+	named := npmLifecycleScript([]string{"lodash", "express"})
+	for _, want := range []string{
+		`printf '%s\n'`,
+		"'/install/node_modules/lodash'",
+		"'/install/node_modules/express'",
+		"| xargs -P 4 -I{}",
+		`sh -c 'cd "{}" && `,
+	} {
+		if !strings.Contains(named, want) {
+			t.Errorf("named script missing %q in:\n%s", want, named)
+		}
+	}
+	// The old sequential `(cd ... && hooks) 2>&1; (cd ... &&` chain
+	// must not reappear — that form was the dominant wall-time cost.
+	if strings.Contains(named, "&& "+`npm run --silent --if-present preinstall; npm run --silent --if-present install; npm run --silent --if-present postinstall) 2>&1; (cd `) {
+		t.Errorf("named script regressed to sequential subshell chain:\n%s", named)
+	}
+}
+
 func TestNpmLifecycleScript_QuotesShellMetachars(t *testing.T) {
 	// Defense-in-depth: even if a malformed name slips past the depfile
 	// validator, the cd target must be safely single-quoted so shell

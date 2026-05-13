@@ -826,6 +826,16 @@ func (s *Sandbox) InstallAllCommand(ctx context.Context, pkgs []string) ([]strin
 	return append(cmd, pkgs...), nil
 }
 
+// npmLifecycleParallelism is the maximum number of package lifecycle
+// hook chains npmLifecycleScript runs concurrently. Each chain spawns
+// a small process tree (sh + npm + node + helpers), so the bound is
+// driven by --pids-limit=256 and per-container CPU/memory headroom
+// rather than by host parallelism — at the chosen value of 4, peak
+// concurrent process count stays well under the limit even for
+// native-module packages that fork compiler toolchains. Mirrors
+// audit.py's worker count for consistency.
+const npmLifecycleParallelism = 4
+
 // npmLifecycleScript builds a /bin/sh script that fires preinstall +
 // install + postinstall hooks for each target package directory under
 // /install/node_modules. When pkgs is nil, every package directory at
@@ -839,41 +849,55 @@ func (s *Sandbox) InstallAllCommand(ctx context.Context, pkgs []string) ([]strin
 // Each package runs in its own subshell with `;` between hooks so a
 // single failing script does not abort the whole sweep — partial
 // progress is what we want for a forensic capture.
+//
+// xargs -P drives the parallelism. With sequential `;`-joined
+// subshells the older form spent ~1 second per package on npm CLI
+// startup alone (300 invocations across 100 packages, mostly no-op
+// `--if-present` skips), which dominated batch scan wall time.
+// Parallel execution lets the strace stream interleave events from
+// up to npmLifecycleParallelism PIDs at once; the analyzer's
+// streaming PID→comm pass attributes each event correctly because
+// every clone/execve carries its own PID and the JIT/library-hijack
+// rules look up that PID independently.
+//
+// xargs -I{} treats one input line as one argument. We use `\n` as
+// the separator (not `\0`) because dash's printf builtin lacks
+// portable `\0` support and npm package names cannot contain
+// newlines (npm registry name spec: `[a-z0-9._@~/-]`). Single-
+// quoting the cd target inside the inserted command is defense-in-
+// depth in case a future code path bypasses depfile name validation.
 func npmLifecycleScript(pkgs []string) string {
 	const hooks = `npm run --silent --if-present preinstall; ` +
 		`npm run --silent --if-present install; ` +
 		`npm run --silent --if-present postinstall`
+	parallel := strconv.Itoa(npmLifecycleParallelism)
 
 	if len(pkgs) == 0 {
 		// mindepth 2 catches /install/node_modules/<pkg>/package.json,
 		// maxdepth 3 also catches /install/node_modules/@scope/<pkg>/package.json
 		// while excluding nested transitive node_modules.
 		//
-		// `find ... | while read` instead of `find -print0 | read -d ""`
-		// because the sandbox's /bin/sh is dash, which silently rejects
-		// the bash-only `-d` flag and produces an empty event stream.
-		// Newlines in node_modules paths are not realistic.
-		return `find /install/node_modules -mindepth 2 -maxdepth 3 -name package.json -type f ` +
-			`| while IFS= read -r pj; do ` +
-			`(cd "$(dirname "$pj")" && ` + hooks + `) 2>&1; done`
+		// `find -print0 | xargs -0` is portable across dash and bash and
+		// avoids the `read -d ""` portability issue that motivated the
+		// previous `find | while read` form.
+		return `find /install/node_modules -mindepth 2 -maxdepth 3 -name package.json -type f -print0 ` +
+			`| xargs -0 -P ` + parallel + ` -I{} sh -c 'd=$(dirname "{}") && cd "$d" && ` + hooks + `' 2>&1`
 	}
 
 	var b strings.Builder
-	for i, p := range pkgs {
-		if i > 0 {
-			b.WriteString("; ")
-		}
+	b.WriteString(`printf '%s\n'`)
+	for _, p := range pkgs {
+		b.WriteByte(' ')
 		// Single-quote the full cd target so any shell metacharacters
 		// in p (which originates from package.json keys, i.e. attacker-
 		// controllable input) cannot break out of the argument. depfile
 		// validates names at parse time; this is defense-in-depth for
 		// any future code path that populates pkgs from another source.
-		b.WriteString(`(cd `)
 		b.WriteString(shQuote("/install/node_modules/" + p))
-		b.WriteString(` && `)
-		b.WriteString(hooks)
-		b.WriteString(`) 2>&1`)
 	}
+	b.WriteString(` | xargs -P ` + parallel + ` -I{} sh -c 'cd "{}" && `)
+	b.WriteString(hooks)
+	b.WriteString(`' 2>&1`)
 	return b.String()
 }
 
