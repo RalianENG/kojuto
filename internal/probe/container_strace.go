@@ -119,6 +119,7 @@ func (c *ContainerStrace) parseStraceOutput(stderr io.ReadCloser, done chan<- st
 	state := NewParseState()
 	scanner := bufio.NewScanner(stderr)
 	scanner.Buffer(make([]byte, 64*1024), straceMaxLine)
+
 	for scanner.Scan() {
 		evt, ok := parseStraceLine(scanner.Text(), state)
 		if !ok {

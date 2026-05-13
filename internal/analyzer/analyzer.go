@@ -151,56 +151,75 @@ var jitInterpreterTrustedDirs = map[string]bool{
 // parser did not populate the comm field (strace mprotect/mmap lines
 // carry the PID but not the process name).
 //
-// Two passes:
+// Single streaming pass over the temporally-ordered event list:
 //
-//  1. Direct execve attribution: PID → execve binary path. Stores the
-//     full path (not just the basename) so the V8 JIT filter can
-//     require both name match AND a trusted directory before
-//     suppressing an event.
+//   - On execve, set m[PID] = full binary path. The path (not just
+//     the basename) is stored so the V8 JIT filter can require both
+//     name match AND a trusted directory before suppressing an event.
 //
-//  2. Clone propagation: when a child PID has no execve of its own
-//     (V8 worker thread, fork-without-exec helper), it inherits the
-//     parent's process image. Copy the parent's comm to the child.
-//     Iterates to a fixed point so chains (parent → child → grand-
-//     child) resolve regardless of event order. Without this pass
-//     the V8 JIT filter misses every worker thread spawned by node,
-//     leaving the verdict suspicious on every clean npm scan.
+//   - On clone, mark the child as a known descendant and copy the
+//     parent's current comm if the child has no entry. A child that
+//     later does its own execve overrides the propagated value.
 //
-// A child that later execve's its own binary keeps the execve entry
-// from pass 1 — the propagation pass only writes when the child has
-// no existing entry.
+//   - On any other event at PID ≠ 0 that has NOT appeared as a clone
+//     child, treat that PID as the current strace phase's "main
+//     target alias" and copy m[0] to m[PID]. This is the inverse of
+//     strace's prefix convention: the main target's syscalls are
+//     printed WITHOUT `[pid X]` (so they extract as PID=0) until
+//     ambiguity forces strace to add one — from then on those
+//     syscalls extract as a non-zero PID. The two are the same
+//     process; without this aliasing, every V8 worker thread cloned
+//     by the disambiguated main target had no parent attribution
+//     in m and the JIT filter missed them, leaving the verdict
+//     suspicious on every clean npm scan.
+//
+// PID = 0 is intentionally tracked across exec replacements (sh →
+// env → node during the import phase). Phases run in sequence and
+// events arrive in temporal order, so m[0] evolves correctly:
+// install-phase main-target aliases inherit the install-phase
+// m[0] value, import-phase aliases inherit node.
 func collectPIDComm(events []types.SyscallEvent) map[uint32]string {
 	m := make(map[uint32]string)
+	known := make(map[uint32]bool) // PIDs already attributed (clone child or main-target alias)
 
-	// Pass 1: direct execve attribution.
 	for i := range events {
 		evt := &events[i]
-		if evt.Syscall != types.EventExecve || evt.PID == 0 || evt.Comm == "" {
-			continue
-		}
-		m[evt.PID] = evt.Comm
-	}
-
-	// Pass 2: propagate parent comm to clone children. Repeat until
-	// no new entries are added — handles parent → child → grandchild
-	// chains regardless of clone-event order in the stream.
-	for {
-		changed := false
-		for i := range events {
-			evt := &events[i]
-			if evt.Syscall != types.EventClone || evt.PID == 0 || evt.ChildPID == 0 {
+		switch evt.Syscall {
+		case types.EventExecve:
+			if evt.Comm == "" {
 				continue
 			}
+			m[evt.PID] = evt.Comm
+			if evt.PID != 0 {
+				known[evt.PID] = true
+			}
+		case types.EventClone:
+			if evt.ChildPID == 0 {
+				continue
+			}
+			known[evt.ChildPID] = true
 			if _, exists := m[evt.ChildPID]; exists {
 				continue
 			}
 			if parentComm, ok := m[evt.PID]; ok {
 				m[evt.ChildPID] = parentComm
-				changed = true
 			}
-		}
-		if !changed {
-			break
+		default:
+			// Main-target alias: a PID ≠ 0 that emits a non-clone
+			// non-execve event without having been seen as a clone
+			// child is the phase's main target showing up with its
+			// disambiguated PID. Copy m[0] (the current main-target
+			// comm) into m[PID] so subsequent attribution lookups
+			// hit. Mark known so we don't redo this on every event.
+			if evt.PID == 0 || known[evt.PID] {
+				continue
+			}
+			known[evt.PID] = true
+			if mainComm, ok := m[0]; ok {
+				if _, exists := m[evt.PID]; !exists {
+					m[evt.PID] = mainComm
+				}
+			}
 		}
 	}
 
@@ -709,20 +728,31 @@ func isHomeDir(filePath string) bool {
 //     signal — the actual harm, if any, is caught by other rules when
 //     the binary actually does something.
 //
-// What stays HIGH (each has a positive attack signature):
-//   - execve from /dev/shm or /proc/self/fd  → fileless attack
-//   - interpreter with inline -c/-e flag     → inline code injection
-//   - sh -c that fails isShellCmdBenign      → already negative-space-
-//     filtered for env/curl, find -exec, $()/“ substitution, cp/ln/mv
-//     to /usr/local/bin, sensitive-path args, etc. (see
-//     isShellCmdBenign). The benign-check failure itself encodes an
-//     attack signature, so reaching this branch is meaningful even
-//     without observing the side-effect syscalls.
+// What stays HIGH (the cmdline shape itself names an attack):
+//   - execve from /dev/shm or /proc/self/fd  -> fileless attack
+//   - interpreter with inline -c/-e flag     -> inline code injection
 //
 // What is now LOW (CategoryUnknownBinary):
-//   - default "unrecognized binary execve"   → harm-firing rules catch
-//     anything the binary actually does. The event is still emitted
-//     for forensic chain visibility.
+//   - unrecognized binary execve             -> the binary's behavior
+//     decides the verdict, not the cmdline string.
+//   - sh -c that fails isShellCmdBenign      -> originally HIGH because
+//     the benign-check failure was treated as an attack signature.
+//     Demoted in 2026-05 after clean-corpus measurement showed every
+//     legitimate native-module package (argon2/bcrypt/sharp/...) fires
+//     this branch via cross-env / node-gyp-build / prebuild-install
+//     preinstall hooks. Expanding the safe-list to cover ecosystem
+//     build tools recreates the open-ended allowlist problem the
+//     default-branch demotion was designed to avoid. Each previously-
+//     caught attack pattern has a downstream harm-firing rule:
+//   - curl/wget execve  -> connect to remote -> c2_communication
+//   - env curl X        -> same
+//   - $() / “ substitution -> spawned process's syscalls
+//   - find -exec /tmp/payload -> /tmp execve fires fileless rule
+//   - cp /tmp/x /usr/local/bin/python3 -> openat write fires
+//     binary_hijacking (parser emits openat specifically for
+//     system-binary targets)
+//   - sh -c "cat ~/.ssh/id_rsa" -> openat sensitive fires
+//     credential_access
 //
 // Static-analysis tooling (GuardDog and similar) covers orthogonal
 // gaps that kojuto cannot reach at runtime: time-bombed payloads
@@ -768,14 +798,19 @@ func classifyExecve(evt *types.SyscallEvent) {
 	}
 
 	// Shell command analysis. Reaching here means isShellCmdBenign
-	// already returned false — the command contains a non-shellSafe
-	// token, a sensitive-path arg, a binary-hijack file op, or a
-	// substitution construct. Any of those is itself an attack
-	// signature. HIGH.
+	// already returned false — the command failed the negative-space
+	// check (non-shellSafe token, sensitive-path arg, binary-hijack
+	// file op, or substitution construct). Recorded for forensic
+	// chain visibility; the verdict is driven by the downstream
+	// syscall-level rules that catch the actual harm — see the
+	// rationale block above for the mapping from each attack pattern
+	// to its dedicated HIGH-severity rule.
 	if shells[base] && hasInlineExecFlag(cmdline, []string{" -c "}) {
-		evt.Category = types.CategoryCodeExecution
+		evt.Category = types.CategoryUnknownBinary
 		evt.Reason = "Shell command: " + truncate(cmdline, 200) +
-			" — contains suspicious commands not expected during package installation."
+			" — recorded for forensic chain visibility. Verdict-flipping " +
+			"signals (network, credential read, persistence, binary hijack, RWX) " +
+			"are emitted by their own syscall-level rules when the command runs."
 		return
 	}
 
