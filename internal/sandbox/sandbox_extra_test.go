@@ -2,7 +2,9 @@ package sandbox
 
 import (
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -593,6 +595,140 @@ func TestRandBase62(t *testing.T) {
 	b := randBase62(40)
 	if a == b {
 		t.Error("randBase62 returned identical values on consecutive calls")
+	}
+}
+
+// TestCleanupStaleSandboxContainers_Empty documents the no-op path:
+// when no labeled containers exist in any non-running state, the
+// function returns (0, nil) without invoking `docker rm`.
+func TestCleanupStaleSandboxContainers_Empty(t *testing.T) {
+	var calls [][]string
+	orig := execCommand
+	execCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		calls = append(calls, append([]string{name}, args...))
+		// `docker ps -aq --filter ...` returns empty output -> no
+		// stale containers; this is the no-op path.
+		return exec.CommandContext(ctx, "true")
+	}
+	t.Cleanup(func() { execCommand = orig })
+
+	n, err := CleanupStaleSandboxContainers(context.Background())
+	if err != nil {
+		t.Fatalf("CleanupStaleSandboxContainers: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("expected 0 removed containers, got %d", n)
+	}
+	// One `docker ps -aq --filter` invocation per status (exited,
+	// created, dead) — three total. No `docker rm` because nothing
+	// to remove.
+	if len(calls) != 3 {
+		t.Fatalf("expected 3 docker ps calls, got %d: %v", len(calls), calls)
+	}
+	for _, args := range calls {
+		joined := strings.Join(args, " ")
+		if !strings.Contains(joined, "ps -aq") ||
+			!strings.Contains(joined, "label="+SandboxContainerLabel) {
+			t.Errorf("unexpected docker call args: %v", args)
+		}
+	}
+}
+
+// TestCleanupStaleSandboxContainers_FiltersByLabel pins the exact
+// filter combination used to find orphans: --filter
+// label=kojuto.scan ANDed with --filter status=<X> for each
+// non-running state. The status enumeration is required because
+// Docker filters compose with AND, not OR.
+func TestCleanupStaleSandboxContainers_FiltersByLabel(t *testing.T) {
+	orig := execCommand
+	defer func() { execCommand = orig }()
+
+	seenStatuses := map[string]bool{}
+	execCommand = func(ctx context.Context, _ string, args ...string) *exec.Cmd {
+		for i, a := range args {
+			if a == "--filter" && i+1 < len(args) && strings.HasPrefix(args[i+1], "status=") {
+				seenStatuses[strings.TrimPrefix(args[i+1], "status=")] = true
+			}
+		}
+		return exec.CommandContext(ctx, "true")
+	}
+
+	if _, err := CleanupStaleSandboxContainers(context.Background()); err != nil {
+		t.Fatalf("CleanupStaleSandboxContainers: %v", err)
+	}
+
+	// Every non-running, non-paused state Docker can report must be
+	// queried — leaving any out would leak that class of orphan.
+	for _, want := range []string{"exited", "created", "dead"} {
+		if !seenStatuses[want] {
+			t.Errorf("status=%q filter not used; seen=%v", want, seenStatuses)
+		}
+	}
+	// Running and paused MUST NOT be queried — those belong to live
+	// concurrent kojuto runs and must be left alone.
+	for _, forbidden := range []string{"running", "paused", "restarting"} {
+		if seenStatuses[forbidden] {
+			t.Errorf("status=%q filter must NOT be used (would disturb live scans)", forbidden)
+		}
+	}
+}
+
+// TestCleanupStaleSandboxContainers_RemovesIDs pins the contract that
+// container IDs returned by `docker ps` are passed to `docker rm -f`
+// in a single batch call.
+//
+// The fake `docker ps` reads its output from a temp file rather than
+// from a shell-dependent `printf`/`echo` invocation — Windows host
+// printf does not interpret `\n` in format strings the same way
+// POSIX printf does, so a literal newline in the file is the only
+// portable way to seed multi-line stdout from a fake exec command.
+func TestCleanupStaleSandboxContainers_RemovesIDs(t *testing.T) {
+	idsFile := filepath.Join(t.TempDir(), "ids.txt")
+	if err := os.WriteFile(idsFile, []byte("abc123\ndef456\n"), 0o600); err != nil {
+		t.Fatalf("seeding ids file: %v", err)
+	}
+
+	var rmArgs []string
+	orig := execCommand
+	execCommand = func(ctx context.Context, _ string, args ...string) *exec.Cmd {
+		if len(args) > 0 && args[0] == "ps" {
+			// Each of the 3 status filters returns the same two IDs
+			// for a total of 6.
+			return exec.CommandContext(ctx, "cat", idsFile)
+		}
+		if len(args) > 0 && args[0] == "rm" {
+			rmArgs = append([]string{}, args...)
+		}
+		return exec.CommandContext(ctx, "true")
+	}
+	t.Cleanup(func() { execCommand = orig })
+
+	n, err := CleanupStaleSandboxContainers(context.Background())
+	if err != nil {
+		t.Fatalf("CleanupStaleSandboxContainers: %v", err)
+	}
+	// 3 statuses × 2 IDs each = 6 IDs.
+	if n != 6 {
+		t.Errorf("removed count = %d, want 6", n)
+	}
+	if len(rmArgs) == 0 {
+		t.Fatal("docker rm was never called")
+	}
+	if rmArgs[0] != "rm" || rmArgs[1] != "-f" {
+		t.Errorf("expected `docker rm -f <ids>`, got args=%v", rmArgs)
+	}
+	// All collected IDs should be passed in a single rm call.
+	for _, id := range []string{"abc123", "def456"} {
+		found := false
+		for _, a := range rmArgs[2:] {
+			if a == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected id %q in rm args, got %v", id, rmArgs)
+		}
 	}
 }
 
