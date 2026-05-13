@@ -177,6 +177,10 @@ func TestContainerArgs(t *testing.T) {
 		"--tmpfs=/var/cache/kojuto:",
 		"--env=NPM_CONFIG_CACHE=/var/cache/kojuto/npm",
 		"--env=PIP_CACHE_DIR=/var/cache/kojuto/pip",
+		// Identifies the container as kojuto-managed so
+		// CleanupStaleSandboxContainers can sweep orphans without
+		// disturbing unrelated Docker workloads.
+		"--label=" + SandboxContainerLabel + "=true",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("containerArgs missing %q in:\n%s", want, joined)

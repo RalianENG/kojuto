@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -233,6 +234,22 @@ type scanResult struct {
 }
 
 func runScan(_ *cobra.Command, args []string) error {
+	// Sweep orphan containers left behind by earlier kojuto runs whose
+	// Cleanup defer did not get a chance to fire (SIGKILL, OOM, panic,
+	// parent-process kill). Running/paused containers belonging to
+	// concurrent kojuto invocations are filtered out and left alone.
+	// Best-effort: a Docker hiccup here is logged but does not abort
+	// the scan, which has its own clearer error path if Docker is
+	// genuinely unavailable.
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cleanupCancel()
+	if n, err := sandbox.CleanupStaleSandboxContainers(cleanupCtx); err != nil {
+		fmt.Fprintf(os.Stderr, "[!] Stale-container sweep skipped: %v\n", err)
+	} else if n > 0 {
+		fmt.Fprintf(os.Stderr, "  %s reaped %d orphan sandbox container(s) from previous runs\n",
+			styleYellowBold("•"), n)
+	}
+
 	// Local mode: scan a local package file or directory.
 	if flagLocal != "" {
 		return runLocalScan(args)
@@ -270,8 +287,11 @@ func scanSinglePackage(pkg, version, ecosystem string) (*pinnedDep, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), flagTimeout)
 	defer cancel()
 
+	// SIGINT (Ctrl+C) + SIGTERM (parent kill, container stop, init
+	// shutdown). SIGKILL cannot be intercepted; the next kojuto run
+	// will mop up the orphan via CleanupStaleSandboxContainers.
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
 		<-sigCh

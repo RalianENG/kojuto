@@ -29,6 +29,13 @@ var seccompProfile []byte
 // SandboxImage is the Docker image used for the sandbox container.
 const SandboxImage = "kojuto-sandbox:latest"
 
+// SandboxContainerLabel tags every container kojuto creates so
+// CleanupStaleSandboxContainers can identify orphans from previous
+// runs without disturbing unrelated Docker workloads on the host.
+// The literal string lives here (not derived from a build flag) so a
+// container created by one kojuto build is recognizable to another.
+const SandboxContainerLabel = "kojuto.scan"
+
 // SandboxPythonVersion must match the Python version in Dockerfile.sandbox.
 const SandboxPythonVersion = "3.12"
 
@@ -162,6 +169,12 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 
 	args = append(args,
 		"--network="+s.networkName,
+		// Identifies the container as kojuto-managed. CleanupStaleSandboxContainers
+		// uses this label at startup to remove orphans from previous runs that
+		// did not get a chance to run their Cleanup defer (SIGKILL, OOM, panic).
+		// Running/paused containers from concurrent kojuto invocations are
+		// filtered out at cleanup time so live scans are not disturbed.
+		"--label="+SandboxContainerLabel+"=true",
 		// Fake DNS: RFC 5737 TEST-NET-2 address, guaranteed unreachable.
 		// Prevents fingerprinting via empty /etc/resolv.conf while ensuring
 		// DNS resolution attempts generate a connect:53 event in strace
@@ -1199,6 +1212,64 @@ func (s *Sandbox) Unpause(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// CleanupStaleSandboxContainers removes kojuto-labeled containers that
+// are no longer running. Called at scan startup to mop up orphans from
+// prior invocations whose Cleanup defer did not get a chance to fire
+// (SIGKILL, OOM, panic, parent-process kill).
+//
+// Filters by label and status only:
+//
+//   - `label=kojuto.scan` restricts the sweep to containers kojuto
+//     itself created; unrelated Docker workloads on the host are
+//     left alone.
+//   - The `status=exited|created|dead` triple matches every non-live
+//     state a stopped container can be in, and excludes `running` /
+//     `paused` so concurrent kojuto invocations are not disturbed.
+//
+// Failures are logged but do not abort scan startup — the caller is
+// scanning a package; container hygiene is best-effort cleanup, not a
+// hard precondition. Returns the count of removed containers so the
+// caller can surface a one-line summary if any were swept.
+//
+// Implementation note: a single `docker ps -aq --filter label=...
+// --filter status=...` call cannot OR multiple statuses (Docker
+// applies multiple --filter as AND), so the three states are queried
+// independently and concatenated before `docker rm -f`.
+func CleanupStaleSandboxContainers(ctx context.Context) (int, error) {
+	var ids []string
+	for _, status := range []string{"exited", "created", "dead"} {
+		cmd := execCommand(ctx, "docker", "ps", "-aq",
+			"--filter", "label="+SandboxContainerLabel,
+			"--filter", "status="+status,
+		)
+		out, err := cmd.Output()
+		if err != nil {
+			// Docker daemon down or unreachable. Skip cleanup; the
+			// scan itself will fail with a clearer error if Docker
+			// is genuinely unavailable.
+			return 0, fmt.Errorf("listing stale kojuto containers (status=%s): %w", status, err)
+		}
+		for _, line := range strings.Split(string(out), "\n") {
+			id := strings.TrimSpace(line)
+			if id != "" {
+				ids = append(ids, id)
+			}
+		}
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+
+	args := append([]string{"rm", "-f"}, ids...)
+	cmd := execCommand(ctx, "docker", args...)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if err := cmd.Run(); err != nil {
+		return 0, fmt.Errorf("removing %d stale kojuto containers: %w", len(ids), err)
+	}
+	return len(ids), nil
 }
 
 // Cleanup stops and removes the container, and cleans up temporary files.
