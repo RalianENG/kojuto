@@ -336,10 +336,17 @@ func parseOpenat(line string) (types.SyscallEvent, bool) {
 		strings.Contains(flags, "O_RDWR") ||
 		strings.Contains(flags, "O_CREAT")
 
-	// Emit if: sensitive path, write to user home, OR write to system binary.
+	// Emit if: sensitive path, write to user home, write to system binary,
+	// OR write into an installed npm package directory. The last case
+	// feeds the analyzer's library_hijacking rule, which compares the
+	// target package name against the scan target set to distinguish
+	// self-writes (legitimate build output) from cross-package writes
+	// (backdoor placement). Filtering self vs other happens in the
+	// analyzer where the scan target list is available.
 	if !isSensitivePath(filePath) &&
 		(!isWrite || !isUserHomePath(filePath)) &&
-		(!isWrite || !isSystemBinaryWrite(filePath)) {
+		(!isWrite || !isSystemBinaryWrite(filePath)) &&
+		(!isWrite || !isInstalledPackageWrite(filePath)) {
 		return types.SyscallEvent{}, false
 	}
 
@@ -350,6 +357,29 @@ func parseOpenat(line string) (types.SyscallEvent, bool) {
 		FilePath:  filePath,
 		OpenFlags: flags,
 	}, true
+}
+
+// isInstalledPackageWrite reports whether filePath targets an installed
+// npm package directory (`/install/node_modules/<pkg>/...`). npm's own
+// bookkeeping entries (`.package-lock.json`, `.bin/`, `.cache/`) are
+// excluded — those never represent attacker-installed packages and
+// would create write-event noise during every install.
+func isInstalledPackageWrite(filePath string) bool {
+	const prefix = "/install/node_modules/"
+	if !strings.HasPrefix(filePath, prefix) {
+		return false
+	}
+	rest := filePath[len(prefix):]
+	if rest == "" {
+		return false
+	}
+	// Scoped packages (@scope/name) and regular packages both produce
+	// a first-segment package identifier. Reject `.`-prefixed
+	// bookkeeping entries.
+	if rest[0] == '.' {
+		return false
+	}
+	return true
 }
 
 // parseRename handles rename, renameat, and renameat2 syscalls.
