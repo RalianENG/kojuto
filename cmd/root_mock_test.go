@@ -141,8 +141,8 @@ func TestScanSinglePackage_DownloadFailure(t *testing.T) {
 
 	flagTimeout = 5 * time.Second
 	downloaderValidate = func(_, _ string) error { return nil }
-	downloaderDownload = func(_ context.Context, _, _, _, _ string) (string, error) {
-		return "", errors.New("download failed: network error")
+	downloaderDownload = func(_ context.Context, _, _, _, _ string) (string, []types.SyscallEvent, error) {
+		return "", nil, errors.New("download failed: network error")
 	}
 
 	_, err := scanSinglePackage("pkg", "", types.EcosystemPyPI)
@@ -167,17 +167,17 @@ func TestDownloadPackage_Success(t *testing.T) {
 	pkgDir := filepath.Join(tmpDir, "packages")
 	os.MkdirAll(pkgDir, 0o755)
 
-	downloaderDownload = func(_ context.Context, _, _, destDir, _ string) (string, error) {
+	downloaderDownload = func(_ context.Context, _, _, destDir, _ string) (string, []types.SyscallEvent, error) {
 		// Create a fake wheel file.
 		os.WriteFile(filepath.Join(destDir, "requests-2.31.0-py3-none-any.whl"), []byte("fake"), 0o644)
-		return destDir, nil
+		return destDir, nil, nil
 	}
 	downloaderDetectVersion = func(_, _ string) string {
 		return testVersion2310
 	}
 
 	ctx := context.Background()
-	dlDir, err := downloadPackage(ctx, "requests")
+	dlDir, _, err := downloadPackage(ctx, "requests")
 	if err != nil {
 		t.Fatalf("downloadPackage failed: %v", err)
 	}
@@ -198,12 +198,12 @@ func TestDownloadPackage_Failure(t *testing.T) {
 	flagEcosystem = types.EcosystemPyPI
 	flagVersion = ""
 
-	downloaderDownload = func(_ context.Context, _, _, _, _ string) (string, error) {
-		return "", errors.New("pip not found")
+	downloaderDownload = func(_ context.Context, _, _, _, _ string) (string, []types.SyscallEvent, error) {
+		return "", nil, errors.New("pip not found")
 	}
 
 	ctx := context.Background()
-	_, err := downloadPackage(ctx, "pkg")
+	_, _, err := downloadPackage(ctx, "pkg")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -300,9 +300,9 @@ func TestRunBatchScan_WithSuspicious(t *testing.T) {
 		}, types.EcosystemPyPI, nil
 	}
 	downloaderValidate = func(_, _ string) error { return nil }
-	downloaderDownload = func(_ context.Context, _, _, destDir, _ string) (string, error) {
+	downloaderDownload = func(_ context.Context, _, _, destDir, _ string) (string, []types.SyscallEvent, error) {
 		os.WriteFile(filepath.Join(destDir, "evil_pkg-1.0.0.whl"), []byte("x"), 0o644)
-		return destDir, nil
+		return destDir, nil, nil
 	}
 	downloaderDetectVersion = func(_, _ string) string { return testVersion }
 	sandboxNew = func(packageDir, pkg string, needsPtrace bool, ecosystem, runtime string) *sandbox.Sandbox {
@@ -337,9 +337,9 @@ func TestRunBatchScan_AllCleanWithPin(t *testing.T) {
 	downloaderValidate = func(_, _ string) error { return nil }
 
 	// Mock download: create temp dir with a package file.
-	downloaderDownload = func(_ context.Context, _, _, destDir, _ string) (string, error) {
+	downloaderDownload = func(_ context.Context, _, _, destDir, _ string) (string, []types.SyscallEvent, error) {
 		os.WriteFile(filepath.Join(destDir, "requests-2.31.0.whl"), []byte("x"), 0o644)
-		return destDir, nil
+		return destDir, nil, nil
 	}
 	downloaderDetectVersion = func(_, _ string) string { return testVersion2310 }
 	sandboxEnsureImage = func(_ context.Context, _ string) error { return nil }
@@ -578,13 +578,13 @@ func TestRunBatchScan_EcosystemOverride(t *testing.T) {
 		return []depfile.Dep{{Name: "pkg"}}, types.EcosystemPyPI, nil
 	}
 	downloaderValidate = func(_, _ string) error { return nil }
-	downloaderDownload = func(_ context.Context, _, _, destDir, eco string) (string, error) {
+	downloaderDownload = func(_ context.Context, _, _, destDir, eco string) (string, []types.SyscallEvent, error) {
 		// Verify ecosystem was overridden.
 		if eco != types.EcosystemNpm {
-			return "", fmt.Errorf("expected npm ecosystem, got %s", eco)
+			return "", nil, fmt.Errorf("expected npm ecosystem, got %s", eco)
 		}
 		os.WriteFile(filepath.Join(destDir, "pkg.whl"), []byte("x"), 0o644)
-		return destDir, nil
+		return destDir, nil, nil
 	}
 	downloaderDetectVersion = func(_, _ string) string { return "1.0" }
 	sandboxEnsureImage = func(_ context.Context, _ string) error {

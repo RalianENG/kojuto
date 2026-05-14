@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/RalianENG/kojuto/internal/probe"
 	"github.com/RalianENG/kojuto/internal/sandbox"
 	"github.com/RalianENG/kojuto/internal/types"
 )
@@ -21,19 +22,55 @@ var (
 
 // runInDownloadSandbox spins up a hardened, network-enabled DownloadSandbox
 // that bind-mounts hostOutDir at the container's /out, runs command inside it
-// (working directory /out), and reaps the container afterward. pip and npm
-// run attacker-influenced code during a download — registry metadata parsers,
-// dependency resolvers, tarball extractors (a real path-traversal surface) —
-// so the download phase is contained to this ephemeral container instead of
-// executing on the host.
-func runInDownloadSandbox(ctx context.Context, hostOutDir string, command []string) ([]byte, error) {
+// under strace, reaps the container, and returns the command output plus the
+// syscall events strace captured.
+//
+// pip and npm run attacker-influenced code during a download — registry
+// metadata parsers, dependency resolvers, tarball extractors (a real
+// path-traversal surface) — so the download phase is both *contained* to
+// this ephemeral container and *observed*: the events feed the analyzer's
+// download-phase profile (execve out of the staging dir, writes that escape
+// it, network egress).
+//
+// Events are drained concurrently with the traced command: the download
+// phase legitimately produces many connect events (registry + CDN), and a
+// consumer that only drained afterward could overflow the probe's buffer.
+func runInDownloadSandbox(ctx context.Context, hostOutDir string, command []string) ([]byte, []types.SyscallEvent, error) {
 	ds := sandbox.NewDownloadSandbox(hostOutDir)
 	if err := ds.Start(ctx); err != nil {
-		return nil, fmt.Errorf("starting download sandbox: %w", err)
+		return nil, nil, fmt.Errorf("starting download sandbox: %w", err)
 	}
-	// Reap the container even if ctx is already cancelled.
-	defer ds.Cleanup(context.Background())
-	return ds.Run(ctx, command)
+	// Reap the container even if ctx is already canceled. Using the
+	// caller's ctx here would skip cleanup on cancellation, orphaning
+	// the container — context.Background() is deliberate.
+	defer func() { _ = ds.Cleanup(context.Background()) }() //nolint:contextcheck // see comment above
+
+	cp := probe.NewContainerStraceForDownload(sandbox.DownloadOutMountPath)
+
+	var events []types.SyscallEvent
+	drained := make(chan struct{})
+	go func() {
+		for evt := range cp.Events() {
+			events = append(events, evt)
+		}
+		close(drained)
+	}()
+
+	out, err := cp.StartAndInstall(ctx, ds.ContainerID(), command)
+	<-drained
+	if err != nil {
+		return out, events, fmt.Errorf("download command failed: %w", err)
+	}
+
+	// Fail closed: a dropped event could be the one that would have flagged
+	// a malicious download-time syscall. Concurrent draining makes an
+	// overflow effectively impossible, so a non-zero count signals
+	// something pathological — treat the download as unobservable rather
+	// than trusting a partial event stream.
+	if dropped := cp.Dropped(); dropped > 0 {
+		return out, events, fmt.Errorf("download monitoring lost %d event(s); cannot verify download safely", dropped)
+	}
+	return out, events, nil
 }
 
 // runInSandbox is the seam downloader tests replace so they never touch
@@ -53,11 +90,12 @@ func ValidatePackage(pkg, version string) error {
 	return nil
 }
 
-// Download fetches a package to destDir.
-// Ecosystem determines which package manager is used (pypi or npm).
-func Download(ctx context.Context, pkg, version, destDir, ecosystem string) (string, error) {
+// Download fetches a package to destDir inside the download sandbox and
+// returns the staging directory plus the syscall events captured while
+// pip/npm ran. Ecosystem determines which package manager is used.
+func Download(ctx context.Context, pkg, version, destDir, ecosystem string) (string, []types.SyscallEvent, error) {
 	if err := ValidatePackage(pkg, version); err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	switch ecosystem {
@@ -66,7 +104,7 @@ func Download(ctx context.Context, pkg, version, destDir, ecosystem string) (str
 	case types.EcosystemNpm:
 		return downloadNpm(ctx, pkg, version, destDir)
 	default:
-		return "", fmt.Errorf("unsupported ecosystem: %s", ecosystem)
+		return "", nil, fmt.Errorf("unsupported ecosystem: %s", ecosystem)
 	}
 }
 
@@ -89,21 +127,22 @@ func pypiDownloadArgs() []string {
 	}
 }
 
-// DownloadAll fetches multiple PyPI packages in a single pip invocation inside
-// a download sandbox. This is significantly faster than calling Download for
-// each package individually.
-func DownloadAll(ctx context.Context, targets []string, destDir string) error {
+// DownloadAll fetches multiple PyPI packages in a single pip invocation
+// inside a download sandbox. This is significantly faster than calling
+// Download for each package individually. Returns the download-phase
+// syscall events for the analyzer.
+func DownloadAll(ctx context.Context, targets []string, destDir string) ([]types.SyscallEvent, error) {
 	args := append([]string{"pip"}, pypiDownloadArgs()...)
 	args = append(args, targets...)
-	out, err := runInSandbox(ctx, destDir, args)
+	out, events, err := runInSandbox(ctx, destDir, args)
 	os.Stderr.Write(out)
 	if err != nil {
-		return fmt.Errorf("pip download failed: %w", err)
+		return events, fmt.Errorf("pip download failed: %w", err)
 	}
-	return nil
+	return events, nil
 }
 
-func downloadPyPI(ctx context.Context, pkg, version, destDir string) (string, error) {
+func downloadPyPI(ctx context.Context, pkg, version, destDir string) (string, []types.SyscallEvent, error) {
 	target := pkg
 	if version != "" {
 		target = pkg + "==" + version
@@ -111,13 +150,14 @@ func downloadPyPI(ctx context.Context, pkg, version, destDir string) (string, er
 
 	args := append([]string{"pip"}, pypiDownloadArgs()...)
 	args = append(args, target)
-	out, err := runInSandbox(ctx, destDir, args)
+	out, events, err := runInSandbox(ctx, destDir, args)
 	os.Stderr.Write(out)
 	if err != nil {
-		return "", fmt.Errorf("pip download failed: %w", err)
+		return "", events, fmt.Errorf("pip download failed: %w", err)
 	}
 
-	return verifyDownload(destDir, pkg)
+	dir, err := verifyDownload(destDir, pkg)
+	return dir, events, err
 }
 
 // writeStagingPackageJSON writes a minimal staging package.json into destDir
@@ -141,24 +181,25 @@ func writeStagingPackageJSON(destDir string, deps map[string]string) error {
 }
 
 // DownloadAllNpm fetches multiple npm packages in a single npm install
-// invocation inside a download sandbox.
-func DownloadAllNpm(ctx context.Context, deps map[string]string, destDir string) error {
+// invocation inside a download sandbox. Returns the download-phase syscall
+// events for the analyzer.
+func DownloadAllNpm(ctx context.Context, deps map[string]string, destDir string) ([]types.SyscallEvent, error) {
 	if err := writeStagingPackageJSON(destDir, deps); err != nil {
-		return err
+		return nil, err
 	}
-	out, err := runInSandbox(ctx, destDir, []string{"npm", "install", "--ignore-scripts"})
+	out, events, err := runInSandbox(ctx, destDir, []string{"npm", "install", "--ignore-scripts"})
 	os.Stderr.Write(out)
 	if err != nil {
-		return fmt.Errorf("npm install (batch staging) failed: %w", err)
+		return events, fmt.Errorf("npm install (batch staging) failed: %w", err)
 	}
 	nmDir := filepath.Join(destDir, "node_modules")
 	if _, err := os.Stat(nmDir); err != nil {
-		return errors.New("node_modules not created")
+		return events, errors.New("node_modules not created")
 	}
-	return nil
+	return events, nil
 }
 
-func downloadNpm(ctx context.Context, pkg, version, destDir string) (string, error) {
+func downloadNpm(ctx context.Context, pkg, version, destDir string) (string, []types.SyscallEvent, error) {
 	// Create a staging project with the target as a dependency. npm install
 	// --ignore-scripts resolves the full dep tree without running any
 	// lifecycle scripts. It runs inside the download sandbox because npm
@@ -167,22 +208,22 @@ func downloadNpm(ctx context.Context, pkg, version, destDir string) (string, err
 	// mounted into the analysis sandbox, where lifecycle scripts (preinstall,
 	// postinstall, etc.) are re-executed under strace.
 	if err := writeStagingPackageJSON(destDir, map[string]string{pkg: versionOrLatest(version)}); err != nil {
-		return "", err
+		return "", nil, err
 	}
 
-	out, err := runInSandbox(ctx, destDir, []string{"npm", "install", "--ignore-scripts"})
+	out, events, err := runInSandbox(ctx, destDir, []string{"npm", "install", "--ignore-scripts"})
 	os.Stderr.Write(out)
 	if err != nil {
-		return "", fmt.Errorf("npm install (sandbox staging) failed: %w", err)
+		return "", events, fmt.Errorf("npm install (sandbox staging) failed: %w", err)
 	}
 
 	// Verify node_modules was created.
 	nmDir := filepath.Join(destDir, "node_modules")
 	if _, err := os.Stat(nmDir); err != nil {
-		return "", fmt.Errorf("node_modules not created for %s", pkg)
+		return "", events, fmt.Errorf("node_modules not created for %s", pkg)
 	}
 
-	return destDir, nil
+	return destDir, events, nil
 }
 
 func versionOrLatest(version string) string {

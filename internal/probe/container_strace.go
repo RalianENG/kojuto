@@ -29,6 +29,15 @@ type ContainerStrace struct {
 	events  chan types.SyscallEvent
 	done    chan struct{}
 	dropped uint64 // events dropped due to full buffer
+	// phase, when non-empty, is stamped onto every emitted event's Phase
+	// field so the analyzer can apply a phase-specific profile. The
+	// install/import probes leave it empty; the download probe sets it
+	// to types.PhaseDownload.
+	phase string
+	// workdir, when non-empty, is passed to `docker exec --workdir`. The
+	// download probe sets it so `npm install` finds the staging
+	// package.json; install/import probes leave it empty.
+	workdir string
 }
 
 // NewContainerStrace creates a new in-container strace probe.
@@ -37,6 +46,18 @@ func NewContainerStrace() *ContainerStrace {
 		events: make(chan types.SyscallEvent, 8192),
 		done:   make(chan struct{}),
 	}
+}
+
+// NewContainerStraceForDownload creates a probe for the download phase: the
+// traced command runs with its working directory set to workdir, and every
+// emitted event is stamped with types.PhaseDownload so the analyzer applies
+// the download-phase profile (network egress is expected; staging-dir
+// execve is an unpacking-time exploit).
+func NewContainerStraceForDownload(workdir string) *ContainerStrace {
+	c := NewContainerStrace()
+	c.phase = types.PhaseDownload
+	c.workdir = workdir
+	return c
 }
 
 // Start is not supported for ContainerStrace. Use StartAndInstall instead.
@@ -88,8 +109,15 @@ func (c *ContainerStrace) StartAndInstall(ctx context.Context, containerID strin
 }
 
 func (c *ContainerStrace) buildCommand(ctx context.Context, containerID string, installCmd []string) *exec.Cmd {
-	args := []string{
-		"exec", containerID,
+	args := []string{"exec"}
+	if c.workdir != "" {
+		// Download phase: npm install resolves its manifest relative to
+		// the working directory, so the traced command must run inside
+		// the bind-mounted staging dir.
+		args = append(args, "--workdir="+c.workdir)
+	}
+	args = append(args,
+		containerID,
 		"strace", "-f",
 		"-s", "256",
 		// --quiet=attach suppresses the "strace: Process N attached"
@@ -114,7 +142,7 @@ func (c *ContainerStrace) buildCommand(ctx context.Context, containerID string, 
 		"-e", "trace=connect,sendto,sendmsg,sendmmsg,bind,listen,accept,accept4,execve,execveat,clone,clone3,openat,rename,renameat,renameat2,sendfile,ptrace,mmap,mprotect,unlink,unlinkat",
 		"-e", "signal=none",
 		"--",
-	}
+	)
 	args = append(args, installCmd...)
 
 	return exec.CommandContext(ctx, "docker", args...)
@@ -131,6 +159,12 @@ func (c *ContainerStrace) parseStraceOutput(stderr io.ReadCloser, done chan<- st
 		evt, ok := parseStraceLine(scanner.Text(), state)
 		if !ok {
 			continue
+		}
+
+		// Stamp the scan phase so the analyzer can route the event
+		// through the right profile. Empty for install/import probes.
+		if c.phase != "" {
+			evt.Phase = c.phase
 		}
 
 		select {

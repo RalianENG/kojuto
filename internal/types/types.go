@@ -118,6 +118,19 @@ const (
 	// any other MEDIUM signal or a second DGA cluster to flip the
 	// verdict.
 	CategoryDGA = "dga"
+	// CategoryDownloadEgress records an outbound connection observed
+	// during the sandboxed download phase (PhaseDownload). The download
+	// phase legitimately fetches packages from the registry and its CDN,
+	// so a plain connect cannot be condemned without a trusted resolver —
+	// it is recorded LOW for forensic visibility and never flips the
+	// verdict on its own. Download-phase connects whose DNS query matches
+	// a known exfil service or shows tunneling entropy do NOT land here;
+	// those keep their data_exfiltration / dns_tunneling categories,
+	// since those heuristics need no whitelist. Attributing a bare-IP C2
+	// connect during download is the job of the deferred synthetic-DNS
+	// resolver work; until then containment (the download sandbox) is
+	// what bounds the blast radius of a malicious connect.
+	CategoryDownloadEgress = "download_egress"
 )
 
 // Category severity tiers drive verdict assignment in analyzer.Analyze.
@@ -154,12 +167,17 @@ var CategorySeverity = map[string]string{
 	CategoryDynamicExec:      SeverityLow,
 	CategoryUnknownBinary:    SeverityLow,
 	CategoryDNSLookup:        SeverityLow,
+	CategoryDownloadEgress:   SeverityLow,
 }
 
-// Scan phases.
+// Scan phases. Stamped onto SyscallEvent.Phase so the analyzer can apply
+// a phase-specific profile — most importantly, the download phase runs
+// with real network egress (it must reach the registry), so its connect
+// events cannot be judged by the install/import rules.
 const (
-	PhaseInstall = "install"
-	PhaseImport  = "import"
+	PhaseInstall  = "install"
+	PhaseImport   = "import"
+	PhaseDownload = "download"
 )
 
 // StaticFinding represents a suspicious pattern found by static analysis.

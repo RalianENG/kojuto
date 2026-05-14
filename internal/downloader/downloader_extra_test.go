@@ -18,7 +18,8 @@ import (
 //
 // The downloader no longer execs pip/npm directly — every registry command
 // goes through runInSandbox, which in production drives a DownloadSandbox
-// container. Tests swap it for a stub so they never touch Docker.
+// container under strace. Tests swap it for a stub so they never touch
+// Docker, and can inject synthetic download-phase syscall events.
 // ---------------------------------------------------------------------------
 
 // recordedRun captures what the runInSandbox stub was called with.
@@ -29,17 +30,17 @@ type recordedRun struct {
 }
 
 // stubRunInSandbox swaps runInSandbox for the duration of the test with a stub
-// that records its arguments and returns the given output/error, restoring the
-// original on cleanup.
-func stubRunInSandbox(t *testing.T, out []byte, err error) *recordedRun {
+// that records its arguments and returns the given output, events, and error,
+// restoring the original on cleanup.
+func stubRunInSandbox(t *testing.T, out []byte, events []types.SyscallEvent, err error) *recordedRun {
 	t.Helper()
 	rec := &recordedRun{}
 	orig := runInSandbox
-	runInSandbox = func(_ context.Context, hostOutDir string, command []string) ([]byte, error) {
+	runInSandbox = func(_ context.Context, hostOutDir string, command []string) ([]byte, []types.SyscallEvent, error) {
 		rec.calls++
 		rec.lastDir = hostOutDir
 		rec.lastCommand = command
-		return out, err
+		return out, events, err
 	}
 	t.Cleanup(func() { runInSandbox = orig })
 	return rec
@@ -238,21 +239,21 @@ func TestDetectVersion_BadDir(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDownload_UnsupportedEcosystem(t *testing.T) {
-	_, err := Download(context.Background(), "pkg", "1.0", t.TempDir(), "rubygems")
+	_, _, err := Download(context.Background(), "pkg", "1.0", t.TempDir(), "rubygems")
 	if err == nil {
 		t.Error("expected error for unsupported ecosystem, got nil")
 	}
 }
 
 func TestDownload_InvalidPackageName(t *testing.T) {
-	_, err := Download(context.Background(), "--evil", "", t.TempDir(), types.EcosystemPyPI)
+	_, _, err := Download(context.Background(), "--evil", "", t.TempDir(), types.EcosystemPyPI)
 	if err == nil {
 		t.Error("expected error for invalid package name, got nil")
 	}
 }
 
 func TestDownload_InvalidVersion(t *testing.T) {
-	_, err := Download(context.Background(), "pkg", "$(whoami)", t.TempDir(), types.EcosystemPyPI)
+	_, _, err := Download(context.Background(), "pkg", "$(whoami)", t.TempDir(), types.EcosystemPyPI)
 	if err == nil {
 		t.Error("expected error for invalid version, got nil")
 	}
@@ -263,7 +264,7 @@ func TestDownload_InvalidVersion(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDownloadPyPI_Mock(t *testing.T) {
-	rec := stubRunInSandbox(t, nil, nil)
+	rec := stubRunInSandbox(t, nil, nil, nil)
 
 	dir := t.TempDir()
 	// Create a fake downloaded file so verifyDownload succeeds.
@@ -271,7 +272,7 @@ func TestDownloadPyPI_Mock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := downloadPyPI(context.Background(), "pkg", "1.0.0", dir)
+	got, _, err := downloadPyPI(context.Background(), "pkg", "1.0.0", dir)
 	if err != nil {
 		t.Fatalf("downloadPyPI error: %v", err)
 	}
@@ -290,14 +291,14 @@ func TestDownloadPyPI_Mock(t *testing.T) {
 }
 
 func TestDownloadPyPI_NoVersion(t *testing.T) {
-	rec := stubRunInSandbox(t, nil, nil)
+	rec := stubRunInSandbox(t, nil, nil, nil)
 
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "pkg-2.0.0.whl"), []byte("fake"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	got, err := downloadPyPI(context.Background(), "pkg", "", dir)
+	got, _, err := downloadPyPI(context.Background(), "pkg", "", dir)
 	if err != nil {
 		t.Fatalf("downloadPyPI error: %v", err)
 	}
@@ -311,27 +312,51 @@ func TestDownloadPyPI_NoVersion(t *testing.T) {
 }
 
 func TestDownloadPyPI_EmptyDir(t *testing.T) {
-	stubRunInSandbox(t, nil, nil)
+	stubRunInSandbox(t, nil, nil, nil)
 
 	dir := t.TempDir()
 	// No files — verifyDownload should fail.
-	_, err := downloadPyPI(context.Background(), "pkg", "1.0.0", dir)
+	_, _, err := downloadPyPI(context.Background(), "pkg", "1.0.0", dir)
 	if err == nil {
 		t.Error("expected error for empty download dir, got nil")
 	}
 }
 
 func TestDownloadPyPI_SandboxError(t *testing.T) {
-	stubRunInSandbox(t, []byte("boom"), errors.New("download command failed"))
+	stubRunInSandbox(t, []byte("boom"), nil, errors.New("download command failed"))
 
 	dir := t.TempDir()
 	// Even with a downloaded file present, a sandbox failure must surface.
 	if err := os.WriteFile(filepath.Join(dir, "pkg-1.0.0.whl"), []byte("fake"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, err := downloadPyPI(context.Background(), "pkg", "1.0.0", dir)
+	_, _, err := downloadPyPI(context.Background(), "pkg", "1.0.0", dir)
 	if err == nil {
 		t.Error("expected error when the download sandbox fails, got nil")
+	}
+}
+
+// TestDownloadPyPI_EventsThreaded pins that the download-phase syscall events
+// captured inside the sandbox are returned to the caller — that stream is
+// what feeds the analyzer's download-phase profile.
+func TestDownloadPyPI_EventsThreaded(t *testing.T) {
+	want := []types.SyscallEvent{
+		{Syscall: types.EventConnect, DstAddr: "151.101.0.223", DstPort: 443, Phase: types.PhaseDownload},
+		{Syscall: types.EventExecve, Comm: "/out/node_modules/evil/payload", Phase: types.PhaseDownload},
+	}
+	stubRunInSandbox(t, nil, want, nil)
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "pkg-1.0.0.whl"), []byte("fake"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, events, err := downloadPyPI(context.Background(), "pkg", "1.0.0", dir)
+	if err != nil {
+		t.Fatalf("downloadPyPI error: %v", err)
+	}
+	if !slices.Equal(events, want) {
+		t.Errorf("downloadPyPI events = %v, want %v", events, want)
 	}
 }
 
@@ -340,7 +365,7 @@ func TestDownloadPyPI_SandboxError(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDownloadNpm_Mock(t *testing.T) {
-	rec := stubRunInSandbox(t, nil, nil)
+	rec := stubRunInSandbox(t, nil, nil, nil)
 
 	dir := t.TempDir()
 	// Create node_modules so the post-install check passes.
@@ -348,7 +373,7 @@ func TestDownloadNpm_Mock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := downloadNpm(context.Background(), "lodash", "4.17.21", dir)
+	got, _, err := downloadNpm(context.Background(), "lodash", "4.17.21", dir)
 	if err != nil {
 		t.Fatalf("downloadNpm error: %v", err)
 	}
@@ -377,14 +402,14 @@ func TestDownloadNpm_Mock(t *testing.T) {
 }
 
 func TestDownloadNpm_NoVersion(t *testing.T) {
-	stubRunInSandbox(t, nil, nil)
+	stubRunInSandbox(t, nil, nil, nil)
 
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, "node_modules"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
-	got, err := downloadNpm(context.Background(), "express", "", dir)
+	got, _, err := downloadNpm(context.Background(), "express", "", dir)
 	if err != nil {
 		t.Fatalf("downloadNpm error: %v", err)
 	}
@@ -407,24 +432,24 @@ func TestDownloadNpm_NoVersion(t *testing.T) {
 }
 
 func TestDownloadNpm_NoNodeModules(t *testing.T) {
-	stubRunInSandbox(t, nil, nil)
+	stubRunInSandbox(t, nil, nil, nil)
 
 	dir := t.TempDir()
 	// Don't create node_modules — should error.
-	_, err := downloadNpm(context.Background(), "lodash", "4.17.21", dir)
+	_, _, err := downloadNpm(context.Background(), "lodash", "4.17.21", dir)
 	if err == nil {
 		t.Error("expected error when node_modules not created, got nil")
 	}
 }
 
 func TestDownloadNpm_SandboxError(t *testing.T) {
-	stubRunInSandbox(t, []byte("npm err"), errors.New("download command failed"))
+	stubRunInSandbox(t, []byte("npm err"), nil, errors.New("download command failed"))
 
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, "node_modules"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	_, err := downloadNpm(context.Background(), "lodash", "4.17.21", dir)
+	_, _, err := downloadNpm(context.Background(), "lodash", "4.17.21", dir)
 	if err == nil {
 		t.Error("expected error when the download sandbox fails, got nil")
 	}
@@ -435,14 +460,14 @@ func TestDownloadNpm_SandboxError(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDownload_PyPI_Mock(t *testing.T) {
-	stubRunInSandbox(t, nil, nil)
+	stubRunInSandbox(t, nil, nil, nil)
 
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "requests-2.31.0-py3-none-any.whl"), []byte("whl"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	got, err := Download(context.Background(), "requests", "2.31.0", dir, types.EcosystemPyPI)
+	got, _, err := Download(context.Background(), "requests", "2.31.0", dir, types.EcosystemPyPI)
 	if err != nil {
 		t.Fatalf("Download pypi error: %v", err)
 	}
@@ -452,14 +477,14 @@ func TestDownload_PyPI_Mock(t *testing.T) {
 }
 
 func TestDownload_Npm_Mock(t *testing.T) {
-	stubRunInSandbox(t, nil, nil)
+	stubRunInSandbox(t, nil, nil, nil)
 
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, "node_modules"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
-	got, err := Download(context.Background(), "lodash", "4.17.21", dir, types.EcosystemNpm)
+	got, _, err := Download(context.Background(), "lodash", "4.17.21", dir, types.EcosystemNpm)
 	if err != nil {
 		t.Fatalf("Download npm error: %v", err)
 	}
@@ -473,12 +498,12 @@ func TestDownload_Npm_Mock(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDownloadAll_Mock(t *testing.T) {
-	rec := stubRunInSandbox(t, nil, nil)
+	rec := stubRunInSandbox(t, nil, nil, nil)
 
 	dir := t.TempDir()
 	targets := []string{"requests==2.31.0", "flask==3.0.0"}
 
-	err := DownloadAll(context.Background(), targets, dir)
+	_, err := DownloadAll(context.Background(), targets, dir)
 	if err != nil {
 		t.Fatalf("DownloadAll error: %v", err)
 	}
@@ -490,10 +515,25 @@ func TestDownloadAll_Mock(t *testing.T) {
 	}
 }
 
-func TestDownloadAll_SandboxError(t *testing.T) {
-	stubRunInSandbox(t, []byte("pip err"), errors.New("download command failed"))
+func TestDownloadAll_EventsThreaded(t *testing.T) {
+	want := []types.SyscallEvent{
+		{Syscall: types.EventConnect, DstAddr: "1.2.3.4", DstPort: 443, Phase: types.PhaseDownload},
+	}
+	stubRunInSandbox(t, nil, want, nil)
 
-	err := DownloadAll(context.Background(), []string{"requests==2.31.0"}, t.TempDir())
+	events, err := DownloadAll(context.Background(), []string{"requests==2.31.0"}, t.TempDir())
+	if err != nil {
+		t.Fatalf("DownloadAll error: %v", err)
+	}
+	if !slices.Equal(events, want) {
+		t.Errorf("DownloadAll events = %v, want %v", events, want)
+	}
+}
+
+func TestDownloadAll_SandboxError(t *testing.T) {
+	stubRunInSandbox(t, []byte("pip err"), nil, errors.New("download command failed"))
+
+	_, err := DownloadAll(context.Background(), []string{"requests==2.31.0"}, t.TempDir())
 	if err == nil {
 		t.Error("expected error when the download sandbox fails, got nil")
 	}
@@ -504,7 +544,7 @@ func TestDownloadAll_SandboxError(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDownloadAllNpm_Mock(t *testing.T) {
-	stubRunInSandbox(t, nil, nil)
+	stubRunInSandbox(t, nil, nil, nil)
 
 	dir := t.TempDir()
 	// Create node_modules so the post-install check passes.
@@ -517,7 +557,7 @@ func TestDownloadAllNpm_Mock(t *testing.T) {
 		"express": "4.18.2",
 	}
 
-	err := DownloadAllNpm(context.Background(), deps, dir)
+	_, err := DownloadAllNpm(context.Background(), deps, dir)
 	if err != nil {
 		t.Fatalf("DownloadAllNpm error: %v", err)
 	}
@@ -548,12 +588,12 @@ func TestDownloadAllNpm_Mock(t *testing.T) {
 }
 
 func TestDownloadAllNpm_NoNodeModules(t *testing.T) {
-	stubRunInSandbox(t, nil, nil)
+	stubRunInSandbox(t, nil, nil, nil)
 
 	dir := t.TempDir()
 	deps := map[string]string{"lodash": "*"}
 
-	err := DownloadAllNpm(context.Background(), deps, dir)
+	_, err := DownloadAllNpm(context.Background(), deps, dir)
 	if err == nil {
 		t.Error("expected error when node_modules not created, got nil")
 	}

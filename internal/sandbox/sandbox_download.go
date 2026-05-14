@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -124,7 +125,7 @@ func (d *DownloadSandbox) Start(ctx context.Context) error {
 // the same container via its ContainerID.
 func (d *DownloadSandbox) Run(ctx context.Context, command []string) ([]byte, error) {
 	if d.containerID == "" {
-		return nil, fmt.Errorf("download sandbox not started")
+		return nil, errors.New("download sandbox not started")
 	}
 	args := append([]string{"exec", "--workdir=" + DownloadOutMountPath, d.containerID}, command...)
 	cmd := execCommand(ctx, "docker", args...)
