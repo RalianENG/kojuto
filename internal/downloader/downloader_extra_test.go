@@ -3,31 +3,46 @@ package downloader
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"slices"
 	"testing"
 
+	"github.com/RalianENG/kojuto/internal/sandbox"
 	"github.com/RalianENG/kojuto/internal/types"
 )
 
 // ---------------------------------------------------------------------------
-// Mock exec command using TestHelperProcess pattern
+// runInSandbox stub
+//
+// The downloader no longer execs pip/npm directly — every registry command
+// goes through runInSandbox, which in production drives a DownloadSandbox
+// container. Tests swap it for a stub so they never touch Docker.
 // ---------------------------------------------------------------------------
 
-func fakeExecCommand(ctx context.Context, name string, args ...string) *exec.Cmd {
-	cs := []string{"-test.run=TestHelperProcess", "--", name}
-	cs = append(cs, args...)
-	cmd := exec.CommandContext(ctx, os.Args[0], cs...)
-	cmd.Env = []string{"GO_WANT_HELPER_PROCESS=1"}
-	return cmd
+// recordedRun captures what the runInSandbox stub was called with.
+type recordedRun struct {
+	calls       int
+	lastDir     string
+	lastCommand []string
 }
 
-func TestHelperProcess(_ *testing.T) {
-	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
-		return
+// stubRunInSandbox swaps runInSandbox for the duration of the test with a stub
+// that records its arguments and returns the given output/error, restoring the
+// original on cleanup.
+func stubRunInSandbox(t *testing.T, out []byte, err error) *recordedRun {
+	t.Helper()
+	rec := &recordedRun{}
+	orig := runInSandbox
+	runInSandbox = func(_ context.Context, hostOutDir string, command []string) ([]byte, error) {
+		rec.calls++
+		rec.lastDir = hostOutDir
+		rec.lastCommand = command
+		return out, err
 	}
-	os.Exit(0)
+	t.Cleanup(func() { runInSandbox = orig })
+	return rec
 }
 
 // ---------------------------------------------------------------------------
@@ -73,6 +88,22 @@ func TestVerifyDownload_BadDir(t *testing.T) {
 	_, err := verifyDownload("/nonexistent_dir_12345", "pkg")
 	if err == nil {
 		t.Error("expected error for nonexistent dir, got nil")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// pypiDownloadArgs
+// ---------------------------------------------------------------------------
+
+func TestPypiDownloadArgs_TargetsMountPath(t *testing.T) {
+	args := pypiDownloadArgs()
+	idx := slices.Index(args, "-d")
+	if idx < 0 || idx == len(args)-1 {
+		t.Fatalf("pypiDownloadArgs missing '-d <dir>': %v", args)
+	}
+	if args[idx+1] != sandbox.DownloadOutMountPath {
+		t.Errorf("pip download dir = %q, want %q (the sandbox mount path)",
+			args[idx+1], sandbox.DownloadOutMountPath)
 	}
 }
 
@@ -228,13 +259,11 @@ func TestDownload_InvalidVersion(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// downloadPyPI — mocked exec
+// downloadPyPI — sandbox stubbed
 // ---------------------------------------------------------------------------
 
 func TestDownloadPyPI_Mock(t *testing.T) {
-	origCmd := execCommand
-	execCommand = fakeExecCommand
-	defer func() { execCommand = origCmd }()
+	rec := stubRunInSandbox(t, nil, nil)
 
 	dir := t.TempDir()
 	// Create a fake downloaded file so verifyDownload succeeds.
@@ -249,12 +278,19 @@ func TestDownloadPyPI_Mock(t *testing.T) {
 	if got != dir {
 		t.Errorf("downloadPyPI returned %q, want %q", got, dir)
 	}
+	if rec.lastDir != dir {
+		t.Errorf("runInSandbox hostOutDir = %q, want %q", rec.lastDir, dir)
+	}
+	if len(rec.lastCommand) == 0 || rec.lastCommand[0] != "pip" {
+		t.Errorf("runInSandbox command = %v, want it to start with 'pip'", rec.lastCommand)
+	}
+	if !slices.Contains(rec.lastCommand, "pkg==1.0.0") {
+		t.Errorf("runInSandbox command = %v, want it to contain 'pkg==1.0.0'", rec.lastCommand)
+	}
 }
 
 func TestDownloadPyPI_NoVersion(t *testing.T) {
-	origCmd := execCommand
-	execCommand = fakeExecCommand
-	defer func() { execCommand = origCmd }()
+	rec := stubRunInSandbox(t, nil, nil)
 
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "pkg-2.0.0.whl"), []byte("fake"), 0o644); err != nil {
@@ -268,12 +304,14 @@ func TestDownloadPyPI_NoVersion(t *testing.T) {
 	if got != dir {
 		t.Errorf("downloadPyPI returned %q, want %q", got, dir)
 	}
+	// No version pin: the bare package name is the target.
+	if !slices.Contains(rec.lastCommand, "pkg") {
+		t.Errorf("runInSandbox command = %v, want it to contain 'pkg'", rec.lastCommand)
+	}
 }
 
 func TestDownloadPyPI_EmptyDir(t *testing.T) {
-	origCmd := execCommand
-	execCommand = fakeExecCommand
-	defer func() { execCommand = origCmd }()
+	stubRunInSandbox(t, nil, nil)
 
 	dir := t.TempDir()
 	// No files — verifyDownload should fail.
@@ -283,14 +321,26 @@ func TestDownloadPyPI_EmptyDir(t *testing.T) {
 	}
 }
 
+func TestDownloadPyPI_SandboxError(t *testing.T) {
+	stubRunInSandbox(t, []byte("boom"), errors.New("download command failed"))
+
+	dir := t.TempDir()
+	// Even with a downloaded file present, a sandbox failure must surface.
+	if err := os.WriteFile(filepath.Join(dir, "pkg-1.0.0.whl"), []byte("fake"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := downloadPyPI(context.Background(), "pkg", "1.0.0", dir)
+	if err == nil {
+		t.Error("expected error when the download sandbox fails, got nil")
+	}
+}
+
 // ---------------------------------------------------------------------------
-// downloadNpm — mocked exec
+// downloadNpm — sandbox stubbed
 // ---------------------------------------------------------------------------
 
 func TestDownloadNpm_Mock(t *testing.T) {
-	origCmd := execCommand
-	execCommand = fakeExecCommand
-	defer func() { execCommand = origCmd }()
+	rec := stubRunInSandbox(t, nil, nil)
 
 	dir := t.TempDir()
 	// Create node_modules so the post-install check passes.
@@ -305,12 +355,29 @@ func TestDownloadNpm_Mock(t *testing.T) {
 	if got != dir {
 		t.Errorf("downloadNpm returned %q, want %q", got, dir)
 	}
+	wantCmd := []string{"npm", "install", "--ignore-scripts"}
+	if !slices.Equal(rec.lastCommand, wantCmd) {
+		t.Errorf("runInSandbox command = %v, want %v", rec.lastCommand, wantCmd)
+	}
+
+	// The staging package.json must be written into destDir, which is what
+	// gets bind-mounted into the sandbox.
+	data, err := os.ReadFile(filepath.Join(dir, "package.json"))
+	if err != nil {
+		t.Fatalf("reading staging package.json: %v", err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("staging package.json is not valid JSON: %v", err)
+	}
+	deps, ok := parsed["dependencies"].(map[string]any)
+	if !ok || deps["lodash"] != "4.17.21" {
+		t.Errorf("staging package.json dependencies = %v, want lodash@4.17.21", parsed["dependencies"])
+	}
 }
 
 func TestDownloadNpm_NoVersion(t *testing.T) {
-	origCmd := execCommand
-	execCommand = fakeExecCommand
-	defer func() { execCommand = origCmd }()
+	stubRunInSandbox(t, nil, nil)
 
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, "node_modules"), 0o755); err != nil {
@@ -324,12 +391,23 @@ func TestDownloadNpm_NoVersion(t *testing.T) {
 	if got != dir {
 		t.Errorf("downloadNpm returned %q, want %q", got, dir)
 	}
+	// No version: dependency resolves to "*".
+	data, err := os.ReadFile(filepath.Join(dir, "package.json"))
+	if err != nil {
+		t.Fatalf("reading staging package.json: %v", err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("staging package.json is not valid JSON: %v", err)
+	}
+	deps, _ := parsed["dependencies"].(map[string]any)
+	if deps["express"] != "*" {
+		t.Errorf("staging package.json dependencies[express] = %v, want '*'", deps["express"])
+	}
 }
 
 func TestDownloadNpm_NoNodeModules(t *testing.T) {
-	origCmd := execCommand
-	execCommand = fakeExecCommand
-	defer func() { execCommand = origCmd }()
+	stubRunInSandbox(t, nil, nil)
 
 	dir := t.TempDir()
 	// Don't create node_modules — should error.
@@ -339,14 +417,25 @@ func TestDownloadNpm_NoNodeModules(t *testing.T) {
 	}
 }
 
+func TestDownloadNpm_SandboxError(t *testing.T) {
+	stubRunInSandbox(t, []byte("npm err"), errors.New("download command failed"))
+
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "node_modules"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := downloadNpm(context.Background(), "lodash", "4.17.21", dir)
+	if err == nil {
+		t.Error("expected error when the download sandbox fails, got nil")
+	}
+}
+
 // ---------------------------------------------------------------------------
-// Download full path via mock (pypi and npm)
+// Download full path via stub (pypi and npm)
 // ---------------------------------------------------------------------------
 
 func TestDownload_PyPI_Mock(t *testing.T) {
-	origCmd := execCommand
-	execCommand = fakeExecCommand
-	defer func() { execCommand = origCmd }()
+	stubRunInSandbox(t, nil, nil)
 
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "requests-2.31.0-py3-none-any.whl"), []byte("whl"), 0o644); err != nil {
@@ -363,9 +452,7 @@ func TestDownload_PyPI_Mock(t *testing.T) {
 }
 
 func TestDownload_Npm_Mock(t *testing.T) {
-	origCmd := execCommand
-	execCommand = fakeExecCommand
-	defer func() { execCommand = origCmd }()
+	stubRunInSandbox(t, nil, nil)
 
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, "node_modules"), 0o755); err != nil {
@@ -382,13 +469,11 @@ func TestDownload_Npm_Mock(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// DownloadAll — mocked exec
+// DownloadAll — sandbox stubbed
 // ---------------------------------------------------------------------------
 
 func TestDownloadAll_Mock(t *testing.T) {
-	origCmd := execCommand
-	execCommand = fakeExecCommand
-	defer func() { execCommand = origCmd }()
+	rec := stubRunInSandbox(t, nil, nil)
 
 	dir := t.TempDir()
 	targets := []string{"requests==2.31.0", "flask==3.0.0"}
@@ -397,16 +482,29 @@ func TestDownloadAll_Mock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DownloadAll error: %v", err)
 	}
+	// All targets go into the single pip invocation.
+	for _, target := range targets {
+		if !slices.Contains(rec.lastCommand, target) {
+			t.Errorf("runInSandbox command = %v, want it to contain %q", rec.lastCommand, target)
+		}
+	}
+}
+
+func TestDownloadAll_SandboxError(t *testing.T) {
+	stubRunInSandbox(t, []byte("pip err"), errors.New("download command failed"))
+
+	err := DownloadAll(context.Background(), []string{"requests==2.31.0"}, t.TempDir())
+	if err == nil {
+		t.Error("expected error when the download sandbox fails, got nil")
+	}
 }
 
 // ---------------------------------------------------------------------------
-// DownloadAllNpm — mocked exec
+// DownloadAllNpm — sandbox stubbed
 // ---------------------------------------------------------------------------
 
 func TestDownloadAllNpm_Mock(t *testing.T) {
-	origCmd := execCommand
-	execCommand = fakeExecCommand
-	defer func() { execCommand = origCmd }()
+	stubRunInSandbox(t, nil, nil)
 
 	dir := t.TempDir()
 	// Create node_modules so the post-install check passes.
@@ -450,9 +548,7 @@ func TestDownloadAllNpm_Mock(t *testing.T) {
 }
 
 func TestDownloadAllNpm_NoNodeModules(t *testing.T) {
-	origCmd := execCommand
-	execCommand = fakeExecCommand
-	defer func() { execCommand = origCmd }()
+	stubRunInSandbox(t, nil, nil)
 
 	dir := t.TempDir()
 	deps := map[string]string{"lodash": "*"}

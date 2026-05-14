@@ -114,6 +114,23 @@ func resolveRuntime() string {
 	return RuntimeDefault
 }
 
+// writeSeccompFile writes the embedded seccomp profile to a fresh temp
+// dir and returns the docker --security-opt value plus the temp dir
+// path. The caller owns cleanup of the returned dir. Shared by the
+// analysis Sandbox and the DownloadSandbox so both run under the same
+// restrictive seccomp profile.
+func writeSeccompFile() (opt, dir string, err error) {
+	dir, err = os.MkdirTemp("", "kojuto-seccomp-*")
+	if err != nil {
+		return "", "", fmt.Errorf("creating seccomp temp dir: %w", err)
+	}
+	path := filepath.Join(dir, "seccomp.json")
+	if err := os.WriteFile(path, seccompProfile, 0o444); err != nil {
+		return "", "", fmt.Errorf("writing seccomp profile: %w", err)
+	}
+	return "seccomp=" + path, dir, nil
+}
+
 // writeSeccompProfile writes the embedded seccomp profile and the empty
 // /.dockerenv mask file to a per-scan temp dir, then returns the
 // --security-opt flag value to pass to docker. The mask path is stashed in
@@ -124,16 +141,11 @@ func resolveRuntime() string {
 // using a char device would itself be a fingerprint that distinguishes
 // kojuto's sandbox from a real Docker container.
 func (s *Sandbox) writeSeccompProfile() (string, error) {
-	dir, err := os.MkdirTemp("", "kojuto-seccomp-*")
+	opt, dir, err := writeSeccompFile()
 	if err != nil {
-		return "", fmt.Errorf("creating seccomp temp dir: %w", err)
+		return "", err
 	}
 	s.seccompDir = dir
-
-	path := filepath.Join(dir, "seccomp.json")
-	if err := os.WriteFile(path, seccompProfile, 0o444); err != nil {
-		return "", fmt.Errorf("writing seccomp profile: %w", err)
-	}
 
 	dockerenvMask := filepath.Join(dir, "dockerenv-mask")
 	if err := os.WriteFile(dockerenvMask, nil, 0o444); err != nil {
@@ -141,7 +153,7 @@ func (s *Sandbox) writeSeccompProfile() (string, error) {
 	}
 	s.dockerenvMask = dockerenvMask
 
-	return "seccomp=" + path, nil
+	return opt, nil
 }
 
 // containerArgs builds the common Docker flags for both Create and Start.

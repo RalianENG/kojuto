@@ -6,11 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 
+	"github.com/RalianENG/kojuto/internal/sandbox"
 	"github.com/RalianENG/kojuto/internal/types"
 )
 
@@ -19,8 +19,26 @@ var (
 	validVersion = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9.*!+_-]*$`)
 )
 
-// execCommand is a package-level variable for exec.CommandContext, allowing tests to mock it.
-var execCommand = exec.CommandContext
+// runInDownloadSandbox spins up a hardened, network-enabled DownloadSandbox
+// that bind-mounts hostOutDir at the container's /out, runs command inside it
+// (working directory /out), and reaps the container afterward. pip and npm
+// run attacker-influenced code during a download — registry metadata parsers,
+// dependency resolvers, tarball extractors (a real path-traversal surface) —
+// so the download phase is contained to this ephemeral container instead of
+// executing on the host.
+func runInDownloadSandbox(ctx context.Context, hostOutDir string, command []string) ([]byte, error) {
+	ds := sandbox.NewDownloadSandbox(hostOutDir)
+	if err := ds.Start(ctx); err != nil {
+		return nil, fmt.Errorf("starting download sandbox: %w", err)
+	}
+	// Reap the container even if ctx is already cancelled.
+	defer ds.Cleanup(context.Background())
+	return ds.Run(ctx, command)
+}
+
+// runInSandbox is the seam downloader tests replace so they never touch
+// Docker; production points it at the real DownloadSandbox-backed runner.
+var runInSandbox = runInDownloadSandbox
 
 // ValidatePackage checks that the package name and version are safe.
 func ValidatePackage(pkg, version string) error {
@@ -52,8 +70,10 @@ func Download(ctx context.Context, pkg, version, destDir, ecosystem string) (str
 	}
 }
 
-// pypiDownloadArgs returns the common pip download arguments for Linux-compatible wheels.
-func pypiDownloadArgs(destDir string) []string {
+// pypiDownloadArgs returns the common pip download arguments for
+// Linux-compatible wheels. Wheels land in DownloadOutMountPath — the staging
+// directory bind-mounted into the download sandbox — not a host path.
+func pypiDownloadArgs() []string {
 	return []string{
 		"download", "--only-binary=:all:",
 		"--platform", "manylinux2014_x86_64",
@@ -65,19 +85,19 @@ func pypiDownloadArgs(destDir string) []string {
 		"--abi", "cp312",
 		"--abi", "abi3",
 		"--abi", "none",
-		"-d", destDir,
+		"-d", sandbox.DownloadOutMountPath,
 	}
 }
 
-// DownloadAll fetches multiple PyPI packages in a single pip invocation.
-// This is significantly faster than calling Download for each package individually.
+// DownloadAll fetches multiple PyPI packages in a single pip invocation inside
+// a download sandbox. This is significantly faster than calling Download for
+// each package individually.
 func DownloadAll(ctx context.Context, targets []string, destDir string) error {
-	args := pypiDownloadArgs(destDir)
+	args := append([]string{"pip"}, pypiDownloadArgs()...)
 	args = append(args, targets...)
-	cmd := execCommand(ctx, "pip", args...)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	out, err := runInSandbox(ctx, destDir, args)
+	os.Stderr.Write(out)
+	if err != nil {
 		return fmt.Errorf("pip download failed: %w", err)
 	}
 	return nil
@@ -89,21 +109,22 @@ func downloadPyPI(ctx context.Context, pkg, version, destDir string) (string, er
 		target = pkg + "==" + version
 	}
 
-	args := pypiDownloadArgs(destDir)
+	args := append([]string{"pip"}, pypiDownloadArgs()...)
 	args = append(args, target)
-	cmd := execCommand(ctx, "pip", args...)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
+	out, err := runInSandbox(ctx, destDir, args)
+	os.Stderr.Write(out)
+	if err != nil {
 		return "", fmt.Errorf("pip download failed: %w", err)
 	}
 
 	return verifyDownload(destDir, pkg)
 }
 
-// DownloadAllNpm fetches multiple npm packages in a single npm install invocation.
-func DownloadAllNpm(ctx context.Context, deps map[string]string, destDir string) error {
+// writeStagingPackageJSON writes a minimal staging package.json into destDir
+// with the given dependency set. destDir is bind-mounted into the download
+// sandbox, so npm install inside the container picks this up as the project
+// manifest.
+func writeStagingPackageJSON(destDir string, deps map[string]string) error {
 	pkgData := map[string]interface{}{
 		"name":         "kojuto-staging",
 		"private":      true,
@@ -116,11 +137,18 @@ func DownloadAllNpm(ctx context.Context, deps map[string]string, destDir string)
 	if err := os.WriteFile(filepath.Join(destDir, "package.json"), pkgJSON, 0o644); err != nil {
 		return fmt.Errorf("writing staging package.json: %w", err)
 	}
-	cmd := execCommand(ctx, "npm", "install", "--ignore-scripts")
-	cmd.Dir = destDir
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	return nil
+}
+
+// DownloadAllNpm fetches multiple npm packages in a single npm install
+// invocation inside a download sandbox.
+func DownloadAllNpm(ctx context.Context, deps map[string]string, destDir string) error {
+	if err := writeStagingPackageJSON(destDir, deps); err != nil {
+		return err
+	}
+	out, err := runInSandbox(ctx, destDir, []string{"npm", "install", "--ignore-scripts"})
+	os.Stderr.Write(out)
+	if err != nil {
 		return fmt.Errorf("npm install (batch staging) failed: %w", err)
 	}
 	nmDir := filepath.Join(destDir, "node_modules")
@@ -131,32 +159,21 @@ func DownloadAllNpm(ctx context.Context, deps map[string]string, destDir string)
 }
 
 func downloadNpm(ctx context.Context, pkg, version, destDir string) (string, error) {
-	// Create a staging project with the target as a dependency.
-	// npm install --ignore-scripts resolves the full dep tree on the host
-	// without running any lifecycle scripts. The resulting node_modules is
-	// then mounted into the sandbox container, where lifecycle scripts
-	// (preinstall, postinstall, etc.) are re-executed under strace.
-	pkgData := map[string]interface{}{
-		"name":         "kojuto-staging",
-		"private":      true,
-		"dependencies": map[string]string{pkg: versionOrLatest(version)},
+	// Create a staging project with the target as a dependency. npm install
+	// --ignore-scripts resolves the full dep tree without running any
+	// lifecycle scripts. It runs inside the download sandbox because npm
+	// executes attacker-controlled registry metadata and unpacks
+	// attacker-controlled tarballs. The resulting node_modules is then
+	// mounted into the analysis sandbox, where lifecycle scripts (preinstall,
+	// postinstall, etc.) are re-executed under strace.
+	if err := writeStagingPackageJSON(destDir, map[string]string{pkg: versionOrLatest(version)}); err != nil {
+		return "", err
 	}
-	pkgJSON, err := json.Marshal(pkgData)
+
+	out, err := runInSandbox(ctx, destDir, []string{"npm", "install", "--ignore-scripts"})
+	os.Stderr.Write(out)
 	if err != nil {
-		return "", fmt.Errorf("marshaling staging package.json: %w", err)
-	}
-
-	if err := os.WriteFile(filepath.Join(destDir, "package.json"), pkgJSON, 0o644); err != nil {
-		return "", fmt.Errorf("writing staging package.json: %w", err)
-	}
-
-	cmd := execCommand(ctx, "npm", "install", "--ignore-scripts")
-	cmd.Dir = destDir
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("npm install (host staging) failed: %w", err)
+		return "", fmt.Errorf("npm install (sandbox staging) failed: %w", err)
 	}
 
 	// Verify node_modules was created.
