@@ -571,6 +571,16 @@ func classify(evt *types.SyscallEvent) {
 					" — recorded for forensic chain visibility; benign-looking query, " +
 					"no tunneling or exfil-service pattern detected."
 			}
+		} else if evt.DstPort == 53 {
+			// sendto/sendmsg to :53 with no parsed DNS query is still
+			// a DNS packet — the parser just failed to extract the
+			// query name from the message payload. Attributing to
+			// dns_lookup LOW instead of C2 HIGH prevents parser-miss
+			// FPs on every DNS resolution the sandbox observes.
+			evt.Category = types.CategoryDNSLookup
+			evt.Reason = "DNS packet to " + evt.DstAddr + ":53" +
+				" — query name not extracted by parser. Recorded at LOW for forensic " +
+				"chain visibility; the follow-up connect to the resolved IP is the C2 signal."
 		} else {
 			evt.Category = types.CategoryC2
 			evt.Reason = "Network data sent to " + evt.DstAddr + ":" + portStr(evt.DstPort) + "."

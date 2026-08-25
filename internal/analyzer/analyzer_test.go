@@ -1102,6 +1102,26 @@ func TestAnalyze_DnsLookupAloneStaysClean(t *testing.T) {
 	}
 }
 
+// TestClassify_SendtoPort53WithoutQuery documents that a sendmsg/
+// sendto to :53 with no parsed DNS query is still recorded as
+// dns_lookup LOW, not c2_communication HIGH. The parser sometimes
+// fails to extract the query name from the message payload (e.g.
+// non-standard record types, EDNS0, sendmsg iovec across pages);
+// attributing to C2 would flip the verdict on every parser miss.
+// The port-53 destination is sufficient to classify as DNS.
+func TestClassify_SendtoPort53WithoutQuery(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventSendmsg, DstAddr: "8.8.8.8", DstPort: 53, Family: 2},
+	}
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictClean {
+		t.Errorf("expected clean for :53 sendmsg without parsed query, got %s", verdict)
+	}
+	if len(filtered) != 1 || filtered[0].Category != types.CategoryDNSLookup {
+		t.Errorf("expected single dns_lookup event, got %v", filtered)
+	}
+}
+
 // TestAnalyze_DnsLookupThenConnect_C2Wins documents that a DNS
 // lookup followed by a real outbound connect fires HIGH on the
 // connect. Two events: one DNSLookup LOW + one C2 HIGH. Verdict
