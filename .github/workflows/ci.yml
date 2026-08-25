@@ -27,7 +27,14 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v7
         with:
-          version: v2.1.6
+          # v2.1.6 (Apr 2025) predates Go 1.25.0 (Aug 2025). When the
+          # module requires Go 1.25 and setup-go installs `stable`, the
+          # older lint binary's internal typechecker fails to resolve
+          # third-party imports (`undefined: yaml` on a valid
+          # `gopkg.in/yaml.v3` import). Pin to a version that supports
+          # Go 1.25's module graph. Update this in lock-step with any
+          # future go.mod toolchain bumps.
+          version: v2.5.0
           install-mode: goinstall
 
   # ──────────────────────────────────────────────
