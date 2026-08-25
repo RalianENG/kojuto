@@ -441,6 +441,14 @@ func (s *Sandbox) Create(ctx context.Context) error {
 // The caller is expected to abort the scan (and surface "inconclusive") on
 // any error returned here. /.dockerenv masking is handled at create time
 // via bind mount (see writeSeccompProfile + containerArgs).
+//
+// Error-path cleanup: once `docker start` succeeds the container is in
+// Up state, and CleanupStaleSandboxContainers deliberately skips Up-state
+// containers to protect concurrent scans. If a subsequent prepare step
+// fails and this function returns error, the caller has no *Sandbox
+// pointer to Cleanup(), so the container would leak permanently. The
+// defer below fires only on the error path (started stays false) and
+// tears down the partial sandbox before returning.
 func (s *Sandbox) StartPaused(ctx context.Context) error {
 	startCmd := execCommand(ctx, "docker", "start", s.containerID)
 	startCmd.Stdout = io.Discard
@@ -450,6 +458,19 @@ func (s *Sandbox) StartPaused(ctx context.Context) error {
 		return fmt.Errorf("docker start failed: %w", err)
 	}
 
+	started := false
+	// contextcheck suppressed: rollbackPartialStart deliberately uses a
+	// fresh context.Background() with its own timeout because the parent
+	// ctx is typically already canceled by the time the rollback fires
+	// (that's what caused prepare to fail). Inheriting the canceled
+	// parent would make docker rm -f fail immediately, defeating the
+	// rollback.
+	defer func() { //nolint:contextcheck // see comment above
+		if !started {
+			s.rollbackPartialStart()
+		}
+	}()
+
 	if err := s.prepareSandboxState(ctx); err != nil {
 		return err
 	}
@@ -458,12 +479,13 @@ func (s *Sandbox) StartPaused(ctx context.Context) error {
 		return fmt.Errorf("immediate pause after start: %w", err)
 	}
 
+	started = true
 	return nil
 }
 
 // Start creates and starts the sandbox container (convenience for strace-container mode
 // which does not need the pause-before-probe pattern). See StartPaused for the
-// rationale on surfacing prep errors.
+// rationale on surfacing prep errors AND on the error-path cleanup below.
 func (s *Sandbox) Start(ctx context.Context) error {
 	if err := s.Create(ctx); err != nil {
 		return err
@@ -477,7 +499,45 @@ func (s *Sandbox) Start(ctx context.Context) error {
 		return fmt.Errorf("docker start failed: %w", err)
 	}
 
-	return s.prepareSandboxState(ctx)
+	started := false
+	// contextcheck suppressed: rollbackPartialStart deliberately uses a
+	// fresh context.Background() with its own timeout because the parent
+	// ctx is typically already canceled by the time the rollback fires
+	// (that's what caused prepare to fail). Inheriting the canceled
+	// parent would make docker rm -f fail immediately, defeating the
+	// rollback.
+	defer func() { //nolint:contextcheck // see comment above
+		if !started {
+			s.rollbackPartialStart()
+		}
+	}()
+
+	if err := s.prepareSandboxState(ctx); err != nil {
+		return err
+	}
+
+	started = true
+	return nil
+}
+
+// rollbackPartialStart removes a container that was successfully started
+// but whose post-start preparation (prepareSandboxState, immediate Pause)
+// failed. Runs from a deferred error path in Start / StartPaused where
+// the caller does not receive a *Sandbox pointer and thus never
+// registers the outer Cleanup defer. Uses its own timeout because the
+// parent context that caused the failure is typically already canceled.
+// Errors are logged but not returned — the original prepare error is
+// what the caller needs to see.
+func (s *Sandbox) rollbackPartialStart() {
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rm := execCommand(cleanupCtx, "docker", "rm", "-f", s.containerID)
+	rm.Stdout = io.Discard
+	rm.Stderr = io.Discard
+	if err := rm.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "[!] Rollback of partial sandbox %s failed: %v\n",
+			s.containerID, err)
+	}
 }
 
 // prepareSandboxState runs the post-start container setup that every scan
