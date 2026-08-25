@@ -42,7 +42,7 @@ func (s *StraceFallback) StartWithPID(pid uint32) error {
 	// noctx suppressed: strace lifecycle is managed explicitly via
 	// Close() → Process.Kill() → Wait(). Plumbing a context through
 	// NewStrace/StartWithPID would add an API change with no
-	// behavioural improvement — the process is already deterministically
+	// behavioral improvement — the process is already deterministically
 	// terminated at scan end.
 	s.cmd = exec.Command("strace", //nolint:noctx // see comment above
 		"-f",
