@@ -408,6 +408,8 @@ func categoryShortDesc(c string) string {
 		return "eval / Function() / vm.runIn*Context (audit hook)"
 	case types.CategoryUnknownBinary:
 		return "execve without positive attack signature (info)"
+	case types.CategoryDNSLookup:
+		return "isolated name resolution (info; C2 fires on the follow-up connect)"
 	}
 	return c
 }
@@ -518,38 +520,10 @@ func buildRemediation(catSet map[string]bool) string {
 func classify(evt *types.SyscallEvent) {
 	switch evt.Syscall {
 	case types.EventConnect:
-		switch {
-		case isKnownDoHServer(evt.DstAddr) && evt.DstPort == 443:
-			evt.Category = types.CategoryDNSTunnel
-			evt.Reason = "Connection to known DNS-over-HTTPS server " + evt.DstAddr + ":443" +
-				" — may be used for DNS tunneling to bypass port-53 monitoring."
-		case evt.DstPort == 53:
-			evt.Category = types.CategoryC2
-			evt.Reason = "DNS resolver connection to " + evt.DstAddr + ":53" +
-				" — package attempted hostname resolution, indicating intent to " +
-				"communicate with an external server."
-		default:
-			evt.Category = types.CategoryC2
-			evt.Reason = "Outbound connection to " + evt.DstAddr + ":" + portStr(evt.DstPort) +
-				" — packages should not make network connections during install or import."
-		}
+		classifyConnect(evt)
 
 	case types.EventSendto, types.EventSendmsg, types.EventSendmmsg:
-		if evt.DNSQuery != "" {
-			if svc := matchExfilService(evt.DNSQuery); svc != "" {
-				evt.Category = types.CategoryDataExfil
-				evt.Reason = "DNS resolution of known exfiltration service (" + svc +
-					"): " + evt.DNSQuery +
-					" — commonly used by threat actors to exfiltrate stolen data."
-			} else {
-				evt.Category = types.CategoryDNSTunnel
-				evt.Reason = "DNS query to " + evt.DNSQuery +
-					" contains high-entropy subdomains, indicating data exfiltration via DNS tunneling."
-			}
-		} else {
-			evt.Category = types.CategoryC2
-			evt.Reason = "Network data sent to " + evt.DstAddr + ":" + portStr(evt.DstPort) + "."
-		}
+		classifySend(evt)
 
 	case types.EventBind, types.EventListen, types.EventAccept:
 		evt.Category = types.CategoryBackdoor
@@ -604,6 +578,76 @@ var persistenceTargets = []string{
 	"/.bashrc", "/.bash_profile", "/.zshrc", "/.profile",
 	"/.bash_history", "/.zsh_history",
 	"/crontab",
+}
+
+// classifyConnect handles TCP/UDP connect events. Split out from
+// classify() so the growth of DNS-specific branches doesn't push the
+// parent function over the linter's cognitive-complexity budget.
+func classifyConnect(evt *types.SyscallEvent) {
+	switch {
+	case isKnownDoHServer(evt.DstAddr) && evt.DstPort == 443:
+		evt.Category = types.CategoryDNSTunnel
+		evt.Reason = "Connection to known DNS-over-HTTPS server " + evt.DstAddr + ":443" +
+			" — may be used for DNS tunneling to bypass port-53 monitoring."
+	case evt.DstPort == 53:
+		// Isolated name resolution is NOT C2. Under --network=none
+		// the lookup never completes, and legitimate defensive
+		// probes (getaddrinfo at import, glibc NSS lookups) fire
+		// this syscall unconditionally. The real C2 signal is the
+		// follow-up connect() to the resolved IP, which the default
+		// branch catches at HIGH. Recording DNS lookups at LOW
+		// preserves the forensic chain but keeps the verdict honest.
+		evt.Category = types.CategoryDNSLookup
+		evt.Reason = "DNS resolver connection to " + evt.DstAddr + ":53" +
+			" — name resolution attempt. Recorded for forensic chain visibility; " +
+			"the follow-up connect to the resolved IP is the actual C2 signal."
+	default:
+		evt.Category = types.CategoryC2
+		evt.Reason = "Outbound connection to " + evt.DstAddr + ":" + portStr(evt.DstPort) +
+			" — packages should not make network connections during install or import."
+	}
+}
+
+// classifySend handles sendto/sendmsg/sendmmsg events. Same rationale
+// as classifyConnect — keeps classify() below the complexity budget.
+func classifySend(evt *types.SyscallEvent) {
+	switch {
+	case evt.DNSQuery != "" && matchExfilService(evt.DNSQuery) != "":
+		svc := matchExfilService(evt.DNSQuery)
+		evt.Category = types.CategoryDataExfil
+		evt.Reason = "DNS resolution of known exfiltration service (" + svc +
+			"): " + evt.DNSQuery +
+			" — commonly used by threat actors to exfiltrate stolen data."
+	case evt.DNSQuery != "" && isDNSTunnel(evt.DNSQuery):
+		evt.Category = types.CategoryDNSTunnel
+		evt.Reason = "DNS query to " + evt.DNSQuery +
+			" contains high-entropy subdomains, indicating data exfiltration via DNS tunneling."
+	case evt.DNSQuery != "":
+		// Benign-looking DNS query that reached this branch because
+		// the resolver IP is external (not loopback, which
+		// isBenignNetwork already filters). Not tunneling and not a
+		// known exfil service — record at LOW so the query domain is
+		// visible in the forensic report without flipping the verdict
+		// on legit lookups.
+		evt.Category = types.CategoryDNSLookup
+		evt.Reason = "DNS query to " + evt.DNSQuery +
+			" via " + evt.DstAddr + ":" + portStr(evt.DstPort) +
+			" — recorded for forensic chain visibility; benign-looking query, " +
+			"no tunneling or exfil-service pattern detected."
+	case evt.DstPort == 53:
+		// sendto/sendmsg to :53 with no parsed DNS query is still a
+		// DNS packet — the parser just failed to extract the query
+		// name from the message payload. Attributing to dns_lookup
+		// LOW instead of C2 HIGH prevents parser-miss FPs on every
+		// DNS resolution the sandbox observes.
+		evt.Category = types.CategoryDNSLookup
+		evt.Reason = "DNS packet to " + evt.DstAddr + ":53" +
+			" — query name not extracted by parser. Recorded at LOW for forensic " +
+			"chain visibility; the follow-up connect to the resolved IP is the C2 signal."
+	default:
+		evt.Category = types.CategoryC2
+		evt.Reason = "Network data sent to " + evt.DstAddr + ":" + portStr(evt.DstPort) + "."
+	}
 }
 
 func classifyOpenat(evt *types.SyscallEvent) {

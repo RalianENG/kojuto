@@ -1041,17 +1041,115 @@ func TestClassify_DoH_Google(t *testing.T) {
 }
 
 func TestClassify_DoH_NotPort443(t *testing.T) {
-	// DoH server on port 53 = regular DNS, not DoH.
+	// DoH server on port 53 = regular DNS, not DoH. Recorded as LOW
+	// (dns_lookup) — the follow-up connect to the resolved IP is
+	// what fires C2. See TestAnalyze_DnsLookupAloneStaysClean.
 	events := []types.SyscallEvent{
 		{Syscall: types.EventConnect, DstAddr: "1.1.1.1", DstPort: 53, Family: 2},
 	}
-	_, filtered := Analyze(events)
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictClean {
+		t.Errorf("expected clean for isolated :53 connect, got %s", verdict)
+	}
 	if len(filtered) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(filtered))
 	}
-	// Should be C2, not DNS tunnel (port 53 connect is already suspicious).
-	if filtered[0].Category != types.CategoryC2 {
-		t.Errorf("category = %q, want %q", filtered[0].Category, types.CategoryC2)
+	if filtered[0].Category != types.CategoryDNSLookup {
+		t.Errorf("category = %q, want %q", filtered[0].Category, types.CategoryDNSLookup)
+	}
+}
+
+// TestAnalyze_DnsLookupAloneStaysClean documents the DNS-lookup
+// demotion. An isolated connect(:53) or benign DNS query has no
+// harm on its own — the sandbox runs --network=none so resolution
+// never completes anyway. The real C2 signal is the follow-up
+// connect() to the resolved IP, which fires CategoryC2 at HIGH
+// independently. Recording the lookup at LOW keeps the forensic
+// chain visible without flipping the verdict on every getaddrinfo
+// probe that defensive code (npm registry ping, glibc NSS) fires.
+func TestAnalyze_DnsLookupAloneStaysClean(t *testing.T) {
+	cases := []struct {
+		name   string
+		events []types.SyscallEvent
+	}{
+		{
+			name: "connect to external DNS resolver on :53",
+			events: []types.SyscallEvent{
+				{Syscall: types.EventConnect, DstAddr: "1.1.1.1", DstPort: 53, Family: 2},
+			},
+		},
+		{
+			name: "benign DNS query to external resolver",
+			events: []types.SyscallEvent{
+				{Syscall: types.EventSendto, DstAddr: "8.8.8.8", DstPort: 53, Family: 2,
+					DNSQuery: "registry.npmjs.org"},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			verdict, filtered := Analyze(tc.events)
+			if verdict != types.VerdictClean {
+				t.Errorf("expected clean for isolated DNS lookup, got %s", verdict)
+			}
+			if len(filtered) != 1 {
+				t.Fatalf("expected 1 forensic event, got %d", len(filtered))
+			}
+			if filtered[0].Category != types.CategoryDNSLookup {
+				t.Errorf("category = %q, want %q", filtered[0].Category, types.CategoryDNSLookup)
+			}
+		})
+	}
+}
+
+// TestClassify_SendtoPort53WithoutQuery documents that a sendmsg/
+// sendto to :53 with no parsed DNS query is still recorded as
+// dns_lookup LOW, not c2_communication HIGH. The parser sometimes
+// fails to extract the query name from the message payload (e.g.
+// non-standard record types, EDNS0, sendmsg iovec across pages);
+// attributing to C2 would flip the verdict on every parser miss.
+// The port-53 destination is sufficient to classify as DNS.
+func TestClassify_SendtoPort53WithoutQuery(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventSendmsg, DstAddr: "8.8.8.8", DstPort: 53, Family: 2},
+	}
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictClean {
+		t.Errorf("expected clean for :53 sendmsg without parsed query, got %s", verdict)
+	}
+	if len(filtered) != 1 || filtered[0].Category != types.CategoryDNSLookup {
+		t.Errorf("expected single dns_lookup event, got %v", filtered)
+	}
+}
+
+// TestAnalyze_DnsLookupThenConnect_C2Wins documents that a DNS
+// lookup followed by a real outbound connect fires HIGH on the
+// connect. Two events: one DNSLookup LOW + one C2 HIGH. Verdict
+// is SUSPICIOUS from the connect alone.
+func TestAnalyze_DnsLookupThenConnect_C2Wins(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventSendto, DstAddr: "8.8.8.8", DstPort: 53, Family: 2,
+			DNSQuery: "attacker.example.com"},
+		{Syscall: types.EventConnect, DstAddr: "203.0.113.7", DstPort: 443, Family: 2},
+	}
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictSuspicious {
+		t.Errorf("expected suspicious when TCP connect follows DNS, got %s", verdict)
+	}
+	var sawC2, sawLookup bool
+	for _, e := range filtered {
+		switch e.Category {
+		case types.CategoryC2:
+			sawC2 = true
+		case types.CategoryDNSLookup:
+			sawLookup = true
+		}
+	}
+	if !sawC2 {
+		t.Errorf("expected C2 event on the resolved-IP connect, got %v", filtered)
+	}
+	if !sawLookup {
+		t.Errorf("expected DNSLookup event on the DNS query for forensic chain, got %v", filtered)
 	}
 }
 

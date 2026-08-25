@@ -83,6 +83,16 @@ const (
 	// AST patterns): the dynamic rule also catches runtime-decoded
 	// target paths that static cannot resolve.
 	CategoryLibraryHijack = "library_hijacking"
+	// CategoryDNSLookup records isolated name-resolution activity: a
+	// connect() to :53 or a benign-looking DNS query payload. The real
+	// C2 signal is the follow-up connect() to the resolved IP, which
+	// fires the HIGH CategoryC2 rule independently. Under
+	// --network=none the resolution never completes anyway, so a bare
+	// DNS lookup carries no C2 harm on its own — logging it at LOW
+	// keeps the forensic chain visible without flipping the verdict on
+	// legitimate defensive connectivity probes (getaddrinfo at import
+	// time, glibc NSS lookups) that every scan otherwise trips.
+	CategoryDNSLookup = "dns_lookup"
 )
 
 // Category severity tiers drive verdict assignment in analyzer.Analyze.
@@ -117,6 +127,7 @@ var CategorySeverity = map[string]string{
 	CategoryEvasion:          SeverityMedium,
 	CategoryDynamicExec:      SeverityLow,
 	CategoryUnknownBinary:    SeverityLow,
+	CategoryDNSLookup:        SeverityLow,
 }
 
 // Scan phases.

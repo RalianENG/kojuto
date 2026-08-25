@@ -175,7 +175,17 @@ linters:
         path: root\.go
       - linters:
           - staticcheck
-        text: "SA6000|SA4000|QF1002"
+        # SA5011 fires on `if x == nil { t.Fatal(...) }; use(x)` patterns
+        # in tests. `t.Fatal` calls runtime.Goexit so the deref never
+        # runs, but older staticcheck versions don't model that.
+        text: "SA6000|SA4000|SA5011|QF1002"
+      - linters:
+          - revive
+        # `package types` is the shared types package under test.
+        # revive's var-naming rule flags it as "meaningless" on test
+        # files; renaming would ripple across every importer.
+        path: internal/types/
+        text: "avoid meaningless package names"
     paths:
       - third_party$
       - builtin$

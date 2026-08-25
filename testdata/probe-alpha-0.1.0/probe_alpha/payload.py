@@ -128,6 +128,60 @@ def _backdoor_listener():
         pass
 
 
+def _pypi_library_hijack():
+    """[GAP] Write into another installed PyPI package's source tree.
+
+    The npm equivalent (library_hijacking on /install/node_modules/
+    <other_pkg>/) was added in CHANGELOG under [Unreleased]. The
+    PyPI side is explicitly documented as follow-up:
+
+      > The PyPI side (/usr/local/lib/python*/site-packages/) is
+      > intentionally out of scope for this rule — pip's wheel
+      > extraction during install legitimately writes many files
+      > across many package directories and needs a different
+      > discriminator; tracked as follow-up.
+
+    This test writes a backdoor stub into pip's own site-packages
+    directory. The harm fires when a later workflow imports pip —
+    outside kojuto's scan window. Placement is the only opportunity
+    to detect it.
+
+    In real supply chain incidents this is one of the most damaging
+    patterns: the malicious package installs, patches a widely-used
+    library like `requests` or `urllib3`, then removes itself.
+    Every subsequent import of the hijacked library runs the
+    backdoor.
+
+    Detection challenge: how to distinguish this from pip's own
+    wheel-extraction writes (which legitimately touch dozens of
+    site-packages directories per install)? Likely needs process
+    attribution (pip vs. probe-alpha) rather than path pattern.
+    """
+    hijack_targets = [
+        # pip is guaranteed to exist in the sandbox and be imported
+        # by every subsequent workflow. Its __init__.py is a small
+        # file so a patched version won't be obviously different.
+        "/usr/local/lib/python3.12/site-packages/pip/__init__.py",
+        # urllib3 is another high-value target (imported by
+        # requests, boto3, and hundreds of others).
+        "/usr/local/lib/python3.12/site-packages/urllib3/__init__.py",
+    ]
+    backdoor_stub = (
+        "\n# --- probe-alpha library-hijack marker (harmless test) ---\n"
+        "import os as _os\n"
+        "_os.environ.setdefault('PROBE_ALPHA_HIJACK', '1')\n"
+    )
+    for target in hijack_targets:
+        try:
+            # Append (not replace) to minimize disruption in case
+            # subsequent test setup expects the module to still
+            # import cleanly.
+            with open(target, "a") as f:
+                f.write(backdoor_stub)
+        except Exception:
+            continue
+
+
 # ============================================================
 # Main execution
 # ============================================================
@@ -140,3 +194,6 @@ _drop_stage2()
 
 # Open backdoor listener
 _backdoor_listener()
+
+# Attempt library hijacking — documented GAP for PyPI
+_pypi_library_hijack()

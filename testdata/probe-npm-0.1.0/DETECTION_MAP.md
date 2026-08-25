@@ -63,17 +63,31 @@ kojuto scan --local testdata/probe-npm-0.1.0/ -e npm
 | 33 | Read /proc/self/status | openat | `evasion` | index.js:sandboxDetect | CORE |
 | 34 | Read /sys/class/net | openat | `evasion` | index.js:sandboxDetect | CORE |
 
+### Boundary Tests (postinstall.js — GAP candidates)
+
+| # | TTP | Syscall | Expected Category | Source | Status |
+|---|-----|---------|-------------------|--------|--------|
+| 35 | WebAssembly.compile + Instance() with attacker-controlled bytes | mprotect(RWX) | **NONE** (filtered by V8 JIT rule) | postinstall.js:wasmRwxViaV8 | **GAP** |
+| 36 | `Object.prototype.__hook__ = fn` (prototype pollution) | *no syscall* | **NONE** (assignment produces no monitored event) | postinstall.js:prototypePollution | **GAP** |
+
 ## Coverage Summary
 
-| Category | CORE | NEW (audit hook) |
-|----------|------|-------------------|
-| c2_communication | 8 | — |
-| credential_access | 10 | — |
-| code_execution | 1 | — |
-| backdoor | 1 | — |
-| persistence | 1 | — |
-| dns_tunneling | 1 | — |
-| anti_forensics | 1 | — |
-| evasion | 2 | — |
-| dynamic_code_execution | — | 6 |
-| **Total** | **25** | **6** |
+| Category | CORE | NEW (audit hook) | GAP (documented) |
+|----------|------|-------------------|-------------------|
+| c2_communication | 8 | — | — |
+| credential_access | 10 | — | — |
+| code_execution | 1 | — | — |
+| backdoor | 1 | — | — |
+| persistence | 1 | — | — |
+| dns_tunneling | 1 | — | — |
+| anti_forensics | 1 | — | — |
+| evasion | 2 | — | — |
+| dynamic_code_execution | — | 6 | — |
+| *wasm-driven RWX (V8 filter collision)* | — | — | 1 |
+| *prototype pollution (no syscall)* | — | — | 1 |
+| **Total** | **25** | **6** | **2** |
+
+## Notes on GAP entries
+
+- **wasmRwxViaV8**: The V8 JIT filter treats simultaneous-RWX mprotect from a trusted-directory Node process as legitimate JIT page management. WebAssembly compilation goes through the same code path, so attacker-supplied wasm bytecode gets the same pass. Distinguishing the two would require inspecting the JIT input (JavaScript vs. wasm bytes) — not currently done. Documented as a design tradeoff, not a bug.
+- **prototypePollution**: Plain property assignment (`Object.prototype.x = fn`) emits no monitored syscall. The Node.js audit hook only fires on eval/Function/vm.runIn*Context/vm.Script — assignments are invisible. Detecting this would require either V8 inspector integration or a source-static analyzer pass on the install script.
