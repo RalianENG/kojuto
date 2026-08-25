@@ -22,18 +22,18 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: stable
+          # Pin to the module's declared Go version instead of `stable`.
+          # golangci-lint's embedded typechecker only supports export
+          # data up to the compiler version it was built with; when
+          # `stable` outpaces the lint binary (e.g. Go 1.27 stdlib
+          # emitting export data v4 vs. lint's max v2/v3), even valid
+          # imports get flagged as "undefined". Matching go.mod keeps
+          # lint deterministic across Go's rolling stable releases.
+          go-version-file: go.mod
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v7
         with:
-          # v2.1.6 (Apr 2025) predates Go 1.25.0 (Aug 2025). When the
-          # module requires Go 1.25 and setup-go installs `stable`, the
-          # older lint binary's internal typechecker fails to resolve
-          # third-party imports (`undefined: yaml` on a valid
-          # `gopkg.in/yaml.v3` import). Pin to a version that supports
-          # Go 1.25's module graph. Update this in lock-step with any
-          # future go.mod toolchain bumps.
           version: v2.5.0
           install-mode: goinstall
 
