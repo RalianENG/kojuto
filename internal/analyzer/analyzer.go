@@ -408,6 +408,8 @@ func categoryShortDesc(c string) string {
 		return "eval / Function() / vm.runIn*Context (audit hook)"
 	case types.CategoryUnknownBinary:
 		return "execve without positive attack signature (info)"
+	case types.CategoryDNSLookup:
+		return "isolated name resolution (info; C2 fires on the follow-up connect)"
 	}
 	return c
 }
@@ -524,10 +526,19 @@ func classify(evt *types.SyscallEvent) {
 			evt.Reason = "Connection to known DNS-over-HTTPS server " + evt.DstAddr + ":443" +
 				" — may be used for DNS tunneling to bypass port-53 monitoring."
 		case evt.DstPort == 53:
-			evt.Category = types.CategoryC2
+			// Isolated name resolution is NOT C2. Under --network=none
+			// the lookup never completes, and legitimate defensive
+			// probes (getaddrinfo at import, glibc NSS lookups) fire
+			// this syscall unconditionally. The real C2 signal is the
+			// follow-up connect() to the resolved IP, which the
+			// default branch below catches at HIGH. Recording DNS
+			// lookups at LOW preserves the forensic chain (the
+			// resolver + query domain are visible in the report) but
+			// keeps the verdict honest.
+			evt.Category = types.CategoryDNSLookup
 			evt.Reason = "DNS resolver connection to " + evt.DstAddr + ":53" +
-				" — package attempted hostname resolution, indicating intent to " +
-				"communicate with an external server."
+				" — name resolution attempt. Recorded for forensic chain visibility; " +
+				"the follow-up connect to the resolved IP is the actual C2 signal."
 		default:
 			evt.Category = types.CategoryC2
 			evt.Reason = "Outbound connection to " + evt.DstAddr + ":" + portStr(evt.DstPort) +
@@ -536,15 +547,29 @@ func classify(evt *types.SyscallEvent) {
 
 	case types.EventSendto, types.EventSendmsg, types.EventSendmmsg:
 		if evt.DNSQuery != "" {
-			if svc := matchExfilService(evt.DNSQuery); svc != "" {
+			svc := matchExfilService(evt.DNSQuery)
+			switch {
+			case svc != "":
 				evt.Category = types.CategoryDataExfil
 				evt.Reason = "DNS resolution of known exfiltration service (" + svc +
 					"): " + evt.DNSQuery +
 					" — commonly used by threat actors to exfiltrate stolen data."
-			} else {
+			case isDNSTunnel(evt.DNSQuery):
 				evt.Category = types.CategoryDNSTunnel
 				evt.Reason = "DNS query to " + evt.DNSQuery +
 					" contains high-entropy subdomains, indicating data exfiltration via DNS tunneling."
+			default:
+				// Benign-looking DNS query that reached this branch
+				// because the resolver IP is external (not loopback,
+				// which isBenignNetwork already filters). Not tunneling
+				// and not a known exfil service — record at LOW so the
+				// query domain is visible in the forensic report
+				// without flipping the verdict on legit lookups.
+				evt.Category = types.CategoryDNSLookup
+				evt.Reason = "DNS query to " + evt.DNSQuery +
+					" via " + evt.DstAddr + ":" + portStr(evt.DstPort) +
+					" — recorded for forensic chain visibility; benign-looking query, " +
+					"no tunneling or exfil-service pattern detected."
 			}
 		} else {
 			evt.Category = types.CategoryC2
