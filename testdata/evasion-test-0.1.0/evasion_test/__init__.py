@@ -905,10 +905,15 @@ def d4_deferred_execution():
     same way, the payload eventually fires.
 
     Kojuto records the setsid execve as unknown_binary LOW (correct
-    for classifying "we saw setsid, don't know what it did"). To
-    close this, kojuto would need to trace the forked child too and
-    NOT tear down the sandbox until child processes exit — a big
-    change.
+    for classifying "we saw setsid, don't know what it did").
+
+    Measured (see d5): "kojuto would need to trace the forked child
+    too" — kojuto ALREADY does this via strace -f, and docker exec
+    blocks on strace which blocks on all tracees. The sandbox waits
+    for the sleep before teardown; the delayed payload's syscalls
+    ARE captured. So this test is not a real BYPASS inside the
+    sandbox — it merely extends scan wall time. Real out-of-window
+    attack surface only exists on the developer's actual machine.
     """
     try:
         import subprocess
@@ -932,11 +937,56 @@ def d4_deferred_execution():
 # ====================================================================
 
 
+def d5_deferred_persistence_traced():
+    """[DETECT — MEASURED] setsid + delay + persistence write.
+
+    Companion to d4: same setsid detach mechanism, but the deferred
+    payload writes into a MONITORED path (~/.bashrc). Serves as the
+    positive proof that strace -f keeps tracking a session-detached
+    child — if strace lost the tracee at setsid, the subsequent
+    openat on ~/.bashrc would never surface and the verdict would
+    stay clean.
+
+    Measured: scan reports `persistence` HIGH for openat(~/.bashrc,
+    O_WRONLY|O_CREAT|O_APPEND) fired from the sh child spawned by
+    setsid, AFTER the sleep 3 completes. This confirms:
+      - strace's per-PID ptrace attach survives setsid session
+        change (setsid does not detach tracer)
+      - the docker exec running strace waits until every tracee
+        exits, so the delayed openat is captured before scan tears
+        down
+      - the sandbox's read-only rootfs does NOT block writes to
+        /home/dev/ (writable tmpfs overlay per user), so the openat
+        actually succeeds — needed for a fair test of observability
+
+    Corollary: d4's "BYPASS" label was optimistic. Deferred execution
+    via setsid inside the sandbox is NOT invisible; it just delays
+    scan completion. The real out-of-window attack surface only exists
+    on the developer's actual machine, outside the sandbox.
+    """
+    try:
+        import subprocess
+        home = os.path.expanduser("~")
+        bashrc = os.path.join(home, ".bashrc")
+        # Same setsid pattern as d4 — session leader change should NOT
+        # break strace's per-tracee ptrace attach.
+        subprocess.Popen(
+            ["setsid", "sh", "-c",
+             f"sleep 3 && echo '# d5-traced-payload' >> {bashrc}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            preexec_fn=os.setsid,
+        )
+    except Exception:
+        pass
+
+
 def _run_group_d():
     d1_memfd_fexecve()
     d2_dga_low_entropy_multi()
     d3_doh_unlisted_provider()
     d4_deferred_execution()
+    d5_deferred_persistence_traced()
 
 
 try:
