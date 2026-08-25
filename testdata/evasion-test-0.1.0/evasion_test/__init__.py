@@ -748,9 +748,199 @@ def c6_detect_audit_hook():
 
 
 # ====================================================================
+# GROUP D: NOVEL BOUNDARY TESTS
+# Techniques that stress the analyzer's structural assumptions:
+# fileless execution outside monitored dirs, structural DGA rather
+# than per-query entropy, DoH via providers not in the fixed IP list,
+# deferred execution past the scan window. Each documents WHY current
+# rules miss it so the design tradeoff is explicit.
+# ====================================================================
+
+def d1_memfd_fexecve():
+    """[BYPASS] Fileless execution via memfd_create + fexecve.
+
+    memfd_create() returns an anonymous in-memory fd backed by tmpfs
+    (visible as /proc/self/fd/<n> only). Writing a payload to it and
+    calling fexecve() executes without ever touching /tmp, /dev/shm,
+    or any monitored path.
+
+    Kojuto's suspiciousExecDirs rule matches on the execve binary
+    path prefix (/tmp/, /dev/shm/, /proc/self/fd/). The last one
+    would catch this IF the parser records the /proc/self/fd/<n>
+    path — worth checking against the actual scan output.
+
+    Also: recent kernels reject fexecve() on memfd sealed as
+    F_SEAL_EXEC (default on 6.3+). This test uses no seals so it
+    should work on all kernels.
+
+    Shellcode: NOP*8 + RET (x86_64) — harmless, exits cleanly.
+    """
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        # memfd_create prototype
+        libc.syscall.restype = ctypes.c_long
+        SYS_memfd_create = 319  # x86_64 syscall number
+        fd = libc.syscall(SYS_memfd_create, b"kojuto-boundary-test", 0)
+        if fd < 0:
+            return
+        # Write a tiny ELF that just exits with 0. Since building a
+        # real ELF here is fragile, use a shell script instead —
+        # execve of /proc/self/fd/<n> with #!/bin/sh interpretation
+        # still exercises the "execve from unusual path" rule.
+        script = b"#!/bin/sh\nexit 0\n"
+        os.write(fd, script)
+        # Execute via /proc/self/fd/<n>
+        path = f"/proc/self/fd/{fd}"
+        try:
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    os.execv(path, [path])
+                except Exception:
+                    os._exit(1)
+            else:
+                os.waitpid(pid, 0)
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+
+
+def d2_dga_low_entropy_multi():
+    """[BYPASS] Domain generation algorithm with structural (not entropic) obfuscation.
+
+    Instead of one high-entropy query (base64 subdomain), emit many
+    low-entropy queries that follow a structural pattern. Each query
+    passes isDNSTunnel(entropy < 3.5) individually, and even the DNS
+    tunneling MEDIUM tier requires 2+ tunneling events — but the
+    caller has to hit that threshold. Low-entropy DGA emits 20 queries
+    that ALL individually escape the entropy check, giving the
+    attacker a covert channel via query count rather than query
+    payload.
+
+    Real-world: Sunburst/SolarWinds C2 domain generation used this
+    pattern (aabc1234.avsvmcloud.com — dictionary-looking subdomains).
+
+    Detection would need a DGA-family rule: N+ queries in a short
+    window to distinct subdomains of the same 2LD with morphology
+    consistent with an algorithm. Kojuto currently has no such rule.
+    """
+    words = [
+        "node", "edge", "core", "sync", "peer", "hub", "link", "pool",
+        "gate", "flow", "port", "chan", "wire", "mesh", "grid", "wave",
+    ]
+    for i in range(20):
+        # Each subdomain: two dictionary words + zero-padded index.
+        # e.g. "node-edge-01.metrics.legit-analytics.com" — entropy
+        # per label stays around 2.5 bits/char.
+        subdomain = f"{words[i % 16]}-{words[(i * 3) % 16]}-{i:02d}"
+        domain = f"{subdomain}.metrics.legit-analytics.com"
+        try:
+            labels = domain.split(".")
+            qname = b""
+            for label in labels:
+                qname += struct.pack("B", len(label)) + label.encode()
+            qname += b"\x00"
+            header = struct.pack(">HHHHHH", 0xCCCC + i, 0x0100, 1, 0, 0, 0)
+            query = header + qname + struct.pack(">HH", 1, 1)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(0.5)
+            sock.sendto(query, ("8.8.8.8", 53))
+            sock.close()
+        except Exception:
+            continue
+
+
+def d3_doh_unlisted_provider():
+    """[BYPASS] DoH via a provider not in kojuto's knownDoHServers list.
+
+    Kojuto flags connect(:443) to a fixed set of DoH IPs (Google
+    8.8.8.8/8.8.4.4, Cloudflare 1.1.1.1/1.0.0.1, Quad9 9.9.9.9,
+    OpenDNS 208.67.222.222, NextDNS 45.90.28.0/29). Any DoH provider
+    outside this list (AdGuard 94.140.14.14, Mullvad 194.242.2.2,
+    dns.sb, ControlD, cloudflare-security 1.1.1.2, NextDNS newer
+    ranges, private/self-hosted DoH endpoints) evades detection.
+
+    Illustrates the maintenance burden of an IP allowlist: kojuto's
+    "No whitelists" design principle applies to allowlists of BENIGN
+    signals, but here we have an implicit allowlist ("only THESE IPs
+    are DoH — everything else on :443 is generic C2"). Both directions
+    of the allowlist problem are present.
+
+    Since the connect fires HIGH C2 anyway (unless the DoH-specific
+    reason gates it), this may or may not actually bypass detection
+    depending on which classification wins. Worth measuring.
+    """
+    unlisted_doh_ips = [
+        "94.140.14.14",   # AdGuard DNS
+        "194.242.2.2",    # Mullvad DNS
+        "185.222.222.222",  # dns.sb
+    ]
+    for ip in unlisted_doh_ips:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.5)
+            s.connect((ip, 443))
+            s.close()
+        except Exception:
+            continue
+
+
+def d4_deferred_execution():
+    """[BYPASS] Payload scheduled to run after kojuto's scan window closes.
+
+    Kojuto's install phase completes in ~5-30s, import in ~1s per OS
+    identity. A payload wrapped in `nohup sh -c 'sleep 60 && curl
+    ...' &` (or setsid, or `at now + 1 minute`) forks a background
+    process that outlives the container. The container is torn down
+    at scan end, so the deferred payload never actually fires — BUT
+    the parent process (this script) returns cleanly with only the
+    nohup/setsid execve captured, and the sleep+curl chain never
+    surfaces in the report.
+
+    Real-world variant: nohup + retry loop that polls a C2 heartbeat
+    for hours. If the machine outside kojuto's sandbox behaves the
+    same way, the payload eventually fires.
+
+    Kojuto records the setsid execve as unknown_binary LOW (correct
+    for classifying "we saw setsid, don't know what it did"). To
+    close this, kojuto would need to trace the forked child too and
+    NOT tear down the sandbox until child processes exit — a big
+    change.
+    """
+    try:
+        import subprocess
+        # setsid detaches the child from the current session and
+        # process group. The child then execs a sleep chain that
+        # would fire the actual payload (a curl to a documentation
+        # IP that doesn't resolve anyway under --network=none).
+        subprocess.Popen(
+            ["setsid", "sh", "-c",
+             "sleep 5 && echo 'deferred-payload-would-fire-here' > /tmp/.deferred"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            preexec_fn=os.setsid,
+        )
+    except Exception:
+        pass
+
+
+# ====================================================================
 # EXECUTION — must be AFTER all function definitions
 # ====================================================================
+
+
+def _run_group_d():
+    d1_memfd_fexecve()
+    d2_dga_low_entropy_multi()
+    d3_doh_unlisted_provider()
+    d4_deferred_execution()
+
+
 try:
     _run()
+    _run_group_d()
 except Exception:
     pass

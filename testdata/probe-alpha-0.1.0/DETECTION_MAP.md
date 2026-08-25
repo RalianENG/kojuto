@@ -8,7 +8,7 @@
 
 ```bash
 # Scan as local sdist
-kojuto scan --local testdata/probe-alpha-0.1.0.tar.gz
+kojuto scan --local testdata/probe-alpha-0.1.0/dist/probe_alpha-0.1.0.tar.gz
 
 # Or scan from source directory
 kojuto scan --local testdata/probe-alpha-0.1.0/
@@ -60,6 +60,13 @@ kojuto scan --local testdata/probe-alpha-0.1.0/
 | 33 | DNS tunnel (base64 subdomain) | sendto:53 | `dns_tunneling` | __init__.py:_dns_tunnel_exfil | OLD |
 | 34 | Write ~/.bashrc (persistence) | openat(O_WRONLY) | `persistence` | __init__.py:_run | OLD |
 
+### Boundary Tests (payload.py — GAP candidates)
+
+| # | TTP | Syscall | Expected Category | Source | Status |
+|---|-----|---------|-------------------|--------|--------|
+| 35 | Write to `/usr/local/lib/python3.12/site-packages/pip/__init__.py` | openat(O_WRONLY) | **NONE** (PyPI library-hijack rule not implemented) | payload.py:_pypi_library_hijack | **GAP** |
+| 36 | Write to `.../site-packages/urllib3/__init__.py` (secondary target) | openat(O_WRONLY) | **NONE** (same) | payload.py:_pypi_library_hijack | **GAP** |
+
 ## Coverage Summary
 
 | Category | OLD | NEW | GAP |
@@ -74,4 +81,10 @@ kojuto scan --local testdata/probe-alpha-0.1.0/
 | evasion | 1 | — | — |
 | dns_tunneling | 1 | — | — |
 | *anti-forensics (unlink)* | — | — | 1 |
-| **Total** | **14** | **19** | **1** |
+| *PyPI library hijacking* | — | — | 2 |
+| **Total** | **14** | **19** | **3** |
+
+## Notes on GAP entries
+
+- **_pypi_library_hijack**: The npm side of this attack class (`/install/node_modules/<other>/`) is implemented in [Unreleased] under `CategoryLibraryHijack`. The PyPI side is deferred because `pip install` legitimately writes many files across many `site-packages/` directories during wheel extraction, and the analyzer needs a discriminator that separates pip-driven writes from probe-driven writes. Likely path: process attribution (writer PID's execve was pip vs. writer was a lifecycle-hook subprocess) rather than path pattern. Documented in CHANGELOG under `library_hijacking` bullet as follow-up.
+  - **Measured**: an actual scan produces **zero** openat events for the hijack target. Two layers of invisibility stack: (a) the sandbox's `--read-only` rootfs prevents the write from succeeding on `/usr/local/lib/python*/site-packages/` (EROFS), and (b) even if the write targeted the writable pip-install directory (`/install/lib/python*/`), the analyzer's `parseOpenat` layer does not emit openat events for that path pattern. Both would need to change to close the gap.
