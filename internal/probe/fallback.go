@@ -39,7 +39,12 @@ func (s *StraceFallback) Start(_ uint32) error {
 
 // StartWithPID attaches strace to the given host PID.
 func (s *StraceFallback) StartWithPID(pid uint32) error {
-	s.cmd = exec.Command("strace",
+	// noctx suppressed: strace lifecycle is managed explicitly via
+	// Close() → Process.Kill() → Wait(). Plumbing a context through
+	// NewStrace/StartWithPID would add an API change with no
+	// behavioural improvement — the process is already deterministically
+	// terminated at scan end.
+	s.cmd = exec.Command("strace", //nolint:noctx // see comment above
 		"-f",
 		"-s", "256",
 		"-e", "trace=connect,sendto,sendmsg,sendmmsg,bind,listen,accept,accept4,execve,openat,rename,renameat,renameat2,sendfile,ptrace,mmap,mprotect,unlink,unlinkat",
