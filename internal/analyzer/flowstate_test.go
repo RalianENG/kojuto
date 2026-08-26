@@ -1,6 +1,7 @@
 package analyzer
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -196,5 +197,200 @@ func TestAnalyze_C2DifferentPIDNoChain(t *testing.T) {
 		if e.Category == types.CategoryC2 && strings.Contains(e.Reason, "evil.example") {
 			t.Errorf("PID 200 connect got PID 100's DNS chain: %s", e.Reason)
 		}
+	}
+}
+
+// buildDGAEvents produces N synthetic DNS-query events for a single
+// PID under one 2LD, with morphologically-uniform subdomain labels.
+// Used by DGA tests as a compact fixture.
+func buildDGAEvents(pid uint32, twoLD string, n int) []types.SyscallEvent {
+	events := make([]types.SyscallEvent, 0, n)
+	for i := range n {
+		// Uniform shape: three-letter word + hyphen + zero-padded two-digit index.
+		// Length 6 for all: `abc-NN`. Character-class fingerprint: lower+digit+hyphen.
+		sub := "abc-"
+		if i < 10 {
+			sub += "0"
+		}
+		sub += strconv.Itoa(i)
+		events = append(events, types.SyscallEvent{
+			Syscall:  types.EventSendto,
+			PID:      pid,
+			Family:   2,
+			DstAddr:  "8.8.8.8",
+			DstPort:  53,
+			DNSQuery: sub + "." + twoLD,
+		})
+	}
+	return events
+}
+
+// TestDetectDGAClusters_PositiveMatch exercises the happy path:
+// dgaMinCluster distinct uniform subdomains under one 2LD from one
+// PID → one DGA cluster with correct metadata.
+func TestDetectDGAClusters_PositiveMatch(t *testing.T) {
+	state := &FlowState{}
+	for _, e := range buildDGAEvents(100, "metrics.legit-analytics.com", dgaMinCluster) {
+		state.RecordDNSQuery(&e)
+	}
+
+	clusters := state.DetectDGAClusters()
+	if len(clusters) != 1 {
+		t.Fatalf("expected 1 cluster, got %d", len(clusters))
+	}
+	c := clusters[0]
+	if c.PID != 100 {
+		t.Errorf("PID = %d, want 100", c.PID)
+	}
+	// registrableTwoLD is rightmost-two-labels, so this becomes
+	// legit-analytics.com (not the full metrics.legit-analytics.com).
+	if c.TwoLD != "legit-analytics.com" {
+		t.Errorf("TwoLD = %q, want legit-analytics.com", c.TwoLD)
+	}
+	if c.QueryCount != dgaMinCluster {
+		t.Errorf("QueryCount = %d, want %d", c.QueryCount, dgaMinCluster)
+	}
+	if len(c.Samples) != 3 {
+		t.Errorf("Samples length = %d, want 3", len(c.Samples))
+	}
+}
+
+// TestDetectDGAClusters_BelowThreshold confirms sub-threshold
+// cardinality does not fire — dgaMinCluster is the floor.
+func TestDetectDGAClusters_BelowThreshold(t *testing.T) {
+	state := &FlowState{}
+	for _, e := range buildDGAEvents(100, "example.com", dgaMinCluster-1) {
+		state.RecordDNSQuery(&e)
+	}
+	if clusters := state.DetectDGAClusters(); len(clusters) != 0 {
+		t.Errorf("expected 0 clusters (below threshold), got %d", len(clusters))
+	}
+}
+
+// TestDetectDGAClusters_MorphologyInconsistent pins that a group
+// large enough by count but morphology-inconsistent is rejected.
+// Legit CDN clients that hit many differently-shaped bucket names
+// under one 2LD fall in this bucket.
+func TestDetectDGAClusters_MorphologyInconsistent(t *testing.T) {
+	state := &FlowState{}
+	// N distinct subdomains, but wildly different lengths — legit
+	// bucket-name-per-lookup pattern.
+	buckets := []string{
+		"a", "medium-name", "very-long-bucket-name-here", "xyz",
+		"another", "b", "prod-eu-west-2-storage", "u",
+		"test-01", "customer-analytics-data",
+	}
+	for _, b := range buckets {
+		evt := types.SyscallEvent{
+			Syscall: types.EventSendto, PID: 100, Family: 2,
+			DstAddr: "8.8.8.8", DstPort: 53,
+			DNSQuery: b + ".s3.amazonaws.com",
+		}
+		state.RecordDNSQuery(&evt)
+	}
+	if clusters := state.DetectDGAClusters(); len(clusters) != 0 {
+		t.Errorf("expected 0 clusters (morphology inconsistent), got %d", len(clusters))
+	}
+}
+
+// TestDetectDGAClusters_MultiplePIDsSeparate confirms PID scope:
+// two PIDs each with own DGA cluster produce two separate findings,
+// not one merged.
+func TestDetectDGAClusters_MultiplePIDsSeparate(t *testing.T) {
+	state := &FlowState{}
+	for _, e := range buildDGAEvents(100, "one.example.com", dgaMinCluster) {
+		state.RecordDNSQuery(&e)
+	}
+	for _, e := range buildDGAEvents(200, "two.example.com", dgaMinCluster) {
+		state.RecordDNSQuery(&e)
+	}
+	clusters := state.DetectDGAClusters()
+	if len(clusters) != 2 {
+		t.Fatalf("expected 2 clusters (one per PID), got %d", len(clusters))
+	}
+	pids := map[uint32]bool{}
+	for _, c := range clusters {
+		pids[c.PID] = true
+	}
+	if !pids[100] || !pids[200] {
+		t.Errorf("expected clusters for PID 100 and 200, got %v", pids)
+	}
+}
+
+// TestDetectDGAClusters_DedupSubdomains guards against the same
+// subdomain repeated many times being counted as N distinct entries.
+// Legit code retrying a single failing hostname must not fire the
+// rule.
+func TestDetectDGAClusters_DedupSubdomains(t *testing.T) {
+	state := &FlowState{}
+	for range dgaMinCluster * 3 {
+		evt := types.SyscallEvent{
+			Syscall: types.EventSendto, PID: 100, Family: 2,
+			DstAddr: "8.8.8.8", DstPort: 53,
+			DNSQuery: "same-name.example.com",
+		}
+		state.RecordDNSQuery(&evt)
+	}
+	if clusters := state.DetectDGAClusters(); len(clusters) != 0 {
+		t.Errorf("expected 0 clusters (all queries are the same subdomain), got %d", len(clusters))
+	}
+}
+
+// TestAnalyze_DGAFiringAsMedium exercises the end-to-end: enough DGA
+// queries on their own produce one MEDIUM synthetic event. Verdict
+// stays clean because MEDIUM needs 2+ to flip — the safety choice
+// documented on CategoryDGA. A second cluster (or any other MEDIUM
+// signal) is what would tip the verdict; that composition is
+// verified in TestAnalyze_DGATwoClustersFlipVerdict.
+func TestAnalyze_DGAFiringAsMedium(t *testing.T) {
+	events := buildDGAEvents(100, "legit-analytics.com", dgaMinCluster)
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictClean {
+		t.Errorf("expected clean for single DGA cluster (MEDIUM alone), got %s", verdict)
+	}
+	var dgaSeen bool
+	for _, e := range filtered {
+		if e.Category == types.CategoryDGA {
+			dgaSeen = true
+			if !strings.Contains(e.Reason, "Structural DGA") {
+				t.Errorf("DGA event Reason missing structural label: %s", e.Reason)
+			}
+		}
+	}
+	if !dgaSeen {
+		t.Error("expected one dga synthetic event in filtered output")
+	}
+}
+
+// TestAnalyze_DGATwoClustersFlipVerdict confirms that two separate
+// DGA clusters (say, two distinct 2LDs) push the verdict to
+// SUSPICIOUS via the "2+ MEDIUM" rule.
+func TestAnalyze_DGATwoClustersFlipVerdict(t *testing.T) {
+	events := append(
+		buildDGAEvents(100, "one.example.com", dgaMinCluster),
+		buildDGAEvents(100, "two.example.net", dgaMinCluster)...,
+	)
+	verdict, _ := Analyze(events)
+	if verdict != types.VerdictSuspicious {
+		t.Errorf("expected suspicious for two DGA clusters, got %s", verdict)
+	}
+}
+
+// TestMorphologyConsistent_CharClassFingerprint pins that character
+// classes must match, not just lengths. Legit hex-hash CDN
+// (lowercase+digit) and legit dictionary-word DGA (lowercase+hyphen)
+// have the same length but different fingerprints and must NOT be
+// clustered together.
+func TestMorphologyConsistent_CharClassFingerprint(t *testing.T) {
+	// Mixed: two hex hashes + one hyphen-word. Lengths match, but
+	// fingerprints diverge (digit vs hyphen).
+	subs := []string{"a1b2c3d4", "e5f6a7b8", "abc-defg"}
+	if morphologyConsistent(subs) {
+		t.Error("morphology check accepted mixed fingerprints (hex hashes + hyphen words)")
+	}
+	// All hex hashes: same fingerprint (lower+digit), same length.
+	hexes := []string{"a1b2c3d4", "e5f6a7b8", "1234abcd"}
+	if !morphologyConsistent(hexes) {
+		t.Error("morphology check rejected uniform hex hashes")
 	}
 }

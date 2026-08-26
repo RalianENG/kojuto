@@ -129,6 +129,186 @@ func isDNSObservation(evt *types.SyscallEvent) bool {
 	return false
 }
 
+// DGA detection thresholds. Kept as package vars so tests can
+// exercise the rule at smaller cluster sizes without waiting for
+// real-world attack proportions.
+var (
+	// dgaMinCluster is the minimum number of distinct subdomains
+	// under one 2LD required to consider a DGA. 10 is empirically
+	// safe against legit multi-subdomain patterns (S3 buckets, CDN
+	// hashes rarely reach 10 in a single install phase).
+	dgaMinCluster = 10
+	// dgaLengthVariance caps how much subdomain lengths may drift
+	// from the median before morphology is considered inconsistent.
+	// ±3 covers "node-edge-01" vs "core-flow-05" (both length 11)
+	// but rejects "abc" alongside "very-long-bucket-name".
+	dgaLengthVariance = 3
+)
+
+// DGACluster is a detected DGA pattern: N+ distinct subdomains
+// queried by one PID under one registrable 2LD, all sharing
+// consistent subdomain morphology (length ±dgaLengthVariance and the
+// same character-class fingerprint).
+type DGACluster struct {
+	PID        uint32
+	TwoLD      string   // registrable 2LD (naive rightmost-two-labels — see registrableTwoLD)
+	Samples    []string // up to first 3 distinct subdomains, in observation order
+	QueryCount int      // total distinct subdomains observed under this 2LD
+}
+
+// DetectDGAClusters scans the accumulated DNS observations and
+// returns every (PID, 2LD) group that meets both the cardinality
+// threshold and the morphology-consistency check. Called from a
+// post-classification pass in Analyze so that individual
+// dns_lookup / dns_tunneling events are already recorded before the
+// aggregate DGA finding lands — the analyst gets both the LOW
+// forensic breadcrumbs AND the MEDIUM aggregate.
+//
+// Returns nil when nothing crosses the threshold — callers can
+// range over the result unconditionally.
+func (s *FlowState) DetectDGAClusters() []DGACluster {
+	if len(s.dnsQueries) < dgaMinCluster {
+		return nil
+	}
+	// Group unique subdomain labels by (PID, 2LD). Order preserved
+	// for deterministic Sample selection.
+	type key struct {
+		pid   uint32
+		twoLD string
+	}
+	groups := make(map[key][]string)
+	order := make([]key, 0)
+	seen := make(map[key]map[string]bool)
+	for i := range s.dnsQueries {
+		q := &s.dnsQueries[i]
+		if q.Query == "" {
+			continue
+		}
+		twoLD := registrableTwoLD(q.Query)
+		sub := strings.TrimSuffix(strings.TrimSuffix(q.Query, twoLD), ".")
+		if sub == "" || twoLD == "" {
+			continue
+		}
+		k := key{q.PID, twoLD}
+		if _, ok := seen[k]; !ok {
+			seen[k] = make(map[string]bool)
+			order = append(order, k)
+		}
+		if seen[k][sub] {
+			continue
+		}
+		seen[k][sub] = true
+		groups[k] = append(groups[k], sub)
+	}
+
+	var clusters []DGACluster
+	for _, k := range order {
+		subs := groups[k]
+		if len(subs) < dgaMinCluster {
+			continue
+		}
+		if !morphologyConsistent(subs) {
+			continue
+		}
+		samples := subs
+		if len(samples) > 3 {
+			samples = samples[:3]
+		}
+		clusters = append(clusters, DGACluster{
+			PID:        k.pid,
+			TwoLD:      k.twoLD,
+			Samples:    samples,
+			QueryCount: len(subs),
+		})
+	}
+	return clusters
+}
+
+// registrableTwoLD extracts the naive registrable 2LD from a
+// hostname: the rightmost two dot-separated labels. This is
+// intentionally NOT Public-Suffix-List aware (adding a 200+KB PSL
+// data file for one rule was rejected as disproportionate) — the
+// consequence is that queries under multi-label public suffixes
+// (co.uk, ap-northeast-1.compute.amazonaws.com) get grouped by a
+// smaller 2LD than a strict eTLD+1 would. In practice this widens
+// what counts as "same domain" and is conservative for DGA
+// detection: false clustering, if any, tends to fire the rule on
+// legit multi-region cloud clients that also happen to be
+// morphology-uniform. The morphology gate filters those out.
+func registrableTwoLD(hostname string) string {
+	// Strip trailing dot if present.
+	h := strings.TrimSuffix(hostname, ".")
+	labels := strings.Split(h, ".")
+	if len(labels) < 2 {
+		return ""
+	}
+	return labels[len(labels)-2] + "." + labels[len(labels)-1]
+}
+
+// morphologyConsistent reports whether the subdomain labels share
+// enough structural similarity to look algorithmically generated.
+// Two axes:
+//
+//  1. Length variance: max - min of subdomain byte lengths must be
+//     at most dgaLengthVariance. `node-edge-01` and `core-flow-05`
+//     are 11 chars each (variance 0); `pip` and `mycompany-prod-x`
+//     are wildly different (variance ≥10) and would not pass.
+//
+//  2. Character-class fingerprint: each subdomain's fingerprint is a
+//     tuple of (has-lowercase, has-uppercase, has-digit, has-hyphen).
+//     All subdomains must share the same fingerprint. Uniform hex
+//     hashes (only lowercase+digit) match each other; mixing plain
+//     words (lowercase only) with hex hashes (lowercase+digit) does
+//     not.
+//
+// Both gates must pass — either alone lets in too much legit noise.
+func morphologyConsistent(subs []string) bool {
+	if len(subs) < 2 {
+		return false
+	}
+	minLen, maxLen := len(subs[0]), len(subs[0])
+	firstFp := charClassFingerprint(subs[0])
+	for _, s := range subs[1:] {
+		if l := len(s); l < minLen {
+			minLen = l
+		} else if l > maxLen {
+			maxLen = l
+		}
+		if charClassFingerprint(s) != firstFp {
+			return false
+		}
+	}
+	return maxLen-minLen <= dgaLengthVariance
+}
+
+// charClassFingerprint returns a compact tuple describing which
+// character classes appear in s. Two subdomains with the same
+// fingerprint use the same "alphabet"; different fingerprints mean
+// heterogeneous character sets and disqualify morphology matching.
+func charClassFingerprint(s string) uint8 {
+	const (
+		fpLower  uint8 = 1 << 0
+		fpUpper  uint8 = 1 << 1
+		fpDigit  uint8 = 1 << 2
+		fpHyphen uint8 = 1 << 3
+	)
+	var fp uint8
+	for i := range len(s) {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+			fp |= fpLower
+		case c >= 'A' && c <= 'Z':
+			fp |= fpUpper
+		case c >= '0' && c <= '9':
+			fp |= fpDigit
+		case c == '-':
+			fp |= fpHyphen
+		}
+	}
+	return fp
+}
+
 // newFlowState builds the FlowState from a temporally-ordered event
 // stream. Runs the two migrated pre-passes over the events; each pass
 // is independent and streaming, so the total cost is O(N) with two

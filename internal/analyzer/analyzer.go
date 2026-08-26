@@ -100,6 +100,14 @@ func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
 		suspicious = append(suspicious, events[i])
 	}
 
+	// Post-classification pass: structural DGA detection over the
+	// accumulated DNS observations. Individual queries already
+	// registered as dns_lookup LOW forensic breadcrumbs during the
+	// main loop; the DGA rule emits an aggregate MEDIUM per detected
+	// (PID, 2LD) cluster on top of those. Not part of classify()
+	// because DGA is per-CLUSTER, not per-event.
+	suspicious = appendDGAFindings(state, suspicious)
+
 	if len(suspicious) == 0 {
 		return types.VerdictClean, nil
 	}
@@ -110,6 +118,37 @@ func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
 	// package. Events still flow into `suspicious` for forensic visibility
 	// in the report.
 	return decideVerdict(suspicious), suspicious
+}
+
+// appendDGAFindings runs the structural DGA detector on the
+// accumulated DNS state and appends one synthetic MEDIUM event per
+// detected cluster. Called after the per-event classification loop
+// so individual dns_lookup / dns_tunneling events are already in
+// `suspicious` — the DGA finding is an aggregate on top of the
+// forensic breadcrumbs, not a replacement for them.
+func appendDGAFindings(state *FlowState, suspicious []types.SyscallEvent) []types.SyscallEvent {
+	clusters := state.DetectDGAClusters()
+	for i := range clusters {
+		c := &clusters[i]
+		reason := "Structural DGA pattern: " + strconv.Itoa(c.QueryCount) +
+			" distinct subdomains under " + c.TwoLD +
+			" queried by PID " + strconv.FormatUint(uint64(c.PID), 10) +
+			" with consistent subdomain morphology (uniform length + character-class fingerprint). " +
+			"Individual queries have low per-query entropy so they escape the dns_tunneling check, " +
+			"but the aggregate cardinality + morphology is the signature C2 discovery uses."
+		if len(c.Samples) > 0 {
+			reason += " Samples: " + strings.Join(c.Samples, ", ") + "."
+		}
+		suspicious = append(suspicious, types.SyscallEvent{
+			Syscall:  types.EventSendto,
+			PID:      c.PID,
+			DstPort:  53,
+			DNSQuery: c.TwoLD,
+			Category: types.CategoryDGA,
+			Reason:   reason,
+		})
+	}
+	return suspicious
 }
 
 // decideVerdict applies the severity rules: any HIGH event → SUSPICIOUS;
@@ -408,6 +447,8 @@ func categoryShortDesc(c string) string {
 		return "execve without positive attack signature (info)"
 	case types.CategoryDNSLookup:
 		return "isolated name resolution (info; C2 fires on the follow-up connect)"
+	case types.CategoryDGA:
+		return "structural DGA: many uniform-morphology subdomains under one 2LD"
 	}
 	return c
 }
@@ -453,8 +494,8 @@ func assessRisk(categories []string) string {
 	}
 	for _, c := range categories {
 		switch c {
-		case types.CategoryBinaryHijack, types.CategoryDNSTunnel, types.CategoryPersistence,
-			types.CategoryEvasion, types.CategoryAntiForensics:
+		case types.CategoryBinaryHijack, types.CategoryDNSTunnel, types.CategoryDGA,
+			types.CategoryPersistence, types.CategoryEvasion, types.CategoryAntiForensics:
 			return "high"
 		}
 	}
@@ -481,6 +522,8 @@ func buildDescription(_ []types.SyscallEvent, categories []string) string {
 			parts = append(parts, "write to shell startup file (persistence mechanism)")
 		case types.CategoryDNSTunnel:
 			parts = append(parts, "DNS tunneling detected (high-entropy subdomain queries)")
+		case types.CategoryDGA:
+			parts = append(parts, "structural DGA pattern detected (many uniform subdomains under one 2LD)")
 		case types.CategoryEvasion:
 			parts = append(parts, "anti-debugging evasion detected (ptrace self-check)")
 		case types.CategoryMemExec:
