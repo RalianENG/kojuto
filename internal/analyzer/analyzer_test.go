@@ -1713,6 +1713,118 @@ func TestAnalyze_LibraryHijackScoped(t *testing.T) {
 	}
 }
 
+// TestExtractPyPISitePackage pins the PyPI site-packages path
+// parser used by the library_hijack rule. Path shape:
+//
+//	/usr/local/lib/python<ver>/site-packages/<pkg>/<subpath>
+//
+// The <ver> segment is not pinned to a specific Python release so
+// future SandboxPythonVersion bumps don't silently disable the rule.
+func TestExtractPyPISitePackage(t *testing.T) {
+	cases := []struct {
+		path string
+		want string
+	}{
+		// Real package writes.
+		{"/usr/local/lib/python3.12/site-packages/pip/__init__.py", "pip"},
+		{"/usr/local/lib/python3.12/site-packages/urllib3/util/x.py", "urllib3"},
+		{"/usr/local/lib/python3.13/site-packages/requests/__init__.py", "requests"},
+		// Underscored top-level packages are legitimate (e.g. _distutils_hack).
+		{"/usr/local/lib/python3.12/site-packages/_distutils_hack/x.py", "_distutils_hack"},
+		// pip bookkeeping — never a real package target.
+		{"/usr/local/lib/python3.12/site-packages/pip-24.0.dist-info/METADATA", ""},
+		{"/usr/local/lib/python3.12/site-packages/setuptools-70.0.egg-info/PKG-INFO", ""},
+		{"/usr/local/lib/python3.12/site-packages/__pycache__/x.pyc", ""},
+		// Boundary.
+		{"/usr/local/lib/python3.12/site-packages/pip", ""}, // no trailing content
+		{"/usr/local/lib/python3.12/site-packages/", ""},
+		{"/usr/local/lib/python/site-packages/pip/x.py", ""}, // no version segment
+		{"/tmp/site-packages/pip/__init__.py", ""},
+		{"/install/node_modules/pip/x", ""},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			got := extractPyPISitePackage(tc.path)
+			if got != tc.want {
+				t.Errorf("extractPyPISitePackage(%q) = %q, want %q", tc.path, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAnalyze_LibraryHijackPyPIAppend documents the PyPI-side
+// library-hijacking detection: append-write into another installed
+// package's site-packages tree. pip's own wheel extraction uses
+// fresh-file writes (no O_APPEND) so requiring O_APPEND on this
+// path cleanly separates attacker "add backdoor to existing
+// __init__.py" from pip's normal install activity.
+func TestAnalyze_LibraryHijackPyPIAppend(t *testing.T) {
+	orig := scannedPkgs
+	defer func() { scannedPkgs = orig }()
+	SetScanPkgs([]string{"probe_alpha"})
+
+	events := []types.SyscallEvent{
+		{
+			Syscall:   types.EventOpenat,
+			FilePath:  "/usr/local/lib/python3.12/site-packages/pip/__init__.py",
+			OpenFlags: "O_WRONLY|O_CREAT|O_APPEND",
+		},
+	}
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictSuspicious {
+		t.Errorf("expected suspicious for append-write into sibling site-packages, got %s", verdict)
+	}
+	if len(filtered) != 1 || filtered[0].Category != types.CategoryLibraryHijack {
+		t.Errorf("expected single library_hijacking event, got %+v", filtered)
+	}
+}
+
+// TestAnalyze_LibraryHijackPyPIFreshWriteAllowed documents that a
+// PyPI site-packages write WITHOUT O_APPEND stays clean — that is
+// pip's normal wheel extraction, indistinguishable from attacker
+// overwrite-hijack by flag alone. Overwrite-hijack detection is a
+// follow-up and needs prior file-existence correlation.
+func TestAnalyze_LibraryHijackPyPIFreshWriteAllowed(t *testing.T) {
+	orig := scannedPkgs
+	defer func() { scannedPkgs = orig }()
+	SetScanPkgs([]string{"probe_alpha"})
+
+	events := []types.SyscallEvent{
+		{
+			Syscall:   types.EventOpenat,
+			FilePath:  "/usr/local/lib/python3.12/site-packages/urllib3/__init__.py",
+			OpenFlags: "O_WRONLY|O_CREAT|O_TRUNC", // pip-style fresh write
+		},
+	}
+	verdict, _ := Analyze(events)
+	if verdict != types.VerdictClean {
+		t.Errorf("expected clean for pip-style fresh write, got %s (overwrite-hijack is a follow-up)", verdict)
+	}
+}
+
+// TestAnalyze_LibraryHijackPyPISelfAppend documents that appending
+// into the scanned package's own site-packages tree does NOT fire
+// the rule. Some legitimate build steps append to config files in
+// the package's own tree during install.
+func TestAnalyze_LibraryHijackPyPISelfAppend(t *testing.T) {
+	orig := scannedPkgs
+	defer func() { scannedPkgs = orig }()
+	SetScanPkgs([]string{"probe_alpha"})
+
+	events := []types.SyscallEvent{
+		{
+			Syscall:   types.EventOpenat,
+			FilePath:  "/usr/local/lib/python3.12/site-packages/probe_alpha/__init__.py",
+			OpenFlags: "O_WRONLY|O_APPEND",
+		},
+	}
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictClean {
+		t.Errorf("expected clean for self-package append, got %s (events=%+v)", verdict, filtered)
+	}
+}
+
 // TestAnalyze_LibraryHijackNpmBookkeepingIgnored documents that npm's
 // own bookkeeping entries (`.package-lock.json`, `.bin/`, `.cache/`)
 // do not fire the rule. They are npm internals, not attacker-installed
