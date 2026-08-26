@@ -60,6 +60,15 @@ func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
 	var suspicious []types.SyscallEvent
 
 	for i := range events {
+		// Record DNS observations BEFORE any filtering. A loopback DNS
+		// query (Docker embedded resolver at 127.0.0.11:53) filters as
+		// benign for verdict purposes but the queried hostname is
+		// still evidence the caller wanted to reach that name — the
+		// downstream connect annotation uses this chain so an isolated
+		// LOW connect can still tell the analyst "PID 100 queried
+		// evil.com before dialing this IP".
+		state.RecordDNSQuery(&events[i])
+
 		// V8 JIT filter: simultaneous RWX mprotect/mmap from a Node
 		// interpreter is legitimate JIT page management, not shellcode
 		// injection. The detection comment in strace_parse.go has been
@@ -73,7 +82,7 @@ func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
 			continue
 		}
 
-		classify(&events[i])
+		classify(&events[i], state)
 
 		// Anti-forensics refinement: only keep unlink events for files
 		// that were also EXECUTED during this scan. This distinguishes
@@ -505,11 +514,15 @@ func buildRemediation(catSet map[string]bool) string {
 	return "Do NOT install this package. Review the events list for details."
 }
 
-// classify assigns Category and Reason to a suspicious event.
-func classify(evt *types.SyscallEvent) {
+// classify assigns Category and Reason to a suspicious event. The
+// FlowState argument gives series-aware rules (currently only
+// classifyConnect's C2-chain annotation) visibility into
+// earlier-observed correlated events; classifiers that need no
+// cross-event context ignore it.
+func classify(evt *types.SyscallEvent, state *FlowState) {
 	switch evt.Syscall {
 	case types.EventConnect:
-		classifyConnect(evt)
+		classifyConnect(evt, state)
 
 	case types.EventSendto, types.EventSendmsg, types.EventSendmmsg:
 		classifySend(evt)
@@ -572,7 +585,14 @@ var persistenceTargets = []string{
 // classifyConnect handles TCP/UDP connect events. Split out from
 // classify() so the growth of DNS-specific branches doesn't push the
 // parent function over the linter's cognitive-complexity budget.
-func classifyConnect(evt *types.SyscallEvent) {
+//
+// FlowState is consulted for the default (non-DoH, non-53) branch
+// only: the C2 Reason is annotated with hostnames the same PID
+// queried earlier in the scan. This does NOT change the category or
+// verdict — a bare connect stays HIGH C2 whether or not a preceding
+// DNS query exists; the annotation gives the analyst the causal
+// chain that produced the connect target.
+func classifyConnect(evt *types.SyscallEvent, state *FlowState) {
 	switch {
 	case isKnownDoHServer(evt.DstAddr) && evt.DstPort == 443:
 		evt.Category = types.CategoryDNSTunnel
@@ -594,6 +614,12 @@ func classifyConnect(evt *types.SyscallEvent) {
 		evt.Category = types.CategoryC2
 		evt.Reason = "Outbound connection to " + evt.DstAddr + ":" + portStr(evt.DstPort) +
 			" — packages should not make network connections during install or import."
+		if state != nil {
+			if hosts := state.DNSHostnamesForPID(evt.PID); len(hosts) > 0 {
+				evt.Reason += " Preceded by DNS query for: " + strings.Join(hosts, ", ") +
+					" (same PID) — outbound connect is the harm-firing step in the DNS→connect C2 chain."
+			}
+		}
 	}
 }
 

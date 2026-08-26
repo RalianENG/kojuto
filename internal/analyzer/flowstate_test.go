@@ -1,6 +1,7 @@
 package analyzer
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/RalianENG/kojuto/internal/types"
@@ -71,5 +72,129 @@ func TestNewFlowState_EmptyEvents(t *testing.T) {
 	if len(state.PIDComm) != 0 || len(state.ExecutedPaths) != 0 {
 		t.Errorf("expected empty maps, got PIDComm=%d ExecutedPaths=%d",
 			len(state.PIDComm), len(state.ExecutedPaths))
+	}
+	if hosts := state.DNSHostnamesForPID(0); hosts != nil {
+		t.Errorf("empty state DNSHostnamesForPID(0) = %v, want nil", hosts)
+	}
+}
+
+// TestFlowState_DNSChainAttribution documents the Phase 2 contract:
+// DNS queries recorded via RecordDNSQuery are attributed per-PID and
+// returned in observation order, deduplicated, with empty-query
+// records skipped (resolver connect with no parsed payload).
+func TestFlowState_DNSChainAttribution(t *testing.T) {
+	state := &FlowState{}
+
+	// Observations arrive: PID 100 queries evil.com then attacker.example
+	// then a duplicate evil.com; PID 200 queries other.example; PID 100
+	// also emits a resolver-connect with empty Query (parser miss).
+	state.RecordDNSQuery(&types.SyscallEvent{
+		Syscall: types.EventSendto, PID: 100, DstPort: 53,
+		DstAddr: "8.8.8.8", DNSQuery: "evil.com",
+	})
+	state.RecordDNSQuery(&types.SyscallEvent{
+		Syscall: types.EventSendto, PID: 100, DstPort: 53,
+		DstAddr: "8.8.8.8", DNSQuery: "attacker.example",
+	})
+	state.RecordDNSQuery(&types.SyscallEvent{
+		Syscall: types.EventSendto, PID: 100, DstPort: 53,
+		DstAddr: "8.8.8.8", DNSQuery: "evil.com", // duplicate
+	})
+	state.RecordDNSQuery(&types.SyscallEvent{
+		Syscall: types.EventSendto, PID: 200, DstPort: 53,
+		DstAddr: "8.8.8.8", DNSQuery: "other.example",
+	})
+	state.RecordDNSQuery(&types.SyscallEvent{
+		Syscall: types.EventConnect, PID: 100, DstPort: 53,
+		DstAddr: "127.0.0.11", // resolver-connect with no Query
+	})
+	// Non-DNS event — must be skipped by the isDNSObservation guard.
+	state.RecordDNSQuery(&types.SyscallEvent{
+		Syscall: types.EventConnect, PID: 100, DstPort: 443,
+		DstAddr: "203.0.113.5",
+	})
+
+	got := state.DNSHostnamesForPID(100)
+	want := []string{"evil.com", "attacker.example"}
+	if len(got) != len(want) {
+		t.Fatalf("DNSHostnamesForPID(100) = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("hostname[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	if hosts := state.DNSHostnamesForPID(200); len(hosts) != 1 || hosts[0] != "other.example" {
+		t.Errorf("PID 200 hostnames = %v, want [other.example]", hosts)
+	}
+	if hosts := state.DNSHostnamesForPID(999); hosts != nil {
+		t.Errorf("unknown PID hostnames = %v, want nil", hosts)
+	}
+}
+
+// TestAnalyze_C2ChainAnnotation exercises the end-to-end chain:
+// a DNS query and a subsequent non-53 connect from the SAME PID
+// produce a C2 event whose Reason names the earlier hostname.
+// Verdict + category are unchanged from the pre-Phase-2 baseline —
+// this is purely additive forensic enrichment.
+func TestAnalyze_C2ChainAnnotation(t *testing.T) {
+	events := []types.SyscallEvent{
+		// Docker embedded DNS is loopback so this is filtered as
+		// benign for verdict purposes, but RecordDNSQuery still
+		// captures the queried hostname pre-filter — that's what
+		// the annotation needs.
+		{Syscall: types.EventSendto, PID: 100, Family: 2, DstAddr: "127.0.0.11", DstPort: 53, DNSQuery: "evil.example"},
+		{Syscall: types.EventConnect, PID: 100, Family: 2, DstAddr: "203.0.113.5", DstPort: 443},
+	}
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictSuspicious {
+		t.Fatalf("expected suspicious verdict for connect, got %s", verdict)
+	}
+	var c2 *types.SyscallEvent
+	for i := range filtered {
+		if filtered[i].Category == types.CategoryC2 {
+			c2 = &filtered[i]
+			break
+		}
+	}
+	if c2 == nil {
+		t.Fatal("expected a C2 event in filtered output")
+	}
+	if !strings.Contains(c2.Reason, "evil.example") {
+		t.Errorf("C2 Reason should mention the queried hostname, got: %s", c2.Reason)
+	}
+	if !strings.Contains(c2.Reason, "Preceded by DNS query") {
+		t.Errorf("C2 Reason should mention the DNS chain, got: %s", c2.Reason)
+	}
+}
+
+// TestAnalyze_C2NoDNSChain confirms that a connect without any prior
+// DNS query gets its baseline Reason with NO chain annotation. Guards
+// against the annotation always firing (which would be noise).
+func TestAnalyze_C2NoDNSChain(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventConnect, PID: 100, Family: 2, DstAddr: "203.0.113.5", DstPort: 443},
+	}
+	_, filtered := Analyze(events)
+	if len(filtered) != 1 {
+		t.Fatalf("expected 1 filtered event, got %d", len(filtered))
+	}
+	if strings.Contains(filtered[0].Reason, "Preceded by DNS query") {
+		t.Errorf("no DNS observed but Reason claims a chain: %s", filtered[0].Reason)
+	}
+}
+
+// TestAnalyze_C2DifferentPIDNoChain confirms PID scope: a DNS query
+// from one PID must NOT annotate a connect from another PID.
+func TestAnalyze_C2DifferentPIDNoChain(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventSendto, PID: 100, Family: 2, DstAddr: "127.0.0.11", DstPort: 53, DNSQuery: "evil.example"},
+		{Syscall: types.EventConnect, PID: 200, Family: 2, DstAddr: "203.0.113.5", DstPort: 443},
+	}
+	_, filtered := Analyze(events)
+	for _, e := range filtered {
+		if e.Category == types.CategoryC2 && strings.Contains(e.Reason, "evil.example") {
+			t.Errorf("PID 200 connect got PID 100's DNS chain: %s", e.Reason)
+		}
 	}
 }
