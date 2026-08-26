@@ -47,7 +47,10 @@ func (s *StraceFallback) StartWithPID(pid uint32) error {
 	s.cmd = exec.Command("strace", //nolint:noctx // see comment above
 		"-f",
 		"-s", "256",
-		"-e", "trace=connect,sendto,sendmsg,sendmmsg,bind,listen,accept,accept4,execve,openat,rename,renameat,renameat2,sendfile,ptrace,mmap,mprotect,unlink,unlinkat",
+		// See container_strace.go for the rationale on tracing execveat
+		// alongside execve (glibc 2.34+ path-execve routing + fexecve /
+		// memfd-loader coverage).
+		"-e", "trace=connect,sendto,sendmsg,sendmmsg,bind,listen,accept,accept4,execve,execveat,openat,rename,renameat,renameat2,sendfile,ptrace,mmap,mprotect,unlink,unlinkat",
 		"-e", "signal=none",
 		"-p", strconv.FormatUint(uint64(pid), 10),
 	)

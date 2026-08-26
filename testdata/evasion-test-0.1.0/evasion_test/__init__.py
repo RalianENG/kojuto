@@ -757,21 +757,23 @@ def c6_detect_audit_hook():
 # ====================================================================
 
 def d1_memfd_fexecve():
-    """[BYPASS] Fileless execution via memfd_create + fexecve.
+    """[DETECT — CLOSED] Fileless execution via memfd_create + fexecve.
 
     memfd_create() returns an anonymous in-memory fd backed by tmpfs
     (visible as /proc/self/fd/<n> only). Writing a payload to it and
     calling fexecve() executes without ever touching /tmp, /dev/shm,
     or any monitored path.
 
-    Kojuto's suspiciousExecDirs rule matches on the execve binary
-    path prefix (/tmp/, /dev/shm/, /proc/self/fd/). The last one
-    would catch this IF the parser records the /proc/self/fd/<n>
-    path — worth checking against the actual scan output.
+    Previously silent in strace-container scans because glibc 2.34+
+    routes both path-execve and fexecve through the execveat syscall,
+    and kojuto's strace `-e trace=` list only listed execve. The eBPF
+    probe covered execveat, but the strace-container path did not.
 
-    Also: recent kernels reject fexecve() on memfd sealed as
-    F_SEAL_EXEC (default on 6.3+). This test uses no seals so it
-    should work on all kernels.
+    Closed by adding execveat to both trace lists (container_strace.go
+    and fallback.go) and synthesizing Comm="/proc/self/fd/<dirfd>" for
+    the AT_EMPTY_PATH form. The synthetic path hits the existing
+    suspiciousExecDirs rule (which already listed /proc/self/fd/) and
+    fires code_execution HIGH.
 
     Shellcode: NOP*8 + RET (x86_64) — harmless, exits cleanly.
     """
