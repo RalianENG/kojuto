@@ -354,16 +354,18 @@ func parseOpenat(line string) (types.SyscallEvent, bool) {
 		strings.Contains(flags, "O_CREAT")
 
 	// Emit if: sensitive path, write to user home, write to system binary,
-	// OR write into an installed npm package directory. The last case
-	// feeds the analyzer's library_hijacking rule, which compares the
-	// target package name against the scan target set to distinguish
-	// self-writes (legitimate build output) from cross-package writes
-	// (backdoor placement). Filtering self vs other happens in the
-	// analyzer where the scan target list is available.
+	// OR write into an installed package directory. The last case feeds
+	// the analyzer's library_hijacking rule, which compares the target
+	// package name against the scan target set to distinguish self-writes
+	// (legitimate build output) from cross-package writes (backdoor
+	// placement). Filtering self vs other happens in the analyzer where
+	// the scan target list is available. For PyPI the gate additionally
+	// requires O_APPEND because pip's own wheel extraction uses
+	// fresh-file writes (no O_APPEND) — see isInstalledPackageWrite.
 	if !isSensitivePath(filePath) &&
 		(!isWrite || !isUserHomePath(filePath)) &&
 		(!isWrite || !isSystemBinaryWrite(filePath)) &&
-		(!isWrite || !isInstalledPackageWrite(filePath)) {
+		(!isWrite || !isInstalledPackageWrite(filePath, flags)) {
 		return types.SyscallEvent{}, false
 	}
 
@@ -376,24 +378,71 @@ func parseOpenat(line string) (types.SyscallEvent, bool) {
 	}, true
 }
 
-// isInstalledPackageWrite reports whether filePath targets an installed
-// npm package directory (`/install/node_modules/<pkg>/...`). npm's own
-// bookkeeping entries (`.package-lock.json`, `.bin/`, `.cache/`) are
-// excluded — those never represent attacker-installed packages and
-// would create write-event noise during every install.
-func isInstalledPackageWrite(filePath string) bool {
-	const prefix = "/install/node_modules/"
-	if !strings.HasPrefix(filePath, prefix) {
+// isInstalledPackageWrite reports whether the given openat targets
+// an installed package directory in a way the analyzer might
+// classify as library hijacking. Two shapes:
+//
+//   - npm:  /install/node_modules/<pkg>/...                (source mount)
+//   - PyPI: /usr/local/lib/python*/site-packages/<pkg>/... (pip target)
+//
+// For npm any write to a per-package directory is emitted (`.`-prefixed
+// bookkeeping entries are excluded). For PyPI the flags MUST include
+// O_APPEND — pip's own wheel extraction uses fresh-file writes
+// (O_WRONLY|O_CREAT|O_TRUNC, never O_APPEND), so the O_APPEND gate at
+// the parser layer keeps every pip install silent while still catching
+// the "add backdoor to existing __init__.py" attack pattern.
+//
+// The analyzer independently re-parses the path via
+// extractNpmInstalledPkg / extractPyPISitePackage to decide self-write
+// vs cross-package hijack, so the two layers stay decoupled.
+func isInstalledPackageWrite(filePath, flags string) bool {
+	if strings.HasPrefix(filePath, "/install/node_modules/") {
+		rest := filePath[len("/install/node_modules/"):]
+		if rest == "" || rest[0] == '.' {
+			return false
+		}
+		return true
+	}
+	if isPyPISitePackageWrite(filePath) && strings.Contains(flags, "O_APPEND") {
+		return true
+	}
+	return false
+}
+
+// isPyPISitePackageWrite reports whether filePath is a per-package
+// write under a PyPI site-packages tree. Path shape matched:
+//
+//	/usr/local/lib/python*/site-packages/<pkg>/<anything>
+//
+// where <pkg> is not __pycache__ and does not end in .dist-info /
+// .egg-info (pip bookkeeping). See analyzer.extractPyPISitePackage
+// for the pkg-name extraction the analyzer performs; both must stay
+// in sync.
+func isPyPISitePackageWrite(filePath string) bool {
+	const rootPrefix = "/usr/local/lib/python"
+	if !strings.HasPrefix(filePath, rootPrefix) {
 		return false
 	}
-	rest := filePath[len(prefix):]
-	if rest == "" {
+	afterVersion := filePath[len(rootPrefix):]
+	slash := strings.IndexByte(afterVersion, '/')
+	if slash <= 0 {
 		return false
 	}
-	// Scoped packages (@scope/name) and regular packages both produce
-	// a first-segment package identifier. Reject `.`-prefixed
-	// bookkeeping entries.
-	if rest[0] == '.' {
+	const sp = "/site-packages/"
+	rest := afterVersion[slash:]
+	if !strings.HasPrefix(rest, sp) {
+		return false
+	}
+	after := rest[len(sp):]
+	end := strings.IndexByte(after, '/')
+	if end <= 0 {
+		return false
+	}
+	pkg := after[:end]
+	if pkg == "__pycache__" {
+		return false
+	}
+	if strings.HasSuffix(pkg, ".dist-info") || strings.HasSuffix(pkg, ".egg-info") {
 		return false
 	}
 	return true

@@ -129,33 +129,28 @@ def _backdoor_listener():
 
 
 def _pypi_library_hijack():
-    """[GAP] Write into another installed PyPI package's source tree.
+    """[DETECT — CLOSED] Write into another installed PyPI package's source tree.
 
-    The npm equivalent (library_hijacking on /install/node_modules/
-    <other_pkg>/) was added in CHANGELOG under [Unreleased]. The
-    PyPI side is explicitly documented as follow-up:
+    Real-world attack pattern: the malicious package installs,
+    appends a backdoor stub to a widely-used library's
+    __init__.py (`requests`, `urllib3`, `pip` itself), then
+    removes itself. Every subsequent import of the hijacked
+    library — outside kojuto's scan window — runs the backdoor.
 
-      > The PyPI side (/usr/local/lib/python*/site-packages/) is
-      > intentionally out of scope for this rule — pip's wheel
-      > extraction during install legitimately writes many files
-      > across many package directories and needs a different
-      > discriminator; tracked as follow-up.
+    Closed by the O_APPEND discriminator: pip's own wheel
+    extraction uses fresh-file writes (O_WRONLY|O_CREAT|O_TRUNC,
+    never O_APPEND). The parser layer only emits site-packages
+    events when O_APPEND is set, and the analyzer classifies
+    cross-package appends as CategoryLibraryHijack HIGH.
 
-    This test writes a backdoor stub into pip's own site-packages
-    directory. The harm fires when a later workflow imports pip —
-    outside kojuto's scan window. Placement is the only opportunity
-    to detect it.
+    Measured: probe-alpha's _pypi_library_hijack fires 2 events
+    (one per target: pip/__init__.py + urllib3/__init__.py),
+    verdict SUSPICIOUS, no site-packages misfires as
+    credential_access.
 
-    In real supply chain incidents this is one of the most damaging
-    patterns: the malicious package installs, patches a widely-used
-    library like `requests` or `urllib3`, then removes itself.
-    Every subsequent import of the hijacked library runs the
-    backdoor.
-
-    Detection challenge: how to distinguish this from pip's own
-    wheel-extraction writes (which legitimately touch dozens of
-    site-packages directories per install)? Likely needs process
-    attribution (pip vs. probe-alpha) rather than path pattern.
+    Follow-up: overwrite-based hijack (O_TRUNC over an existing
+    file with prior content) needs pre-write file-existence
+    correlation and stays out of scope for this rule.
     """
     hijack_targets = [
         # pip is guaranteed to exist in the sandbox and be imported
