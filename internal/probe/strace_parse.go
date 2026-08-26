@@ -81,6 +81,19 @@ var (
 		`execve\("([^"]+)",\s*\[([^\]]+)\]`,
 	)
 
+	// execveat(dirfd, "path", ["argv"], envp, flags)
+	// Three shapes we care about:
+	//   execveat(AT_FDCWD, "/usr/bin/foo", ...)       // glibc 2.34+ path form
+	//   execveat(3, "", ["prog"], ..., AT_EMPTY_PATH) // fexecve / memfd loader
+	//   execveat(3, "subpath", ...)                   // fd-relative (rare)
+	// dirfd is captured as either "AT_FDCWD" or a decimal fd number so
+	// the parser can synthesize /proc/self/fd/<n> for the AT_EMPTY_PATH
+	// fileless-exec pattern (matches straceExecveRe if we allow empty
+	// path, so use a separate regex).
+	straceExecveatRe = regexp.MustCompile(
+		`execveat\((AT_FDCWD|-?\d+),\s*"([^"]*)",\s*\[([^\]]+)\]`,
+	)
+
 	// openat(AT_FDCWD, "/home/dev/.ssh/id_rsa", O_RDONLY|O_CLOEXEC) = 3.
 	straceOpenatRe = regexp.MustCompile(
 		`openat\([^,]+,\s*"([^"]+)",\s*([A-Z_|]+)`,
@@ -255,6 +268,10 @@ func parseStraceLine(line string, state *ParseState) (types.SyscallEvent, bool) 
 	}
 
 	if evt, ok := parseExecve(line); ok {
+		return evt, true
+	}
+
+	if evt, ok := parseExecveat(line); ok {
 		return evt, true
 	}
 
@@ -641,6 +658,68 @@ func parseExecve(line string) (types.SyscallEvent, bool) {
 		PID:       extractPID(line),
 		Syscall:   types.EventExecve,
 		Comm:      matches[1],
+		Cmdline:   cmdline,
+	}, true
+}
+
+// parseExecveat handles execveat lines. Two shapes matter:
+//
+//  1. Path form — execveat(AT_FDCWD, "/bin/sh", ["sh","-c",...], envp, 0).
+//     glibc 2.34+ routes ordinary path-based execve through this syscall,
+//     so without tracing execveat every path-execve is silent on modern
+//     glibc. Emitted as an EventExecve with Comm=path so existing rules
+//     (suspiciousExecDirs, benignPaths, interpreterExecFlags, sh -c
+//     inspection) fire unchanged.
+//
+//  2. AT_EMPTY_PATH form — execveat(3, "", ["prog"], envp, AT_EMPTY_PATH).
+//     The dirfd is the actual file to execute (typically a memfd_create
+//     anonymous fd used as a fileless-loader payload container).
+//     Synthesize Comm="/proc/self/fd/<dirfd>" so the existing
+//     suspiciousExecDirs rule (which already lists /proc/self/fd/) fires
+//     as code_execution HIGH.
+//
+// Fd-relative paths (dirfd != AT_FDCWD and path is non-empty non-absolute)
+// are rare in supply chain attacks and left to fall through — Comm gets
+// the relative path as-is, which won't match suspiciousExecDirs but is
+// still recorded via classifyExecve's default branch (unknown_binary LOW).
+func parseExecveat(line string) (types.SyscallEvent, bool) {
+	matches := straceExecveatRe.FindStringSubmatch(line)
+	if matches == nil {
+		return types.SyscallEvent{}, false
+	}
+
+	dirfd, execPath, argv := matches[1], matches[2], matches[3]
+
+	// AT_EMPTY_PATH + numeric dirfd = fexecve pattern. AT_FDCWD in this
+	// position with empty path is legal but nonsensical (execveat glibc
+	// wrapper wouldn't emit it); skip to be safe.
+	if execPath == "" && strings.Contains(line, "AT_EMPTY_PATH") && dirfd != "AT_FDCWD" {
+		execPath = "/proc/self/fd/" + dirfd
+	}
+	if execPath == "" {
+		return types.SyscallEvent{}, false
+	}
+
+	// Failed exec: keep only when target is in a suspicious dir (matches
+	// parseExecve behavior — the attempt itself is evidence of intent).
+	if execveFailedRe.MatchString(line) {
+		suspicious := strings.HasPrefix(execPath, "/tmp/") ||
+			strings.HasPrefix(execPath, "/dev/shm/") ||
+			strings.HasPrefix(execPath, "/var/tmp/") ||
+			strings.HasPrefix(execPath, "/proc/self/fd/")
+		if !suspicious {
+			return types.SyscallEvent{}, false
+		}
+	}
+
+	cmdline := strings.ReplaceAll(argv, "\"", "")
+	cmdline = strings.ReplaceAll(cmdline, ", ", " ")
+
+	return types.SyscallEvent{
+		Timestamp: time.Now().UTC(),
+		PID:       extractPID(line),
+		Syscall:   types.EventExecve,
+		Comm:      execPath,
 		Cmdline:   cmdline,
 	}, true
 }

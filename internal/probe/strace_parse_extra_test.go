@@ -1059,3 +1059,95 @@ func TestParseStraceLine_RenameWithEscapedQuotes(t *testing.T) {
 		})
 	}
 }
+
+// TestParseExecveat pins the three execveat shapes kojuto cares
+// about. glibc 2.34+ routes ordinary path-based execve through
+// execveat(AT_FDCWD, ...); the AT_EMPTY_PATH form is the fexecve /
+// memfd-loader fileless-exec pattern; and fd-relative paths still
+// produce a recorded event without matching suspiciousExecDirs.
+func TestParseExecveat(t *testing.T) {
+	cases := []struct {
+		name        string
+		line        string
+		wantOK      bool
+		wantComm    string
+		wantPID     uint32
+		wantCmdline string
+	}{
+		{
+			name:        "AT_FDCWD path form (glibc 2.34+ execve)",
+			line:        `[pid  100] execveat(AT_FDCWD, "/bin/sh", ["sh", "-c", "echo hi"], 0x7ffe..., 0) = 0`,
+			wantOK:      true,
+			wantComm:    "/bin/sh",
+			wantPID:     100,
+			wantCmdline: "sh -c echo hi",
+		},
+		{
+			name:     "AT_EMPTY_PATH fexecve / memfd loader",
+			line:     `[pid  200] execveat(3, "", ["payload"], 0x7ffe..., AT_EMPTY_PATH) = 0`,
+			wantOK:   true,
+			wantComm: "/proc/self/fd/3", // synthetic path so suspiciousExecDirs fires
+			wantPID:  200,
+		},
+		{
+			name:     "AT_EMPTY_PATH with two-digit fd",
+			line:     `execveat(42, "", ["loader"], 0x7ffe..., AT_EMPTY_PATH) = 0`,
+			wantOK:   true,
+			wantComm: "/proc/self/fd/42",
+			wantPID:  0,
+		},
+		{
+			name:     "fd-relative subpath (rare, recorded as-is)",
+			line:     `[pid  300] execveat(4, "bin/sh", ["sh"], 0x..., 0) = 0`,
+			wantOK:   true,
+			wantComm: "bin/sh",
+			wantPID:  300,
+		},
+		{
+			name:     "failed execveat from /tmp (kept — attempt is evidence)",
+			line:     `[pid  400] execveat(AT_FDCWD, "/tmp/payload", ["p"], 0x..., 0) = -1 EACCES (Permission denied)`,
+			wantOK:   true,
+			wantComm: "/tmp/payload",
+			wantPID:  400,
+		},
+		{
+			name:   "failed execveat PATH-search — dropped",
+			line:   `execveat(AT_FDCWD, "/usr/local/bin/foo", ["foo"], 0x..., 0) = -1 ENOENT (No such file or directory)`,
+			wantOK: false,
+		},
+		{
+			name:   "AT_FDCWD with empty path — malformed, dropped",
+			line:   `execveat(AT_FDCWD, "", ["x"], 0x..., AT_EMPTY_PATH) = 0`,
+			wantOK: false,
+		},
+		{
+			name:   "not an execveat line",
+			line:   `[pid  500] execve("/usr/bin/node", ["node"], ...) = 0`,
+			wantOK: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			evt, ok := parseExecveat(tc.line)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if evt.Syscall != types.EventExecve {
+				t.Errorf("Syscall = %q, want %q", evt.Syscall, types.EventExecve)
+			}
+			if evt.Comm != tc.wantComm {
+				t.Errorf("Comm = %q, want %q", evt.Comm, tc.wantComm)
+			}
+			if evt.PID != tc.wantPID {
+				t.Errorf("PID = %d, want %d", evt.PID, tc.wantPID)
+			}
+			if tc.wantCmdline != "" && evt.Cmdline != tc.wantCmdline {
+				t.Errorf("Cmdline = %q, want %q", evt.Cmdline, tc.wantCmdline)
+			}
+		})
+	}
+}

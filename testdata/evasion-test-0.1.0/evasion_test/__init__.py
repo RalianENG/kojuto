@@ -757,21 +757,23 @@ def c6_detect_audit_hook():
 # ====================================================================
 
 def d1_memfd_fexecve():
-    """[BYPASS] Fileless execution via memfd_create + fexecve.
+    """[DETECT — CLOSED] Fileless execution via memfd_create + fexecve.
 
     memfd_create() returns an anonymous in-memory fd backed by tmpfs
     (visible as /proc/self/fd/<n> only). Writing a payload to it and
     calling fexecve() executes without ever touching /tmp, /dev/shm,
     or any monitored path.
 
-    Kojuto's suspiciousExecDirs rule matches on the execve binary
-    path prefix (/tmp/, /dev/shm/, /proc/self/fd/). The last one
-    would catch this IF the parser records the /proc/self/fd/<n>
-    path — worth checking against the actual scan output.
+    Previously silent in strace-container scans because glibc 2.34+
+    routes both path-execve and fexecve through the execveat syscall,
+    and kojuto's strace `-e trace=` list only listed execve. The eBPF
+    probe covered execveat, but the strace-container path did not.
 
-    Also: recent kernels reject fexecve() on memfd sealed as
-    F_SEAL_EXEC (default on 6.3+). This test uses no seals so it
-    should work on all kernels.
+    Closed by adding execveat to both trace lists (container_strace.go
+    and fallback.go) and synthesizing Comm="/proc/self/fd/<dirfd>" for
+    the AT_EMPTY_PATH form. The synthetic path hits the existing
+    suspiciousExecDirs rule (which already listed /proc/self/fd/) and
+    fires code_execution HIGH.
 
     Shellcode: NOP*8 + RET (x86_64) — harmless, exits cleanly.
     """
@@ -804,6 +806,50 @@ def d1_memfd_fexecve():
                 os.waitpid(pid, 0)
         finally:
             os.close(fd)
+    except Exception:
+        pass
+
+
+def d1b_fexecve_existing_fd():
+    """[DETECT — MEASURED] fexecve via /proc/self/fd/<fd> path.
+
+    Companion to d1: d1 is neutralized by the sandbox's seccomp
+    profile which blocks memfd_create outright (documented defense
+    in depth). This variant survives seccomp because it opens an
+    EXISTING legitimate binary (/bin/sh) and then execveat's it via
+    /proc/self/fd/<fd>. The fileless-loader semantics are the same:
+    the execve target path is /proc/self/fd/<n>, which trips
+    kojuto's suspiciousExecDirs rule as code_execution HIGH.
+
+    Serves as the live-verification probe for the execveat parsing
+    added to fix the glibc-2.34+ path-routing gap. If parseExecveat
+    is missing or the strace trace list omits execveat, this event
+    is silent and no code_execution HIGH fires.
+    """
+    try:
+        # Open /bin/sh (which every container has and seccomp allows).
+        # Use O_PATH so we don't consume a real open (kernel doesn't need
+        # read perms for execveat via path).
+        fd = os.open("/bin/sh", os.O_RDONLY)
+        try:
+            path = f"/proc/self/fd/{fd}"
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    # Child: execve "/proc/self/fd/<n>" → sh. The kernel
+                    # follows the /proc/self/fd/ symlink to the actual
+                    # /bin/sh inode and executes it. Under glibc 2.34+
+                    # the syscall dispatched is execveat(AT_FDCWD, ...).
+                    os.execv(path, ["sh", "-c", "exit 0"])
+                except Exception:
+                    os._exit(1)
+            else:
+                os.waitpid(pid, 0)
+        finally:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -905,10 +951,15 @@ def d4_deferred_execution():
     same way, the payload eventually fires.
 
     Kojuto records the setsid execve as unknown_binary LOW (correct
-    for classifying "we saw setsid, don't know what it did"). To
-    close this, kojuto would need to trace the forked child too and
-    NOT tear down the sandbox until child processes exit — a big
-    change.
+    for classifying "we saw setsid, don't know what it did").
+
+    Measured (see d5): "kojuto would need to trace the forked child
+    too" — kojuto ALREADY does this via strace -f, and docker exec
+    blocks on strace which blocks on all tracees. The sandbox waits
+    for the sleep before teardown; the delayed payload's syscalls
+    ARE captured. So this test is not a real BYPASS inside the
+    sandbox — it merely extends scan wall time. Real out-of-window
+    attack surface only exists on the developer's actual machine.
     """
     try:
         import subprocess
@@ -932,11 +983,57 @@ def d4_deferred_execution():
 # ====================================================================
 
 
+def d5_deferred_persistence_traced():
+    """[DETECT — MEASURED] setsid + delay + persistence write.
+
+    Companion to d4: same setsid detach mechanism, but the deferred
+    payload writes into a MONITORED path (~/.bashrc). Serves as the
+    positive proof that strace -f keeps tracking a session-detached
+    child — if strace lost the tracee at setsid, the subsequent
+    openat on ~/.bashrc would never surface and the verdict would
+    stay clean.
+
+    Measured: scan reports `persistence` HIGH for openat(~/.bashrc,
+    O_WRONLY|O_CREAT|O_APPEND) fired from the sh child spawned by
+    setsid, AFTER the sleep 3 completes. This confirms:
+      - strace's per-PID ptrace attach survives setsid session
+        change (setsid does not detach tracer)
+      - the docker exec running strace waits until every tracee
+        exits, so the delayed openat is captured before scan tears
+        down
+      - the sandbox's read-only rootfs does NOT block writes to
+        /home/dev/ (writable tmpfs overlay per user), so the openat
+        actually succeeds — needed for a fair test of observability
+
+    Corollary: d4's "BYPASS" label was optimistic. Deferred execution
+    via setsid inside the sandbox is NOT invisible; it just delays
+    scan completion. The real out-of-window attack surface only exists
+    on the developer's actual machine, outside the sandbox.
+    """
+    try:
+        import subprocess
+        home = os.path.expanduser("~")
+        bashrc = os.path.join(home, ".bashrc")
+        # Same setsid pattern as d4 — session leader change should NOT
+        # break strace's per-tracee ptrace attach.
+        subprocess.Popen(
+            ["setsid", "sh", "-c",
+             f"sleep 3 && echo '# d5-traced-payload' >> {bashrc}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            preexec_fn=os.setsid,
+        )
+    except Exception:
+        pass
+
+
 def _run_group_d():
     d1_memfd_fexecve()
+    d1b_fexecve_existing_fd()
     d2_dga_low_entropy_multi()
     d3_doh_unlisted_provider()
     d4_deferred_execution()
+    d5_deferred_persistence_traced()
 
 
 try:

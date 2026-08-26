@@ -814,7 +814,7 @@ func TestDockerWriteFile_StructureNoHeredoc(t *testing.T) {
 	}
 
 	want := []string{
-		"docker", "exec", "-i", "--user=root", testContainerID,
+		"docker", dockerSubcmdExec, "-i", "--user=root", testContainerID,
 		"sh", "-c", "cat > '/tmp/probe.js'",
 	}
 	if !reflect.DeepEqual(captured, want) {
@@ -895,5 +895,112 @@ func TestWriteProbeScriptsMulti_FailLoud(t *testing.T) {
 	sb := &Sandbox{containerID: testContainerID, ecosystem: types.EcosystemPyPI}
 	if err := sb.WriteProbeScriptsMulti(context.Background(), []string{"x"}); err == nil {
 		t.Fatal("WriteProbeScriptsMulti returned nil despite failing docker command")
+	}
+}
+
+// dockerSubcmdExec is the docker subcommand string used across the
+// rollback tests below. Extracted for goconst.
+const dockerSubcmdExec = "exec"
+
+// TestStart_RollbackOnPrepareFailure pins the contract that when
+// Start's post-start preparation fails, the partially-created
+// container is removed before Start returns.
+//
+// Motivating measurement: --timeout 3s during a live scan left the
+// docker exec cp of tmpfs overlays incomplete, and the caller never
+// receives a *Sandbox pointer to register Cleanup on. Without the
+// rollback the container leaks in Up state, which
+// CleanupStaleSandboxContainers deliberately skips (to protect
+// concurrent scans).
+//
+// The fake execCommand succeeds on create/start/network but fails
+// the first docker exec (restoreLocalBin), triggering the rollback
+// path. We assert `docker rm -f <containerID>` was invoked.
+func TestStart_RollbackOnPrepareFailure(t *testing.T) {
+	var rmCalls []string
+	orig := execCommand
+	execCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		if len(args) > 0 {
+			switch args[0] {
+			case dockerSubcmdExec:
+				// Fail this — triggers prepareSandboxState error
+				// path and the deferred rollbackPartialStart.
+				return exec.CommandContext(ctx, "false")
+			case "rm":
+				rmCalls = append(rmCalls, strings.Join(args, " "))
+			}
+		}
+		// Everything else routes through TestHelperProcess (docker
+		// create returns the fake container id via stdout).
+		return fakeExecCommand(ctx, name, args...)
+	}
+	t.Cleanup(func() { execCommand = orig })
+
+	sb := newTestSandbox(t, types.EcosystemPyPI)
+	t.Cleanup(func() {
+		if sb.seccompDir != "" {
+			os.RemoveAll(sb.seccompDir)
+		}
+	})
+
+	err := sb.Start(context.Background())
+	if err == nil {
+		t.Fatal("expected Start to return error when docker exec fails")
+	}
+
+	if len(rmCalls) == 0 {
+		t.Fatal("rollback did not fire — no docker rm invocation after Start failure")
+	}
+	joined := strings.Join(rmCalls, " ")
+	if !strings.Contains(joined, "rm -f") {
+		t.Errorf("expected 'rm -f' in rm calls, got %v", rmCalls)
+	}
+	// The container id set by Create (via fakeExecCommand's docker
+	// create case) must appear in the rm invocation.
+	if !strings.Contains(joined, "fake-container-id-12345") {
+		t.Errorf("expected fake container id in rm calls, got %v", rmCalls)
+	}
+}
+
+// TestStartPaused_RollbackOnPrepareFailure mirrors the Start test
+// for the paused variant used by eBPF / strace host-side probe modes.
+// The docker start succeeds, then the docker exec of prepareSandboxState
+// fails — the deferred rollback must remove the leaked container.
+func TestStartPaused_RollbackOnPrepareFailure(t *testing.T) {
+	var rmCalls []string
+	orig := execCommand
+	execCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		if len(args) > 0 {
+			switch args[0] {
+			case dockerSubcmdExec:
+				return exec.CommandContext(ctx, "false")
+			case "rm":
+				rmCalls = append(rmCalls, strings.Join(args, " "))
+			}
+		}
+		return fakeExecCommand(ctx, name, args...)
+	}
+	t.Cleanup(func() { execCommand = orig })
+
+	// StartPaused expects the caller to have called Create first.
+	sb := newTestSandbox(t, types.EcosystemPyPI)
+	sb.containerID = testContainerID
+	t.Cleanup(func() {
+		if sb.seccompDir != "" {
+			os.RemoveAll(sb.seccompDir)
+		}
+	})
+
+	err := sb.StartPaused(context.Background())
+	if err == nil {
+		t.Fatal("expected StartPaused to return error when docker exec fails")
+	}
+
+	if len(rmCalls) == 0 {
+		t.Fatal("rollback did not fire — no docker rm invocation after StartPaused failure")
+	}
+	joined := strings.Join(rmCalls, " ")
+	if !strings.Contains(joined, "rm -f "+testContainerID) {
+		t.Errorf("expected 'rm -f %s' in rm calls, got %v", testContainerID, rmCalls)
 	}
 }

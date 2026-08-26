@@ -104,7 +104,14 @@ func (c *ContainerStrace) buildCommand(ctx context.Context, containerID string, 
 		// boundaries (V8 spawns worker threads via clone — they never
 		// execve so the analyzer's PID→comm map cannot attribute their
 		// mprotect events without seeing the parent relationship).
-		"-e", "trace=connect,sendto,sendmsg,sendmmsg,bind,listen,accept,accept4,execve,clone,clone3,openat,rename,renameat,renameat2,sendfile,ptrace,mmap,mprotect,unlink,unlinkat",
+		// execveat is traced alongside execve because glibc 2.34+ routes
+		// path-based execve through execveat(AT_FDCWD, ...) internally,
+		// and the AT_EMPTY_PATH form (execveat(fd, "", ..., AT_EMPTY_PATH))
+		// is the fexecve/memfd-loader fileless-exec pattern. Without this,
+		// `os.execv("/proc/self/fd/<n>")` from a memfd-loader payload was
+		// silent in every strace-container scan even though the analyzer's
+		// suspiciousExecDirs rule was ready to catch it.
+		"-e", "trace=connect,sendto,sendmsg,sendmmsg,bind,listen,accept,accept4,execve,execveat,clone,clone3,openat,rename,renameat,renameat2,sendfile,ptrace,mmap,mprotect,unlink,unlinkat",
 		"-e", "signal=none",
 		"--",
 	}
