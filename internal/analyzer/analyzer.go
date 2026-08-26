@@ -49,15 +49,13 @@ func SetScanPkgs(pkgs []string) {
 // Events matching known-benign patterns are filtered out first.
 // Suspicious events are enriched with Category and Reason fields.
 func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
-	// Pre-pass: collect paths that were executed (execve) and files that
-	// were written (openat O_CREAT/O_WRONLY) to correlate with unlinks.
-	executedPaths := collectExecutedPaths(events)
-
-	// Pre-pass: build PID → comm map from execve events so later
-	// syscalls (mprotect, mmap) can be attributed back to the process
-	// that issued them. Strace mprotect lines do not carry the
-	// process name; only the PID. This map is the missing link.
-	pidComm := collectPIDComm(events)
+	// Single flow-aware pre-pass. See FlowState in flowstate.go for
+	// the state layout and Phase 1/2/3 refactor rationale — historical
+	// per-correlation pre-passes (collectPIDComm, collectExecutedPaths)
+	// live here as fields on a shared context so future series-aware
+	// rules (DNS→connect chain, DGA, memfd→execveat) can layer new
+	// state without another parallel pre-pass over `events`.
+	state := newFlowState(events)
 
 	var suspicious []types.SyscallEvent
 
@@ -67,7 +65,7 @@ func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
 		// injection. The detection comment in strace_parse.go has been
 		// documenting this as a known false-positive source; this is
 		// the implementation it pointed at.
-		if isV8JITPageOp(&events[i], pidComm) {
+		if isV8JITPageOp(&events[i], state.PIDComm) {
 			continue
 		}
 
@@ -82,7 +80,7 @@ func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
 		// malware payload self-deletion (create→execute→delete) from
 		// pip temp file cleanup (create→delete without execute).
 		if events[i].Category == types.CategoryAntiForensics {
-			if !executedPaths[events[i].FilePath] {
+			if !state.ExecutedPaths[events[i].FilePath] {
 				continue
 			}
 			events[i].Reason = "Payload self-deletion: " + events[i].FilePath +
@@ -318,15 +316,6 @@ func collectExecutedPaths(events []types.SyscallEvent) map[string]bool {
 		// execution happened between create and delete.
 	}
 	return paths
-}
-
-// isInSuspiciousDir checks if a path is in a directory associated with
-// payload staging (same dirs as the unlink detector).
-func isInSuspiciousDir(filePath string) bool {
-	return strings.HasPrefix(filePath, "/tmp/") ||
-		strings.HasPrefix(filePath, "/dev/shm/") ||
-		strings.HasPrefix(filePath, "/var/tmp/") ||
-		strings.HasPrefix(filePath, "/run/")
 }
 
 // GenerateSummary creates a human-readable summary from analyzed events.
