@@ -810,6 +810,50 @@ def d1_memfd_fexecve():
         pass
 
 
+def d1b_fexecve_existing_fd():
+    """[DETECT — MEASURED] fexecve via /proc/self/fd/<fd> path.
+
+    Companion to d1: d1 is neutralized by the sandbox's seccomp
+    profile which blocks memfd_create outright (documented defense
+    in depth). This variant survives seccomp because it opens an
+    EXISTING legitimate binary (/bin/sh) and then execveat's it via
+    /proc/self/fd/<fd>. The fileless-loader semantics are the same:
+    the execve target path is /proc/self/fd/<n>, which trips
+    kojuto's suspiciousExecDirs rule as code_execution HIGH.
+
+    Serves as the live-verification probe for the execveat parsing
+    added to fix the glibc-2.34+ path-routing gap. If parseExecveat
+    is missing or the strace trace list omits execveat, this event
+    is silent and no code_execution HIGH fires.
+    """
+    try:
+        # Open /bin/sh (which every container has and seccomp allows).
+        # Use O_PATH so we don't consume a real open (kernel doesn't need
+        # read perms for execveat via path).
+        fd = os.open("/bin/sh", os.O_RDONLY)
+        try:
+            path = f"/proc/self/fd/{fd}"
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    # Child: execve "/proc/self/fd/<n>" → sh. The kernel
+                    # follows the /proc/self/fd/ symlink to the actual
+                    # /bin/sh inode and executes it. Under glibc 2.34+
+                    # the syscall dispatched is execveat(AT_FDCWD, ...).
+                    os.execv(path, ["sh", "-c", "exit 0"])
+                except Exception:
+                    os._exit(1)
+            else:
+                os.waitpid(pid, 0)
+        finally:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def d2_dga_low_entropy_multi():
     """[BYPASS] Domain generation algorithm with structural (not entropic) obfuscation.
 
@@ -985,6 +1029,7 @@ def d5_deferred_persistence_traced():
 
 def _run_group_d():
     d1_memfd_fexecve()
+    d1b_fexecve_existing_fd()
     d2_dga_low_entropy_multi()
     d3_doh_unlisted_provider()
     d4_deferred_execution()
