@@ -936,25 +936,42 @@ func TestParseOpenat_SystemBinaryWrite(t *testing.T) {
 
 func TestIsInstalledPackageWrite(t *testing.T) {
 	cases := []struct {
-		path string
-		want bool
+		path  string
+		flags string
+		want  bool
 	}{
-		{"/install/node_modules/lodash/index.js", true},
-		{"/install/node_modules/@babel/core/lib/index.js", true},
-		// npm bookkeeping — never a real package, do not emit.
-		{"/install/node_modules/.package-lock.json", false},
-		{"/install/node_modules/.bin/foo", false},
-		// Boundary cases.
-		{"/install/node_modules/", false},
-		{"/install/node_modules", false},
-		{"/install/foo/bar", false},
-		{"/home/dev/.npm/_logs/x.log", false},
-		{"", false},
+		// npm shape — any write flag emits (self vs cross-pkg decided in analyzer).
+		{"/install/node_modules/lodash/index.js", "O_WRONLY|O_CREAT|O_TRUNC", true},
+		{"/install/node_modules/@babel/core/lib/index.js", "O_WRONLY|O_CREAT|O_APPEND", true},
+		{"/install/node_modules/.package-lock.json", "O_WRONLY|O_CREAT", false},
+		{"/install/node_modules/.bin/foo", "O_WRONLY|O_CREAT", false},
+		{"/install/node_modules/", "O_WRONLY", false},
+		{"/install/node_modules", "O_WRONLY", false},
+		{"/install/foo/bar", "O_WRONLY", false},
+
+		// PyPI shape — O_APPEND is required.
+		{"/usr/local/lib/python3.12/site-packages/pip/__init__.py", "O_WRONLY|O_CREAT|O_APPEND", true},
+		{"/usr/local/lib/python3.13/site-packages/urllib3/util/x.py", "O_WRONLY|O_APPEND", true},
+		{"/usr/local/lib/python3.12/site-packages/_distutils_hack/x.py", "O_WRONLY|O_APPEND", true},
+		// PyPI without O_APPEND — pip's own fresh-file wheel extraction, do NOT emit.
+		{"/usr/local/lib/python3.12/site-packages/pip/__init__.py", "O_WRONLY|O_CREAT|O_TRUNC", false},
+		{"/usr/local/lib/python3.12/site-packages/urllib3/x.py", "O_WRONLY|O_CREAT", false},
+		// pip bookkeeping — never emit even with O_APPEND.
+		{"/usr/local/lib/python3.12/site-packages/pip-24.0.dist-info/METADATA", "O_WRONLY|O_APPEND", false},
+		{"/usr/local/lib/python3.12/site-packages/setuptools-70.0.egg-info/PKG-INFO", "O_WRONLY|O_APPEND", false},
+		{"/usr/local/lib/python3.12/site-packages/__pycache__/x.pyc", "O_WRONLY|O_APPEND", false},
+		// Boundary.
+		{"/usr/local/lib/python3.12/site-packages/pip", "O_WRONLY|O_APPEND", false}, // no trailing content
+		{"/usr/local/lib/python3.12/site-packages/", "O_WRONLY|O_APPEND", false},
+		{"/tmp/site-packages/pip/__init__.py", "O_WRONLY|O_APPEND", false},
+
+		{"/home/dev/.npm/_logs/x.log", "O_WRONLY|O_APPEND", false},
+		{"", "O_WRONLY", false},
 	}
 	for _, tc := range cases {
-		t.Run(tc.path, func(t *testing.T) {
-			if got := isInstalledPackageWrite(tc.path); got != tc.want {
-				t.Errorf("isInstalledPackageWrite(%q) = %v, want %v", tc.path, got, tc.want)
+		t.Run(tc.path+"|"+tc.flags, func(t *testing.T) {
+			if got := isInstalledPackageWrite(tc.path, tc.flags); got != tc.want {
+				t.Errorf("isInstalledPackageWrite(%q, %q) = %v, want %v", tc.path, tc.flags, got, tc.want)
 			}
 		})
 	}

@@ -655,23 +655,13 @@ func classifyOpenat(evt *types.SyscallEvent) {
 		strings.Contains(evt.OpenFlags, "O_RDWR") ||
 		strings.Contains(evt.OpenFlags, "O_CREAT")
 
-	// Library hijack: write to /install/node_modules/<other_pkg>/... where
-	// <other_pkg> is not one of the packages being scanned. The hijacked
-	// package's source gets backdoored; harm fires when a later workflow
-	// imports it, outside kojuto's scan window. Placement is the only
-	// chance to detect this attack class.
-	//
-	// Disabled when scannedPkgs is empty (no SetScanPkgs called), so
-	// existing call sites and tests are unaffected.
-	if isWrite && len(scannedPkgs) > 0 {
-		if pkg := extractNpmInstalledPkg(evt.FilePath); pkg != "" && !scannedPkgs[pkg] {
-			evt.Category = types.CategoryLibraryHijack
-			evt.Reason = "Cross-package write into installed sibling: " + evt.FilePath +
-				" — scanned package wrote into " + pkg + "'s source tree. " +
-				"Backdoor placement targeting a sibling dependency; harm fires when " +
-				"a later workflow imports the hijacked package."
-			return
-		}
+	// Library-hijack checks (npm + PyPI). Extracted to keep
+	// classifyOpenat under the gocyclo budget. If the file path matches
+	// either shape, classification is terminal (either fires library_hijack
+	// or returns clean without falling through to credential_access, which
+	// would misclassify legit self-writes and pip's own extraction).
+	if handled := classifyLibraryHijack(evt, isWrite); handled {
+		return
 	}
 
 	// Binary hijack: overwriting a system binary that benignPaths trusts.
@@ -817,6 +807,102 @@ func isBenignInstalledPackageWrite(evt *types.SyscallEvent) bool {
 	}
 	// Cross-package write — let classifyOpenat handle it.
 	return false
+}
+
+// classifyLibraryHijack handles both npm and PyPI library-hijack
+// patterns. Returns true when the file path is under an installed
+// package directory (in which case classification is terminal — the
+// caller should return without falling through to
+// classifyOpenat's default rules). Returns false when the path is
+// not a library-hijack candidate.
+//
+// npm shape: /install/node_modules/<other_pkg>/... — any write from
+// the scanned package into another package's source tree fires
+// CategoryLibraryHijack HIGH.
+//
+// PyPI shape: /usr/local/lib/python*/site-packages/<other_pkg>/... —
+// only append writes (O_APPEND) fire. pip's own wheel extraction uses
+// fresh-file writes (O_WRONLY|O_CREAT|O_TRUNC, never O_APPEND) so the
+// O_APPEND gate cleanly excludes pip. The parser layer additionally
+// pre-filters PyPI events to O_APPEND only; the check here is
+// defensive.
+//
+// When SetScanPkgs has not been called (scannedPkgs empty), the rule
+// is inert — a candidate path still returns true so classifyOpenat
+// doesn't misfire, but no category is set.
+func classifyLibraryHijack(evt *types.SyscallEvent, isWrite bool) bool {
+	if !isWrite {
+		return false
+	}
+	if pkg := extractNpmInstalledPkg(evt.FilePath); pkg != "" {
+		if len(scannedPkgs) > 0 && !scannedPkgs[pkg] {
+			evt.Category = types.CategoryLibraryHijack
+			evt.Reason = "Cross-package write into installed sibling: " + evt.FilePath +
+				" — scanned package wrote into " + pkg + "'s source tree. " +
+				"Backdoor placement targeting a sibling dependency; harm fires when " +
+				"a later workflow imports the hijacked package."
+		}
+		return true
+	}
+	if pkg := extractPyPISitePackage(evt.FilePath); pkg != "" {
+		if strings.Contains(evt.OpenFlags, "O_APPEND") &&
+			len(scannedPkgs) > 0 && !scannedPkgs[pkg] {
+			evt.Category = types.CategoryLibraryHijack
+			evt.Reason = "Append-write into sibling package's site-packages: " + evt.FilePath +
+				" — scanned package appended to " + pkg + "'s installed source. " +
+				"pip's own wheel extraction uses fresh-file writes (no O_APPEND); " +
+				"append into a sibling is a backdoor-placement pattern that harms " +
+				"later workflows importing the hijacked package."
+		}
+		return true
+	}
+	return false
+}
+
+// extractPyPISitePackage returns the site-packages directory name
+// written into when filePath is under a PyPI site-packages tree, or
+// "" otherwise. Mirrors probe.isPyPISitePackageWrite in shape but
+// returns the extracted package name for the library_hijack rule.
+//
+// Examples (SandboxPythonVersion = "3.12" — pinned to the sandbox
+// image; the "python<ver>" segment tolerates future version bumps
+// so the rule doesn't silently break):
+//
+//	/usr/local/lib/python3.12/site-packages/pip/__init__.py       -> "pip"
+//	/usr/local/lib/python3.12/site-packages/urllib3/util/x.py     -> "urllib3"
+//	/usr/local/lib/python3.12/site-packages/pip-24.0.dist-info/x  -> ""
+//	/usr/local/lib/python3.12/site-packages/__pycache__/x         -> ""
+//	/usr/local/lib/python3.12/site-packages/_distutils_hack/x.py  -> "_distutils_hack"
+//	/usr/local/lib/python3.12/site-packages/pip                   -> ""  (no trailing content)
+//	/tmp/site-packages/x                                          -> ""  (wrong prefix)
+func extractPyPISitePackage(filePath string) string {
+	const rootPrefix = "/usr/local/lib/python"
+	if !strings.HasPrefix(filePath, rootPrefix) {
+		return ""
+	}
+	afterVersion := filePath[len(rootPrefix):]
+	slash := strings.IndexByte(afterVersion, '/')
+	if slash <= 0 {
+		return ""
+	}
+	const sp = "/site-packages/"
+	rest := afterVersion[slash:]
+	if !strings.HasPrefix(rest, sp) {
+		return ""
+	}
+	after := rest[len(sp):]
+	end := strings.IndexByte(after, '/')
+	if end <= 0 {
+		return ""
+	}
+	pkg := after[:end]
+	if pkg == "__pycache__" {
+		return ""
+	}
+	if strings.HasSuffix(pkg, ".dist-info") || strings.HasSuffix(pkg, ".egg-info") {
+		return ""
+	}
+	return pkg
 }
 
 // extractNpmInstalledPkg returns the npm package name written into when

@@ -60,12 +60,12 @@ kojuto scan --local testdata/probe-alpha-0.1.0/
 | 33 | DNS tunnel (base64 subdomain) | sendto:53 | `dns_tunneling` | __init__.py:_dns_tunnel_exfil | OLD |
 | 34 | Write ~/.bashrc (persistence) | openat(O_WRONLY) | `persistence` | __init__.py:_run | OLD |
 
-### Boundary Tests (payload.py — GAP candidates)
+### Boundary Tests (payload.py — verified DETECT)
 
-| # | TTP | Syscall | Expected Category | Source | Status |
-|---|-----|---------|-------------------|--------|--------|
-| 35 | Write to `/usr/local/lib/python3.12/site-packages/pip/__init__.py` | openat(O_WRONLY) | **NONE** (PyPI library-hijack rule not implemented) | payload.py:_pypi_library_hijack | **GAP** |
-| 36 | Write to `.../site-packages/urllib3/__init__.py` (secondary target) | openat(O_WRONLY) | **NONE** (same) | payload.py:_pypi_library_hijack | **GAP** |
+| # | TTP | Syscall | Category | Source | Status |
+|---|-----|---------|----------|--------|--------|
+| 35 | Append-write to `.../site-packages/pip/__init__.py` | openat(O_APPEND) | `library_hijacking` (HIGH) | payload.py:_pypi_library_hijack | **DETECT** |
+| 36 | Append-write to `.../site-packages/urllib3/__init__.py` | openat(O_APPEND) | `library_hijacking` (HIGH) | payload.py:_pypi_library_hijack | **DETECT** |
 
 ## Coverage Summary
 
@@ -81,10 +81,13 @@ kojuto scan --local testdata/probe-alpha-0.1.0/
 | evasion | 1 | — | — |
 | dns_tunneling | 1 | — | — |
 | *anti-forensics (unlink)* | — | — | 1 |
-| *PyPI library hijacking* | — | — | 2 |
-| **Total** | **14** | **19** | **3** |
+| *PyPI library hijacking (append)* | — | 2 | — |
+| **Total** | **14** | **21** | **1** |
 
-## Notes on GAP entries
+## Notes on the PyPI library-hijack rule
 
-- **_pypi_library_hijack**: The npm side of this attack class (`/install/node_modules/<other>/`) is implemented in [Unreleased] under `CategoryLibraryHijack`. The PyPI side is deferred because `pip install` legitimately writes many files across many `site-packages/` directories during wheel extraction, and the analyzer needs a discriminator that separates pip-driven writes from probe-driven writes. Likely path: process attribution (writer PID's execve was pip vs. writer was a lifecycle-hook subprocess) rather than path pattern. Documented in CHANGELOG under `library_hijacking` bullet as follow-up.
-  - **Measured**: an actual scan produces **zero** openat events for the hijack target. Two layers of invisibility stack: (a) the sandbox's `--read-only` rootfs prevents the write from succeeding on `/usr/local/lib/python*/site-packages/` (EROFS), and (b) even if the write targeted the writable pip-install directory (`/install/lib/python*/`), the analyzer's `parseOpenat` layer does not emit openat events for that path pattern. Both would need to change to close the gap.
+- The npm equivalent was landed in a prior release; the PyPI side needed a discriminator to separate pip's own wheel extraction from attacker-driven hijack writes.
+- Discriminator chosen: **O_APPEND**. pip's wheel extraction opens fresh files with `O_WRONLY|O_CREAT|O_TRUNC` (never O_APPEND), so requiring O_APPEND on the site-packages write cleanly excludes every pip write while still catching the "add backdoor to existing `__init__.py`" attack subclass.
+- The parser layer (`isInstalledPackageWrite`) applies the O_APPEND gate for PyPI paths, so pip's install-time writes never even reach the analyzer.
+- The site-packages tmpfs overlay makes writes there succeed (the previous "read-only rootfs blocks it" observation was on a stale sandbox build); the analyzer's rule fires on the resulting openat event.
+- Overwrite-based hijack (O_TRUNC over an existing file) is out of scope for this rule: distinguishing it from pip's create-new writes needs pre-write file-existence correlation, which requires more state than the current single-pass analyzer keeps. Tracked as follow-up.
