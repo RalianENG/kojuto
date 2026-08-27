@@ -28,9 +28,10 @@ func NewParseState() *ParseState {
 }
 
 // straceOpenatCreateRe matches openat calls with O_CREAT flag for tracking
-// file creation in temp directories.
+// file creation in temp directories. See straceRenameRe for why the
+// filename capture uses the alternation-escape pattern instead of `[^"]+`.
 var straceOpenatCreateRe = regexp.MustCompile(
-	`openat\([^,]+,\s*"([^"]+)",\s*([A-Z_|]*O_CREAT[A-Z_|]*)`,
+	`openat\([^,]+,\s*"((?:\\.|[^"\\])+)",\s*([A-Z_|]*O_CREAT[A-Z_|]*)`,
 )
 
 var (
@@ -79,8 +80,12 @@ var (
 	)
 
 	// execve("/usr/bin/curl", ["curl", "http://evil.com"], ...)
+	// Binary path uses the alternation-escape pattern so a file with
+	// `"` in its name doesn't truncate the captured Comm at the first
+	// `\"` escape — that would silence classifyExecve's basename +
+	// path-prefix checks (benignPaths, suspiciousExecDirs).
 	straceExecveRe = regexp.MustCompile(
-		`execve\("([^"]+)",\s*\[([^\]]+)\]`,
+		`execve\("((?:\\.|[^"\\])+)",\s*\[([^\]]+)\]`,
 	)
 
 	// execveat(dirfd, "path", ["argv"], envp, flags)
@@ -93,12 +98,16 @@ var (
 	// fileless-exec pattern (matches straceExecveRe if we allow empty
 	// path, so use a separate regex).
 	straceExecveatRe = regexp.MustCompile(
-		`execveat\((AT_FDCWD|-?\d+),\s*"([^"]*)",\s*\[([^\]]+)\]`,
+		`execveat\((AT_FDCWD|-?\d+),\s*"((?:\\.|[^"\\])*)",\s*\[([^\]]+)\]`,
 	)
 
 	// openat(AT_FDCWD, "/home/dev/.ssh/id_rsa", O_RDONLY|O_CLOEXEC) = 3.
+	// Filename uses the alternation-escape pattern so an attacker
+	// cannot silence sensitive-path detection by placing a `"` in the
+	// filename (rendered as `\"` by strace; naive `[^"]+` would
+	// truncate at the first `\` and skip the substring match).
 	straceOpenatRe = regexp.MustCompile(
-		`openat\([^,]+,\s*"([^"]+)",\s*([A-Z_|]+)`,
+		`openat\([^,]+,\s*"((?:\\.|[^"\\])+)",\s*([A-Z_|]+)`,
 	)
 
 	// rename("/tmp/evil", "/usr/local/bin/python3") = 0.
@@ -151,14 +160,15 @@ var (
 	)
 
 	// unlink("/tmp/.ld-linux-x86-64.py") = 0.
+	// See straceRenameRe for the alternation-escape rationale.
 	straceUnlinkRe = regexp.MustCompile(
-		`unlink\("([^"]+)"\)`,
+		`unlink\("((?:\\.|[^"\\])+)"\)`,
 	)
 
 	// unlinkat(AT_FDCWD, "/tmp/payload", 0) = 0
 	// Excludes AT_REMOVEDIR (directory removal by pip/npm is benign).
 	straceUnlinkatRe = regexp.MustCompile(
-		`unlinkat\([^,]+,\s*"([^"]+)",\s*0\)`,
+		`unlinkat\([^,]+,\s*"((?:\\.|[^"\\])+)",\s*0\)`,
 	)
 
 	// ptrace(PTRACE_TRACEME, ...) = -1 EPERM — anti-debugging evasion attempt.
@@ -358,7 +368,7 @@ func parseOpenat(line string) (types.SyscallEvent, bool) {
 		return types.SyscallEvent{}, false
 	}
 
-	filePath := matches[1]
+	filePath := unescapeStracePath(matches[1])
 	var flags string
 	if len(matches) > 2 {
 		flags = matches[2]
@@ -472,8 +482,8 @@ func parseRename(line string) (types.SyscallEvent, bool) {
 			Timestamp: time.Now().UTC(),
 			PID:       extractPID(line),
 			Syscall:   types.EventRename,
-			SrcPath:   matches[1],
-			DstPath:   matches[2],
+			SrcPath:   unescapeStracePath(matches[1]),
+			DstPath:   unescapeStracePath(matches[2]),
 		}, true
 	}
 
@@ -483,8 +493,8 @@ func parseRename(line string) (types.SyscallEvent, bool) {
 			Timestamp: time.Now().UTC(),
 			PID:       extractPID(line),
 			Syscall:   types.EventRename,
-			SrcPath:   matches[1],
-			DstPath:   matches[2],
+			SrcPath:   unescapeStracePath(matches[1]),
+			DstPath:   unescapeStracePath(matches[2]),
 		}, true
 	}
 
@@ -578,7 +588,7 @@ func trackTmpFileCreation(line string, state *ParseState) {
 		return
 	}
 
-	filePath := matches[1]
+	filePath := unescapeStracePath(matches[1])
 
 	// Skip failed calls.
 	if strings.Contains(line, "= -1 ") {
@@ -606,9 +616,9 @@ func parseUnlink(line string, state *ParseState) (types.SyscallEvent, bool) {
 	var filePath string
 
 	if matches := straceUnlinkRe.FindStringSubmatch(line); matches != nil {
-		filePath = matches[1]
+		filePath = unescapeStracePath(matches[1])
 	} else if matches := straceUnlinkatRe.FindStringSubmatch(line); matches != nil {
-		filePath = matches[1]
+		filePath = unescapeStracePath(matches[1])
 	}
 
 	if filePath == "" {
@@ -703,8 +713,8 @@ func parseExecve(line string) (types.SyscallEvent, bool) {
 	// However, KEEP failed execve from suspicious directories (/tmp, /dev/shm)
 	// — these indicate a payload execution attempt that was blocked by
 	// permissions (EACCES) or seccomp. The attempt itself is evidence.
+	binaryPath := unescapeStracePath(matches[1])
 	if execveFailedRe.MatchString(line) {
-		binaryPath := matches[1]
 		isSuspiciousPath := strings.HasPrefix(binaryPath, "/tmp/") ||
 			strings.HasPrefix(binaryPath, "/dev/shm/") ||
 			strings.HasPrefix(binaryPath, "/var/tmp/")
@@ -721,7 +731,7 @@ func parseExecve(line string) (types.SyscallEvent, bool) {
 		Timestamp: time.Now().UTC(),
 		PID:       extractPID(line),
 		Syscall:   types.EventExecve,
-		Comm:      matches[1],
+		Comm:      binaryPath,
 		Cmdline:   cmdline,
 	}, true
 }
@@ -752,7 +762,7 @@ func parseExecveat(line string) (types.SyscallEvent, bool) {
 		return types.SyscallEvent{}, false
 	}
 
-	dirfd, execPath, argv := matches[1], matches[2], matches[3]
+	dirfd, execPath, argv := matches[1], unescapeStracePath(matches[2]), matches[3]
 
 	// AT_EMPTY_PATH + numeric dirfd = fexecve pattern. AT_FDCWD in this
 	// position with empty path is legal but nonsensical (execveat glibc
@@ -918,6 +928,21 @@ func decodeDNSBuffer(escaped string) string {
 	}
 	// Skip 12-byte DNS header, parse question name.
 	return parseDNSName(raw[12:])
+}
+
+// unescapeStracePath decodes a strace-captured filename by running
+// unescapeStraceBuf and returning the result as a string. Filenames
+// captured with the alternation-escape regex (`(?:\\.|[^"\\])+`)
+// preserve backslash-escape sequences intact (`\"`, `\\`, `\NNN`,
+// `\xNN`, `\a\b\f\n\r\t\v\'`); downstream analyzer matching (e.g.
+// `strings.Contains(FilePath, "/.ssh/")`) expects the decoded byte
+// sequence, so all callers should route captured filenames through
+// this helper before storing them in a SyscallEvent field.
+func unescapeStracePath(escaped string) string {
+	if !strings.ContainsRune(escaped, '\\') {
+		return escaped
+	}
+	return string(unescapeStraceBuf(escaped))
 }
 
 // unescapeStraceBuf converts strace's C-escaped buffer representation to bytes.

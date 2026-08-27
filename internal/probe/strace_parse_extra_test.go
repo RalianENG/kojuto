@@ -1040,16 +1040,19 @@ func TestParseStraceLine_RenameWithEscapedQuotes(t *testing.T) {
 		wantDst string
 	}{
 		{
-			name:    "rename with escaped quote in src",
-			line:    `[pid 100] rename("/tmp/x\"y", "/usr/local/bin/python3") = 0`,
-			wantSrc: `/tmp/x\"y`,
+			name: "rename with escaped quote in src",
+			line: `[pid 100] rename("/tmp/x\"y", "/usr/local/bin/python3") = 0`,
+			// unescapeStracePath now decodes \" to the literal ", so
+			// downstream substring matches against sensitive paths see
+			// the actual filename bytes rather than the raw escape.
+			wantSrc: `/tmp/x"y`,
 			wantDst: "/usr/local/bin/python3",
 		},
 		{
 			name:    "renameat with escaped quote in dst",
 			line:    `[pid 101] renameat(AT_FDCWD, "/tmp/legit", AT_FDCWD, "/etc/x\"y") = 0`,
 			wantSrc: "/tmp/legit",
-			wantDst: `/etc/x\"y`,
+			wantDst: `/etc/x"y`,
 		},
 		{
 			name:    "plain rename still parses",
@@ -1075,6 +1078,69 @@ func TestParseStraceLine_RenameWithEscapedQuotes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestParseFilenameEscape_OpenatExecveUnlink pins the alternation-escape
+// coverage extended from rename to the remaining filename-carrying
+// syscalls (openat / execve / execveat / unlink / unlinkat). Before
+// this change every filename regex used the naive `[^"]+` pattern,
+// so an attacker who dropped a payload or targeted a credential
+// file whose name contained a literal `"` (rendered by strace as
+// `\"`) silently bypassed the event emission.
+func TestParseFilenameEscape_OpenatExecveUnlink(t *testing.T) {
+	saved := sensitivePathPatterns
+	defer func() { sensitivePathPatterns = saved }()
+	SetSensitivePaths([]string{"/.ssh/"})
+
+	t.Run("openat sensitive path with escaped quote", func(t *testing.T) {
+		line := `[pid 100] openat(AT_FDCWD, "/home/dev/.ssh/id\"key", O_RDONLY) = 3`
+		evt, ok := parseStraceLine(line, NewParseState())
+		if !ok {
+			t.Fatal("openat with escaped quote should still emit")
+		}
+		if evt.FilePath != `/home/dev/.ssh/id"key` {
+			t.Errorf("FilePath = %q, want /home/dev/.ssh/id\"key (decoded)", evt.FilePath)
+		}
+	})
+
+	t.Run("execve suspicious /tmp with escaped quote", func(t *testing.T) {
+		line := `[pid 101] execve("/tmp/pay\"load", ["pay\"load"], 0x...) = 0`
+		evt, ok := parseStraceLine(line, NewParseState())
+		if !ok {
+			t.Fatal("execve with escaped quote should still emit")
+		}
+		if evt.Comm != `/tmp/pay"load` {
+			t.Errorf("Comm = %q, want /tmp/pay\"load (decoded)", evt.Comm)
+		}
+	})
+
+	t.Run("execveat suspicious /tmp with escaped quote", func(t *testing.T) {
+		line := `[pid 102] execveat(AT_FDCWD, "/tmp/x\"y", ["a"], 0x..., 0) = 0`
+		evt, ok := parseStraceLine(line, NewParseState())
+		if !ok {
+			t.Fatal("execveat with escaped quote should still emit")
+		}
+		if evt.Comm != `/tmp/x"y` {
+			t.Errorf("Comm = %q, want /tmp/x\"y (decoded)", evt.Comm)
+		}
+	})
+
+	t.Run("unlink of created payload with escaped quote", func(t *testing.T) {
+		state := NewParseState()
+		createLine := `[pid 103] openat(AT_FDCWD, "/tmp/dropper\"1", O_WRONLY|O_CREAT|O_TRUNC, 0644) = 3`
+		trackTmpFileCreation(createLine, state)
+		if !state.createdTmpFiles[`/tmp/dropper"1`] {
+			t.Fatal("trackTmpFileCreation should record decoded path")
+		}
+		unlinkLine := `[pid 103] unlink("/tmp/dropper\"1") = 0`
+		evt, ok := parseUnlink(unlinkLine, state)
+		if !ok {
+			t.Fatal("unlink of previously-created file should emit")
+		}
+		if evt.FilePath != `/tmp/dropper"1` {
+			t.Errorf("FilePath = %q, want /tmp/dropper\"1 (decoded)", evt.FilePath)
+		}
+	})
 }
 
 // TestParseExecveat pins the three execveat shapes kojuto cares
