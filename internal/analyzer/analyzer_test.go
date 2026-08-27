@@ -1545,7 +1545,7 @@ func TestClassify_OpenatSystemBinaryWrite(t *testing.T) {
 		FilePath:  "/usr/local/bin/python3",
 		OpenFlags: "O_WRONLY|O_CREAT|O_TRUNC",
 	}
-	classify(&evt)
+	classify(&evt, nil)
 	if evt.Category != types.CategoryBinaryHijack {
 		t.Errorf("category = %q, want %q", evt.Category, types.CategoryBinaryHijack)
 	}
@@ -1560,7 +1560,7 @@ func TestClassify_OpenatSystemBinaryReadNotHijack(t *testing.T) {
 		FilePath:  "/usr/local/bin/python3",
 		OpenFlags: "O_RDONLY|O_CLOEXEC",
 	}
-	classify(&evt)
+	classify(&evt, nil)
 	// Read should NOT be classified as binary hijack.
 	if evt.Category == types.CategoryBinaryHijack {
 		t.Error("read from system binary should not be binary_hijacking")
@@ -1573,7 +1573,7 @@ func TestClassify_DynamicExec(t *testing.T) {
 		AuditEvent:  "eval",
 		CodeSnippet: "process.env.GITHUB_TOKEN",
 	}
-	classify(&evt)
+	classify(&evt, nil)
 	if evt.Category != types.CategoryDynamicExec {
 		t.Errorf("category = %q, want %q", evt.Category, types.CategoryDynamicExec)
 	}

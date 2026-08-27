@@ -370,6 +370,136 @@ func TestUnescapeStraceBuf(t *testing.T) {
 	if got2[28] != 4 {
 		t.Errorf("label len at byte 28: got %d, want 4", got2[28])
 	}
+
+	// Alphabetic C escapes strace uses for specific control bytes.
+	// \f is the case that broke DGA detection in live scans: a DNS
+	// label length of 12 (0x0C) is rendered as `\f`, so if the
+	// escape is dropped the label reader misaligns on the very
+	// first length byte.
+	alphaCases := []struct {
+		name  string
+		input string
+		want  []byte
+	}{
+		{"form feed (\\f = 0x0C)", `\fabc`, []byte{0x0C, 'a', 'b', 'c'}},
+		{"vertical tab (\\v = 0x0B)", `\vxy`, []byte{0x0B, 'x', 'y'}},
+		{"alert (\\a = 0x07)", `\aXY`, []byte{0x07, 'X', 'Y'}},
+		{"backspace (\\b = 0x08)", `\bZ`, []byte{0x08, 'Z'}},
+		{"escaped quote (\\\") ", `\"hi`, []byte{'"', 'h', 'i'}},
+		{"escaped apostrophe (\\')", `\'x`, []byte{'\'', 'x'}},
+	}
+	for _, tc := range alphaCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := unescapeStraceBuf(tc.input)
+			if len(got) != len(tc.want) {
+				t.Fatalf("length mismatch: got %d %v, want %d %v",
+					len(got), got, len(tc.want), tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Errorf("byte %d: got %d, want %d", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+
+	// End-to-end: d2_dga_low_entropy_multi's actual sendto line
+	// (captured from a live scan). Without the \f handler the
+	// parser dropped one byte on every DGA query and DNS name
+	// extraction silently failed.
+	dgaLine := `sendto(3, "\314\314\1\0\0\1\0\0\0\0\0\0\fnode-edge-01\7metrics\17legit-analytics\3com\0\0\1\0\1", 58, 0, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, 16) = 58`
+	if got := extractDNSQuery(dgaLine); got != "node-edge-01.metrics.legit-analytics.com" {
+		t.Errorf("d2-style DGA sendto: got %q, want node-edge-01.metrics.legit-analytics.com", got)
+	}
+}
+
+// TestExtractDNSQueryFromMsg pins the sendmsg / sendmmsg DNS
+// extraction path. sendto had DNS extraction; sendmsg / sendmmsg
+// were previously silent because their buffer lives inside a
+// msg_iov entry (`iov_base="..."`) rather than as a direct argument.
+// Attacker code that constructs raw DNS packets via sendmsg to
+// avoid the more-inspected sendto path would have escaped detection.
+func TestExtractDNSQueryFromMsg(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		want string
+	}{
+		{
+			name: "sendmsg with iov_base carrying DNS",
+			line: `sendmsg(3, {msg_name={sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, msg_namelen=16, msg_iov=[{iov_base="\0\0\1\0\0\1\0\0\0\0\0\0\x06google\x03com\0\0\1\0\1", iov_len=28}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 28`,
+			want: "google.com",
+		},
+		{
+			name: "sendmmsg with iov_base inside msg_hdr",
+			line: `sendmmsg(3, [{msg_hdr={msg_name={sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, msg_iov=[{iov_base="\0\0\1\0\0\1\0\0\0\0\0\0\x04test\x03com\0\0\1\0\1", iov_len=26}], msg_iovlen=1}, msg_len=26}], 1, 0) = 1`,
+			want: "test.com",
+		},
+		{
+			name: "sendmsg with buffer that has \\f label length (\"node-edge-01\" is 12 chars)",
+			line: `sendmsg(3, {msg_name={sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, msg_namelen=16, msg_iov=[{iov_base="\314\314\1\0\0\1\0\0\0\0\0\0\fnode-edge-01\7metrics\17legit-analytics\3com\0\0\1\0\1", iov_len=58}], msg_iovlen=1}, 0) = 58`,
+			want: "node-edge-01.metrics.legit-analytics.com",
+		},
+		{
+			name: "no iov_base present (regex miss)",
+			line: `sendmsg(3, {msg_name={sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, ..., msg_flags=0}, 0) = 28`,
+			want: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := extractDNSQueryFromMsg(tc.line)
+			if got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestExtractDNSQuery_EscapedQuoteInBuffer pins the buffer-capture
+// regex against DNS wire packets whose bytes include 0x22 (rendered
+// by strace as `\"`). Query IDs and lengths land on 0x22 a small but
+// non-zero fraction of the time, and an attacker can deliberately
+// pick one to silence detection. Before the alternation-escape fix
+// the outer regex terminated at the first byte of `\"`, capturing an
+// almost-empty buffer and returning "".
+func TestExtractDNSQuery_EscapedQuoteInBuffer(t *testing.T) {
+	// Live-captured line: query ID 0x2222 → header renders as \"\".
+	line := `sendto(3, "\"\"\1\0\0\1\0\0\0\0\0\0\4test\3com\0\0\1\0\1", 26, 0, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, 16) = 26`
+	if got := extractDNSQuery(line); got != "test.com" {
+		t.Errorf("query ID with 0x22 byte: got %q, want test.com — silent truncation regressed", got)
+	}
+}
+
+// TestExtractDNSQueryFromMsg_EscapedQuoteInBuffer mirrors the
+// escaped-quote test for the sendmsg / sendmmsg path.
+func TestExtractDNSQueryFromMsg_EscapedQuoteInBuffer(t *testing.T) {
+	line := `sendmsg(3, {msg_name={sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, msg_namelen=16, msg_iov=[{iov_base="\"\"\1\0\0\1\0\0\0\0\0\0\4test\3com\0\0\1\0\1", iov_len=26}], msg_iovlen=1}, 0) = 26`
+	if got := extractDNSQueryFromMsg(line); got != "test.com" {
+		t.Errorf("sendmsg with 0x22 byte: got %q, want test.com", got)
+	}
+}
+
+// TestParseStraceLine_SendmsgDNS wires the parseStraceLine dispatch
+// end-to-end: a sendmsg to port 53 populates DNSQuery from the
+// iov_base buffer, so downstream analyzer rules (isDNSTunnel,
+// matchExfilService, DGA clustering, DNS chain annotation) all see
+// the queried hostname.
+func TestParseStraceLine_SendmsgDNS(t *testing.T) {
+	line := `[pid 400] sendmsg(3, {msg_name={sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, msg_namelen=16, msg_iov=[{iov_base="\0\0\1\0\0\1\0\0\0\0\0\0\x06google\x03com\0\0\1\0\1", iov_len=28}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 28`
+	evt, ok := parseStraceLine(line, NewParseState())
+	if !ok {
+		t.Fatal("parseStraceLine should recognize the sendmsg")
+	}
+	if evt.Syscall != types.EventSendmsg {
+		t.Errorf("Syscall = %q, want sendmsg", evt.Syscall)
+	}
+	if evt.DstPort != 53 {
+		t.Errorf("DstPort = %d, want 53", evt.DstPort)
+	}
+	if evt.DNSQuery != "google.com" {
+		t.Errorf("DNSQuery = %q, want google.com", evt.DNSQuery)
+	}
 }
 
 func TestParseStraceLine_NoPID(t *testing.T) {

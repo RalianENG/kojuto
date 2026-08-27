@@ -49,25 +49,32 @@ func SetScanPkgs(pkgs []string) {
 // Events matching known-benign patterns are filtered out first.
 // Suspicious events are enriched with Category and Reason fields.
 func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
-	// Pre-pass: collect paths that were executed (execve) and files that
-	// were written (openat O_CREAT/O_WRONLY) to correlate with unlinks.
-	executedPaths := collectExecutedPaths(events)
-
-	// Pre-pass: build PID → comm map from execve events so later
-	// syscalls (mprotect, mmap) can be attributed back to the process
-	// that issued them. Strace mprotect lines do not carry the
-	// process name; only the PID. This map is the missing link.
-	pidComm := collectPIDComm(events)
+	// Single flow-aware pre-pass. See FlowState in flowstate.go for
+	// the state layout and Phase 1/2/3 refactor rationale — historical
+	// per-correlation pre-passes (collectPIDComm, collectExecutedPaths)
+	// live here as fields on a shared context so future series-aware
+	// rules (DNS→connect chain, DGA, memfd→execveat) can layer new
+	// state without another parallel pre-pass over `events`.
+	state := newFlowState(events)
 
 	var suspicious []types.SyscallEvent
 
 	for i := range events {
+		// Record DNS observations BEFORE any filtering. A loopback DNS
+		// query (Docker embedded resolver at 127.0.0.11:53) filters as
+		// benign for verdict purposes but the queried hostname is
+		// still evidence the caller wanted to reach that name — the
+		// downstream connect annotation uses this chain so an isolated
+		// LOW connect can still tell the analyst "PID 100 queried
+		// evil.com before dialing this IP".
+		state.RecordDNSQuery(&events[i])
+
 		// V8 JIT filter: simultaneous RWX mprotect/mmap from a Node
 		// interpreter is legitimate JIT page management, not shellcode
 		// injection. The detection comment in strace_parse.go has been
 		// documenting this as a known false-positive source; this is
 		// the implementation it pointed at.
-		if isV8JITPageOp(&events[i], pidComm) {
+		if isV8JITPageOp(&events[i], state.PIDComm) {
 			continue
 		}
 
@@ -75,14 +82,14 @@ func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
 			continue
 		}
 
-		classify(&events[i])
+		classify(&events[i], state)
 
 		// Anti-forensics refinement: only keep unlink events for files
 		// that were also EXECUTED during this scan. This distinguishes
 		// malware payload self-deletion (create→execute→delete) from
 		// pip temp file cleanup (create→delete without execute).
 		if events[i].Category == types.CategoryAntiForensics {
-			if !executedPaths[events[i].FilePath] {
+			if !state.ExecutedPaths[events[i].FilePath] {
 				continue
 			}
 			events[i].Reason = "Payload self-deletion: " + events[i].FilePath +
@@ -92,6 +99,14 @@ func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
 
 		suspicious = append(suspicious, events[i])
 	}
+
+	// Post-classification pass: structural DGA detection over the
+	// accumulated DNS observations. Individual queries already
+	// registered as dns_lookup LOW forensic breadcrumbs during the
+	// main loop; the DGA rule emits an aggregate MEDIUM per detected
+	// (PID, 2LD) cluster on top of those. Not part of classify()
+	// because DGA is per-CLUSTER, not per-event.
+	suspicious = appendDGAFindings(state, suspicious)
 
 	if len(suspicious) == 0 {
 		return types.VerdictClean, nil
@@ -103,6 +118,37 @@ func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
 	// package. Events still flow into `suspicious` for forensic visibility
 	// in the report.
 	return decideVerdict(suspicious), suspicious
+}
+
+// appendDGAFindings runs the structural DGA detector on the
+// accumulated DNS state and appends one synthetic MEDIUM event per
+// detected cluster. Called after the per-event classification loop
+// so individual dns_lookup / dns_tunneling events are already in
+// `suspicious` — the DGA finding is an aggregate on top of the
+// forensic breadcrumbs, not a replacement for them.
+func appendDGAFindings(state *FlowState, suspicious []types.SyscallEvent) []types.SyscallEvent {
+	clusters := state.DetectDGAClusters()
+	for i := range clusters {
+		c := &clusters[i]
+		reason := "Structural DGA pattern: " + strconv.Itoa(c.QueryCount) +
+			" distinct subdomains under " + c.TwoLD +
+			" queried by PID " + strconv.FormatUint(uint64(c.PID), 10) +
+			" with consistent subdomain morphology (uniform length + character-class fingerprint). " +
+			"Individual queries have low per-query entropy so they escape the dns_tunneling check, " +
+			"but the aggregate cardinality + morphology is the signature C2 discovery uses."
+		if len(c.Samples) > 0 {
+			reason += " Samples: " + strings.Join(c.Samples, ", ") + "."
+		}
+		suspicious = append(suspicious, types.SyscallEvent{
+			Syscall:  types.EventSendto,
+			PID:      c.PID,
+			DstPort:  53,
+			DNSQuery: c.TwoLD,
+			Category: types.CategoryDGA,
+			Reason:   reason,
+		})
+	}
+	return suspicious
 }
 
 // decideVerdict applies the severity rules: any HIGH event → SUSPICIOUS;
@@ -320,15 +366,6 @@ func collectExecutedPaths(events []types.SyscallEvent) map[string]bool {
 	return paths
 }
 
-// isInSuspiciousDir checks if a path is in a directory associated with
-// payload staging (same dirs as the unlink detector).
-func isInSuspiciousDir(filePath string) bool {
-	return strings.HasPrefix(filePath, "/tmp/") ||
-		strings.HasPrefix(filePath, "/dev/shm/") ||
-		strings.HasPrefix(filePath, "/var/tmp/") ||
-		strings.HasPrefix(filePath, "/run/")
-}
-
 // GenerateSummary creates a human-readable summary from analyzed events.
 func GenerateSummary(verdict string, events []types.SyscallEvent) *types.ReportSummary {
 	if verdict == types.VerdictClean {
@@ -410,6 +447,8 @@ func categoryShortDesc(c string) string {
 		return "execve without positive attack signature (info)"
 	case types.CategoryDNSLookup:
 		return "isolated name resolution (info; C2 fires on the follow-up connect)"
+	case types.CategoryDGA:
+		return "structural DGA: many uniform-morphology subdomains under one 2LD"
 	}
 	return c
 }
@@ -455,8 +494,8 @@ func assessRisk(categories []string) string {
 	}
 	for _, c := range categories {
 		switch c {
-		case types.CategoryBinaryHijack, types.CategoryDNSTunnel, types.CategoryPersistence,
-			types.CategoryEvasion, types.CategoryAntiForensics:
+		case types.CategoryBinaryHijack, types.CategoryDNSTunnel, types.CategoryDGA,
+			types.CategoryPersistence, types.CategoryEvasion, types.CategoryAntiForensics:
 			return "high"
 		}
 	}
@@ -483,6 +522,8 @@ func buildDescription(_ []types.SyscallEvent, categories []string) string {
 			parts = append(parts, "write to shell startup file (persistence mechanism)")
 		case types.CategoryDNSTunnel:
 			parts = append(parts, "DNS tunneling detected (high-entropy subdomain queries)")
+		case types.CategoryDGA:
+			parts = append(parts, "structural DGA pattern detected (many uniform subdomains under one 2LD)")
 		case types.CategoryEvasion:
 			parts = append(parts, "anti-debugging evasion detected (ptrace self-check)")
 		case types.CategoryMemExec:
@@ -516,11 +557,15 @@ func buildRemediation(catSet map[string]bool) string {
 	return "Do NOT install this package. Review the events list for details."
 }
 
-// classify assigns Category and Reason to a suspicious event.
-func classify(evt *types.SyscallEvent) {
+// classify assigns Category and Reason to a suspicious event. The
+// FlowState argument gives series-aware rules (currently only
+// classifyConnect's C2-chain annotation) visibility into
+// earlier-observed correlated events; classifiers that need no
+// cross-event context ignore it.
+func classify(evt *types.SyscallEvent, state *FlowState) {
 	switch evt.Syscall {
 	case types.EventConnect:
-		classifyConnect(evt)
+		classifyConnect(evt, state)
 
 	case types.EventSendto, types.EventSendmsg, types.EventSendmmsg:
 		classifySend(evt)
@@ -583,7 +628,14 @@ var persistenceTargets = []string{
 // classifyConnect handles TCP/UDP connect events. Split out from
 // classify() so the growth of DNS-specific branches doesn't push the
 // parent function over the linter's cognitive-complexity budget.
-func classifyConnect(evt *types.SyscallEvent) {
+//
+// FlowState is consulted for the default (non-DoH, non-53) branch
+// only: the C2 Reason is annotated with hostnames the same PID
+// queried earlier in the scan. This does NOT change the category or
+// verdict — a bare connect stays HIGH C2 whether or not a preceding
+// DNS query exists; the annotation gives the analyst the causal
+// chain that produced the connect target.
+func classifyConnect(evt *types.SyscallEvent, state *FlowState) {
 	switch {
 	case isKnownDoHServer(evt.DstAddr) && evt.DstPort == 443:
 		evt.Category = types.CategoryDNSTunnel
@@ -605,6 +657,12 @@ func classifyConnect(evt *types.SyscallEvent) {
 		evt.Category = types.CategoryC2
 		evt.Reason = "Outbound connection to " + evt.DstAddr + ":" + portStr(evt.DstPort) +
 			" — packages should not make network connections during install or import."
+		if state != nil {
+			if hosts := state.DNSHostnamesForPID(evt.PID); len(hosts) > 0 {
+				evt.Reason += " Preceded by DNS query for: " + strings.Join(hosts, ", ") +
+					" (same PID) — outbound connect is the harm-firing step in the DNS→connect C2 chain."
+			}
+		}
 	}
 }
 

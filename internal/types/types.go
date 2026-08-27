@@ -93,6 +93,20 @@ const (
 	// legitimate defensive connectivity probes (getaddrinfo at import
 	// time, glibc NSS lookups) that every scan otherwise trips.
 	CategoryDNSLookup = "dns_lookup"
+	// CategoryDGA records the structural Domain Generation Algorithm
+	// pattern: a single PID emits N+ distinct subdomain queries under
+	// the same registrable 2LD whose subdomain labels share consistent
+	// morphology (uniform length + character-class fingerprint). This
+	// is the pattern real C2 discovery uses (SUNBURST/Sunburst-style
+	// avsvmcloud.com beaconing) and one that per-query entropy checks
+	// can never catch — each individual dictionary-word subdomain
+	// passes the entropy threshold, but the aggregate cardinality +
+	// morphology gives it away. Emitted at MEDIUM: a single cluster
+	// stays under the verdict threshold on its own (heuristic rule
+	// with FP potential on very active CDN clients), but pairs with
+	// any other MEDIUM signal or a second DGA cluster to flip the
+	// verdict.
+	CategoryDGA = "dga"
 )
 
 // Category severity tiers drive verdict assignment in analyzer.Analyze.
@@ -124,6 +138,7 @@ var CategorySeverity = map[string]string{
 	CategoryAntiForensics:    SeverityHigh,
 	CategoryLibraryHijack:    SeverityHigh,
 	CategoryDNSTunnel:        SeverityMedium,
+	CategoryDGA:              SeverityMedium,
 	CategoryEvasion:          SeverityMedium,
 	CategoryDynamicExec:      SeverityLow,
 	CategoryUnknownBinary:    SeverityLow,
