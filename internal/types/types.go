@@ -19,6 +19,17 @@ const (
 	EventMprotect    = "mprotect"
 	EventUnlink      = "unlink"
 	EventDynamicExec = "dynamic_exec"
+	// EventImportAttempt records the outcome of one __import__/require
+	// call issued by the OS-simulation probe scripts. Emitted by
+	// pythonImportProbeSource / nodeImportProbeSource as a
+	// `KOJUTO:import_attempt:<dist>:<module>:<result>` line and parsed
+	// into a SyscallEvent so analyzer.Analyze can determine whether the
+	// import phase actually exercised any package code. When no attempt
+	// succeeds the verdict becomes `inconclusive` — that closes the
+	// silent-no-op gap where `pkg.replace("-","_")` produced an
+	// ImportError that was swallowed by the wrapping try/except,
+	// yielding a false "clean" verdict.
+	EventImportAttempt = "import_attempt"
 	// EventClone records a clone/clone3/fork/vfork call. The parent
 	// PID lives in PID; the new child PID lives in ChildPID. The
 	// analyzer's PID-attribution pre-pass uses these to propagate

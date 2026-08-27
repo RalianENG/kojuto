@@ -989,16 +989,13 @@ func shQuote(s string) string {
 // hiding platform-gated payloads — that is itself a false-clean vector.
 func (s *Sandbox) WriteProbeScriptsMulti(ctx context.Context, pkgs []string) error {
 	if s.ecosystem == types.EcosystemNpm {
+		nodeImportSource := nodeImportProbeSource(pkgs)
 		for _, p := range []string{"linux", "win32", "darwin"} {
-			var requires strings.Builder
-			for _, pkg := range pkgs {
-				fmt.Fprintf(&requires, "try{require('%s')}catch(e){}\n", pkg)
-			}
 			script := fmt.Sprintf(
 				"module.paths.unshift('/install/node_modules');\n"+
 					"Object.defineProperty(process,'platform',{value:'%s'});\n"+
 					"%s",
-				p, requires.String(),
+				p, nodeImportSource,
 			)
 			filename := "/tmp/_kojuto_probe_all_" + p + ".js"
 			if err := s.dockerWriteFile(ctx, filename, script); err != nil {
@@ -1021,12 +1018,8 @@ func (s *Sandbox) WriteProbeScriptsMulti(ctx context.Context, pkgs []string) err
 		{"Windows", "win32", "nt", "\\\\", ";", "\\r\\n"},
 		{"Darwin", "darwin", "posix", "/", ":", "\\n"},
 	}
+	importProbeSource := pythonImportProbeSource(pkgs)
 	for _, p := range pyPlatforms {
-		var imports strings.Builder
-		for _, pkg := range pkgs {
-			importName := strings.ReplaceAll(pkg, "-", "_")
-			fmt.Fprintf(&imports, "try:\n __import__('%s')\nexcept Exception:\n pass\n", importName)
-		}
 		script := fmt.Sprintf(
 			"import platform,sys,os,collections\n"+
 				"for _k in ['LD_PRELOAD','FAKETIME','FAKETIME_NO_CACHE','FAKETIME_TIMESTAMP_FILE']:\n"+
@@ -1042,7 +1035,7 @@ func (s *Sandbox) WriteProbeScriptsMulti(ctx context.Context, pkgs []string) err
 				"os.linesep='%s'\n"+
 				"%s",
 			p.system, p.system, p.sysplatform, p.osname,
-			p.sep, p.pathsep, p.linesep, imports.String(),
+			p.sep, p.pathsep, p.linesep, importProbeSource,
 		)
 		filename := "/tmp/_kojuto_probe_all_" + p.sysplatform + ".py"
 		if err := s.dockerWriteFile(ctx, filename, script); err != nil {
@@ -1085,11 +1078,106 @@ func (s *Sandbox) ImportCommands() [][]string {
 	return s.pythonImportCommands()
 }
 
+// pythonImportProbeSource emits a Python snippet that resolves each dist
+// name in `dists` to the actual top-level module name(s) at runtime and
+// attempts to import each. Every attempt writes a KOJUTO:import_attempt:
+// line to stderr so the analyzer can observe (a) that the import phase
+// actually ran and (b) whether any import succeeded. Historically the
+// probe used a naive `pkg.replace("-", "_")` and swallowed ImportError,
+// so pillow (dist=pillow, module=PIL), pyyaml (module=yaml),
+// beautifulsoup4 (module=bs4), scikit-learn (module=sklearn),
+// opencv-python (module=cv2) et al. produced no import-phase syscalls
+// and returned "clean" without any observable behavior. An attacker
+// could exploit this by deliberately mismatching dist and module names.
+//
+// The resolver reads `.dist-info/top_level.txt` via importlib.metadata,
+// falls back to walking dist files for top-level `<name>.py` or
+// `<name>/__init__.py` entries, and finally falls back to the canonical
+// dist-name so packages without top_level.txt still import the obvious
+// way. importlib.metadata is stdlib since Python 3.8; the sandbox
+// image ships Python 3.12 so no compatibility shim is needed.
+func pythonImportProbeSource(dists []string) string {
+	distList := make([]string, len(dists))
+	for i, d := range dists {
+		distList[i] = `'` + strings.ReplaceAll(d, "'", `\'`) + `'`
+	}
+	return `_KJ_DISTS=[` + strings.Join(distList, ",") + `]
+import sys as _kj_sys
+try:
+ from importlib import metadata as _kj_md
+except Exception:
+ _kj_md=None
+def _kj_resolve(dist):
+ canon=dist.lower().replace('-','_')
+ if _kj_md is None:
+  return [canon]
+ try:
+  files=_kj_md.files(dist) or []
+ except Exception:
+  return [canon]
+ for f in files:
+  if str(f).endswith('top_level.txt'):
+   try:
+    text=f.read_text()
+    names=[ln.strip() for ln in text.splitlines() if ln.strip()]
+    if names:
+     return names
+   except Exception:
+    pass
+   break
+ top=set()
+ for f in files:
+  p=str(f)
+  if '.dist-info/' in p or '.egg-info/' in p:
+   continue
+  if '/' not in p and p.endswith('.py') and p!='__init__.py':
+   top.add(p[:-3])
+  elif p.endswith('/__init__.py') and p.count('/')==1:
+   top.add(p.split('/')[0])
+ return sorted(top) if top else [canon]
+for _kj_d in _KJ_DISTS:
+ for _kj_n in _kj_resolve(_kj_d):
+  try:
+   __import__(_kj_n)
+   _kj_sys.stderr.write('KOJUTO:import_attempt:'+_kj_d+':'+_kj_n+':ok\n')
+  except BaseException as _e:
+   _kj_sys.stderr.write('KOJUTO:import_attempt:'+_kj_d+':'+_kj_n+':fail:'+type(_e).__name__+'\n')
+_kj_sys.stderr.flush()
+`
+}
+
+// nodeImportProbeSource emits the npm-side equivalent of
+// pythonImportProbeSource: try to require() each package; on
+// ERR_REQUIRE_ESM (or module-not-found via CJS on ESM-only packages),
+// fall back to dynamic import(). Every attempt emits a
+// KOJUTO:import_attempt: line so the analyzer can observe reality.
+func nodeImportProbeSource(pkgs []string) string {
+	pkgList := make([]string, len(pkgs))
+	for i, p := range pkgs {
+		pkgList[i] = `'` + strings.ReplaceAll(p, "'", `\'`) + `'`
+	}
+	return `const _KJ_PKGS=[` + strings.Join(pkgList, ",") + `];
+(async()=>{
+ for(const p of _KJ_PKGS){
+  let ok=false, err='';
+  try{require(p); ok=true;}
+  catch(e){
+   err=e&&e.code?e.code:(e&&e.name?e.name:'Error');
+   if(err==='ERR_REQUIRE_ESM'||err==='MODULE_NOT_FOUND'){
+    try{await import(p); ok=true; err='';}catch(e2){err=e2&&e2.code?e2.code:(e2&&e2.name?e2.name:'Error');}
+   }
+  }
+  process.stderr.write('KOJUTO:import_attempt:'+p+':'+p+':'+(ok?'ok':('fail:'+err))+'\n');
+ }
+})();
+`
+}
+
 // WriteProbeScripts writes the OS-simulation import scripts into the container's
 // /tmp directory. Must be called before ImportCommands. Returns an error if any
 // script fails to land — see WriteProbeScriptsMulti for the rationale.
 func (s *Sandbox) WriteProbeScripts(ctx context.Context) error {
-	importName := strings.ReplaceAll(s.pkg, "-", "_")
+	importProbeSource := pythonImportProbeSource([]string{s.pkg})
 
 	// Each simulated OS must be consistent across ALL platform detection APIs.
 	// Malware checks platform.system() vs platform.uname().system, os.sep vs
@@ -1129,9 +1217,9 @@ func (s *Sandbox) WriteProbeScripts(ctx context.Context) error {
 				"os.sep='%s'\n"+
 				"os.pathsep='%s'\n"+
 				"os.linesep='%s'\n"+
-				"try:\n import %s\nexcept Exception:\n pass\n",
+				"%s",
 			p.system, p.system, p.sysplatform, p.osname,
-			p.sep, p.pathsep, p.linesep, importName,
+			p.sep, p.pathsep, p.linesep, importProbeSource,
 		)
 		filename := "/tmp/_kojuto_probe_" + p.sysplatform + ".py"
 		if err := s.dockerWriteFile(ctx, filename, script); err != nil {
@@ -1139,13 +1227,14 @@ func (s *Sandbox) WriteProbeScripts(ctx context.Context) error {
 		}
 	}
 
+	nodeImportSource := nodeImportProbeSource([]string{s.pkg})
 	jsPlatforms := []string{"linux", "win32", "darwin"}
 	for _, p := range jsPlatforms {
 		script := fmt.Sprintf(
 			"module.paths.unshift('/install/node_modules');\n"+
 				"Object.defineProperty(process,'platform',{value:'%s'});\n"+
-				"try{require('%s')}catch(e){}\n",
-			p, s.pkg,
+				"%s",
+			p, nodeImportSource,
 		)
 		filename := "/tmp/_kojuto_probe_" + p + ".js"
 		if err := s.dockerWriteFile(ctx, filename, script); err != nil {

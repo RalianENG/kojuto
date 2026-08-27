@@ -780,6 +780,80 @@ func TestParseAuditHook_NodeVm(t *testing.T) {
 	}
 }
 
+// TestParseAuditHook_ImportAttempt exercises the new import-attempt
+// path emitted by pythonImportProbeSource / nodeImportProbeSource.
+// The result field distinguishes ok / fail and the CodeSnippet
+// carries the failure error type so the report retains diagnostic
+// context.
+func TestParseAuditHook_ImportAttempt(t *testing.T) {
+	cases := []struct {
+		name     string
+		line     string
+		wantOK   bool
+		wantDist string
+		wantMod  string
+		wantRes  string
+		wantErr  string
+	}{
+		{
+			name:     "pillow ok (dist != module)",
+			line:     "KOJUTO:import_attempt:pillow:PIL:ok",
+			wantOK:   true,
+			wantDist: "pillow",
+			wantMod:  "PIL",
+			wantRes:  "ok",
+		},
+		{
+			name:     "pyyaml ok",
+			line:     "KOJUTO:import_attempt:pyyaml:yaml:ok",
+			wantOK:   true,
+			wantDist: "pyyaml",
+			wantMod:  "yaml",
+			wantRes:  "ok",
+		},
+		{
+			name:     "silent no-op regression: fail with ImportError",
+			line:     "KOJUTO:import_attempt:pillow:pillow:fail:ImportError",
+			wantOK:   true,
+			wantDist: "pillow",
+			wantMod:  "pillow",
+			wantRes:  "fail",
+			wantErr:  "ImportError",
+		},
+		{
+			name:     "fail without error type still parses",
+			line:     "KOJUTO:import_attempt:x:x:fail",
+			wantOK:   true,
+			wantDist: "x",
+			wantMod:  "x",
+			wantRes:  "fail",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			evt, ok := parseAuditHook(tc.line)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
+			}
+			if evt.Syscall != types.EventImportAttempt {
+				t.Errorf("Syscall = %q, want %q", evt.Syscall, types.EventImportAttempt)
+			}
+			if evt.Comm != tc.wantDist {
+				t.Errorf("Comm (dist) = %q, want %q", evt.Comm, tc.wantDist)
+			}
+			if evt.Cmdline != tc.wantMod {
+				t.Errorf("Cmdline (module) = %q, want %q", evt.Cmdline, tc.wantMod)
+			}
+			if evt.FilePath != tc.wantRes {
+				t.Errorf("FilePath (result) = %q, want %q", evt.FilePath, tc.wantRes)
+			}
+			if evt.CodeSnippet != tc.wantErr {
+				t.Errorf("CodeSnippet (error) = %q, want %q", evt.CodeSnippet, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestParseAuditHook_NotKojutoLine(t *testing.T) {
 	lines := []string{
 		`[pid 100] connect(3, {sa_family=AF_INET}, 16) = 0`,
