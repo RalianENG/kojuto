@@ -1407,7 +1407,7 @@ func TestOpenatDirFDResolution(t *testing.T) {
 			wantPath:   "/home/dev/.ssh/id_rsa",
 		},
 		{
-			name: "unresolved dirfd (open() before trace) falls through cleanly",
+			name:       "unresolved dirfd (open() before trace) falls through cleanly",
 			setupLines: []string{
 				// No prior open — fd 7 has no recorded path.
 			},
@@ -1423,7 +1423,7 @@ func TestOpenatDirFDResolution(t *testing.T) {
 			wantEvent:  false,
 		},
 		{
-			name: "absolute path with numeric dirfd ignores dirfd (POSIX)",
+			name:       "absolute path with numeric dirfd ignores dirfd (POSIX)",
 			setupLines: []string{
 				// dirfd 3 not recorded; would resolve to bare "" if consulted.
 			},
