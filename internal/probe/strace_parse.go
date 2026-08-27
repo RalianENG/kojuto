@@ -2,6 +2,7 @@ package probe
 
 import (
 	"encoding/hex"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -448,19 +449,30 @@ func trackOpenFD(line string, state *ParseState) {
 	if absPath == "" || !strings.HasPrefix(absPath, "/") {
 		return
 	}
+	// resolveOpenatPath already normalizes; recorded base stays
+	// canonical so future dirfd-relative resolutions inherit a
+	// clean prefix and cannot accumulate `//` or `/./` segments.
 	state.recordFD(extractPID(line), int(fd64), absPath)
 }
 
 // resolveOpenatPath returns the absolute path an openat call resolves
 // to, or "" when it cannot be determined. Rules:
-//   - AT_FDCWD + absolute path      → the path as-is
-//   - AT_FDCWD + relative path      → "" (working directory unknown)
-//   - numeric dirfd + absolute path → the path as-is (POSIX: absolute
+//   - AT_FDCWD + absolute rel        → the path as-is (normalized)
+//   - AT_FDCWD + relative rel        → "" (working directory unknown)
+//   - numeric dirfd + absolute rel   → the rel as-is (POSIX: absolute
 //     path ignores dirfd)
-//   - numeric dirfd + relative path → dirfd's recorded path + "/" + path
-func resolveOpenatPath(dirfd, path string, state *ParseState, pid uint32) string {
-	if strings.HasPrefix(path, "/") {
-		return path
+//   - numeric dirfd + relative rel   → dirfd's recorded path + "/" + rel
+//
+// Every non-empty return flows through normalizePath so cosmetic
+// variants (`/etc/./shadow`, `/etc//shadow`, `/etc/../etc/shadow`)
+// collapse to their canonical form BEFORE the sensitivePathPatterns
+// substring match runs — otherwise the naive Contains check could be
+// dodged by a rearranged path form that still resolves to the same
+// inode. The `rel` parameter is named that way to keep the shadowing
+// warning off the `path` stdlib package used by normalizePath.
+func resolveOpenatPath(dirfd, rel string, state *ParseState, pid uint32) string {
+	if strings.HasPrefix(rel, "/") {
+		return normalizePath(rel)
 	}
 	if dirfd == "AT_FDCWD" {
 		return ""
@@ -473,7 +485,7 @@ func resolveOpenatPath(dirfd, path string, state *ParseState, pid uint32) string
 	if base == "" {
 		return ""
 	}
-	return base + "/" + path
+	return normalizePath(base + "/" + rel)
 }
 
 // parseOpenat emits events for:
@@ -499,6 +511,8 @@ func parseOpenat(line string, state *ParseState) (types.SyscallEvent, bool) {
 
 	if resolved := resolveOpenatPath(dirfd, filePath, state, extractPID(line)); resolved != "" {
 		filePath = resolved
+	} else {
+		filePath = normalizePath(filePath)
 	}
 
 	isWrite := strings.Contains(flags, "O_WRONLY") ||
@@ -609,8 +623,8 @@ func parseRename(line string) (types.SyscallEvent, bool) {
 			Timestamp: time.Now().UTC(),
 			PID:       extractPID(line),
 			Syscall:   types.EventRename,
-			SrcPath:   unescapeStracePath(matches[1]),
-			DstPath:   unescapeStracePath(matches[2]),
+			SrcPath:   normalizePath(unescapeStracePath(matches[1])),
+			DstPath:   normalizePath(unescapeStracePath(matches[2])),
 		}, true
 	}
 
@@ -620,8 +634,8 @@ func parseRename(line string) (types.SyscallEvent, bool) {
 			Timestamp: time.Now().UTC(),
 			PID:       extractPID(line),
 			Syscall:   types.EventRename,
-			SrcPath:   unescapeStracePath(matches[1]),
-			DstPath:   unescapeStracePath(matches[2]),
+			SrcPath:   normalizePath(unescapeStracePath(matches[1])),
+			DstPath:   normalizePath(unescapeStracePath(matches[2])),
 		}, true
 	}
 
@@ -715,7 +729,7 @@ func trackTmpFileCreation(line string, state *ParseState) {
 		return
 	}
 
-	filePath := unescapeStracePath(matches[1])
+	filePath := normalizePath(unescapeStracePath(matches[1]))
 
 	// Skip failed calls.
 	if strings.Contains(line, "= -1 ") {
@@ -743,9 +757,9 @@ func parseUnlink(line string, state *ParseState) (types.SyscallEvent, bool) {
 	var filePath string
 
 	if matches := straceUnlinkRe.FindStringSubmatch(line); matches != nil {
-		filePath = unescapeStracePath(matches[1])
+		filePath = normalizePath(unescapeStracePath(matches[1]))
 	} else if matches := straceUnlinkatRe.FindStringSubmatch(line); matches != nil {
-		filePath = unescapeStracePath(matches[1])
+		filePath = normalizePath(unescapeStracePath(matches[1]))
 	}
 
 	if filePath == "" {
@@ -835,7 +849,7 @@ func parseExecve(line string) (types.SyscallEvent, bool) {
 		return types.SyscallEvent{}, false
 	}
 
-	binaryPath := unescapeStracePath(matches[1])
+	binaryPath := normalizePath(unescapeStracePath(matches[1]))
 
 	// Skip failed execve calls that are harmless PATH search attempts
 	// (ENOENT = file not found at /usr/bin/foo, then tries /bin/foo).
@@ -898,6 +912,7 @@ func parseExecveat(line string) (types.SyscallEvent, bool) {
 	if execPath == "" && strings.Contains(line, "AT_EMPTY_PATH") && dirfd != "AT_FDCWD" {
 		execPath = "/proc/self/fd/" + dirfd
 	}
+	execPath = normalizePath(execPath)
 	if execPath == "" {
 		return types.SyscallEvent{}, false
 	}
@@ -1066,6 +1081,45 @@ func decodeDNSBuffer(escaped string) string {
 // filename captures are always UTF-8-clean bytes; return as string.
 func unescapeStracePath(s string) string {
 	return string(unescapeStraceBuf(s))
+}
+
+// normalizePath canonicalizes a captured filesystem path so downstream
+// substring-based matchers (sensitivePathPatterns, isUserHomePath,
+// isSystemBinaryWrite, isInstalledPackageWrite, suspiciousUnlinkDirs)
+// cannot be bypassed by cosmetic path variants. Uses `path.Clean`
+// (POSIX / forward-slash) rather than `filepath.Clean` (host-native
+// separator) because these are Linux paths captured from a Linux
+// sandbox — running on a Windows or macOS host, filepath.Clean would
+// mutate them incorrectly.
+//
+// Attack shapes this closes for absolute paths:
+//   - /etc/./shadow        → /etc/shadow
+//   - /etc//shadow         → /etc/shadow
+//   - /etc/foo/../shadow   → /etc/shadow
+//   - /etc/../etc/shadow   → /etc/shadow  (previously invisible: substring
+//     match on `/etc/shadow` failed because the surrounding bytes broke
+//     the pattern anchor even though a naive Contains happened to hit)
+//
+// Empty input is preserved (path.Clean("") returns "." which would
+// silently invent a working directory; the parser must never manufacture
+// a nonexistent path). Relative paths pass through only after Clean
+// has flattened intra-segment dots and slashes — they still start
+// without a leading `/` and are handled by the resolveOpenatPath
+// dirfd path below.
+//
+// Symlink resolution is intentionally NOT attempted here: the parser
+// sees only strace traces, has no view into the sandbox's live
+// filesystem state, and any resolution driven by the guest FS would
+// be attacker-controlled (the attacker plants the symlink). A separate
+// analyzer-side symlink policy (e.g., emit an evasion event when a
+// sensitive read is preceded by a suspicious symlink() /
+// symlinkat() call) is the correct place for that class; tracked as a
+// follow-up.
+func normalizePath(p string) string {
+	if p == "" {
+		return ""
+	}
+	return path.Clean(p)
 }
 
 // unescapeStraceBuf converts strace's C-escaped buffer representation to bytes.

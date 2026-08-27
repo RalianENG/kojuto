@@ -1477,3 +1477,125 @@ func TestTrackOpenFD_IgnoresFailedOpens(t *testing.T) {
 		t.Fatalf("failed open should not populate fd map")
 	}
 }
+
+// TestPathNormalization_ClosesCosmeticBypasses pins that cosmetic path
+// variants collapse to their canonical form BEFORE the analyzer's
+// substring-based sensitivePathPatterns matcher runs. Each row is a
+// concrete bypass the pre-normalization parser would have missed: an
+// attacker could rearrange a sensitive-file access into a form that
+// syntactically differs from the pattern anchor even though the
+// resolved inode is identical.
+//
+// The normalization layer is deliberately syntactic-only. Symlink
+// resolution is NOT attempted here — the attacker controls the guest
+// filesystem post-install, so any symlink-driven resolution would be
+// attacker-authored. That class belongs to a separate analyzer-side
+// policy (emit an evasion event when a sensitive read is preceded by a
+// suspicious symlink() call); tracked as a follow-up.
+func TestPathNormalization_ClosesCosmeticBypasses(t *testing.T) {
+	cases := []struct {
+		name       string
+		line       string
+		wantEmit   bool
+		wantPath   string
+		wantReason string
+	}{
+		{
+			name:       "double-slash sensitive path collapses",
+			line:       `[pid 100] openat(AT_FDCWD, "/etc//shadow", O_RDONLY) = 3`,
+			wantEmit:   true,
+			wantPath:   "/etc/shadow",
+			wantReason: "//",
+		},
+		{
+			name:       "dot segment collapses",
+			line:       `[pid 100] openat(AT_FDCWD, "/etc/./shadow", O_RDONLY) = 3`,
+			wantEmit:   true,
+			wantPath:   "/etc/shadow",
+			wantReason: "/./",
+		},
+		{
+			name:       "parent-dir traversal collapses",
+			line:       `[pid 100] openat(AT_FDCWD, "/etc/foo/../shadow", O_RDONLY) = 3`,
+			wantEmit:   true,
+			wantPath:   "/etc/shadow",
+			wantReason: "foo/..",
+		},
+		{
+			name:       "double-parent traversal from unrelated root collapses",
+			line:       `[pid 100] openat(AT_FDCWD, "/tmp/../etc/shadow", O_RDONLY) = 3`,
+			wantEmit:   true,
+			wantPath:   "/etc/shadow",
+			wantReason: "/tmp/..",
+		},
+		{
+			name:       "ssh dir with dot-segment collapses",
+			line:       `[pid 100] openat(AT_FDCWD, "/home/dev/./.ssh/id_rsa", O_RDONLY) = 3`,
+			wantEmit:   true,
+			wantPath:   "/home/dev/.ssh/id_rsa",
+			wantReason: "/./",
+		},
+		{
+			name:     "already-canonical path is idempotent",
+			line:     `[pid 100] openat(AT_FDCWD, "/etc/shadow", O_RDONLY) = 3`,
+			wantEmit: true,
+			wantPath: "/etc/shadow",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			evt, ok := parseStraceLine(tc.line, NewParseState())
+			if ok != tc.wantEmit {
+				t.Fatalf("emit=%v want %v (%s)", ok, tc.wantEmit, tc.wantReason)
+			}
+			if !tc.wantEmit {
+				return
+			}
+			if evt.FilePath != tc.wantPath {
+				t.Errorf("FilePath = %q, want %q (%s)", evt.FilePath, tc.wantPath, tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestPathNormalization_DirfdCompositionCollapses pins that composing
+// a dirfd base with a relative rel that itself contains dot-segments
+// still yields a canonical absolute path. Previously the dirfd
+// resolver produced `/etc/./shadow` or `/etc//shadow` verbatim, which
+// substring-matched sensitivePathPatterns by accident (`/etc/shadow`
+// appears literally in `/etc//shadow` under the `contains` check that
+// today's pattern set uses, but does NOT appear in `/etc/./shadow` or
+// `/etc/foo/../shadow`). Normalization at the resolver output closes
+// both directions in one pass.
+func TestPathNormalization_DirfdCompositionCollapses(t *testing.T) {
+	state := NewParseState()
+	parseStraceLine(`[pid 100] openat(AT_FDCWD, "/etc", O_RDONLY|O_DIRECTORY|O_CLOEXEC) = 3`, state)
+	evt, ok := parseStraceLine(`[pid 100] openat(3, "./shadow", O_RDONLY) = 4`, state)
+	if !ok {
+		t.Fatal("expected event for /etc/./shadow via dirfd")
+	}
+	if evt.FilePath != "/etc/shadow" {
+		t.Errorf("FilePath = %q, want /etc/shadow", evt.FilePath)
+	}
+}
+
+// TestPathNormalization_TrackTmpAndUnlink pins that the create→delete
+// anti-forensics correlation matches even when the create and unlink
+// sides use different cosmetic path forms. Without normalization at
+// both sides, the analyzer's `createdTmpFiles[path]` lookup was a
+// literal string compare — an attacker who created via `/tmp/x` and
+// removed via `/tmp/./x` would leave the deletion untracked.
+func TestPathNormalization_TrackTmpAndUnlink(t *testing.T) {
+	state := NewParseState()
+	trackTmpFileCreation(`[pid 100] openat(AT_FDCWD, "/tmp/./payload", O_WRONLY|O_CREAT, 0644) = 3`, state)
+	if !state.createdTmpFiles["/tmp/payload"] {
+		t.Fatal("createdTmpFiles missing normalized /tmp/payload after creation")
+	}
+	evt, ok := parseStraceLine(`[pid 100] unlink("/tmp/foo/../payload") = 0`, state)
+	if !ok {
+		t.Fatal("expected unlink to be emitted after normalized correlation")
+	}
+	if evt.FilePath != "/tmp/payload" {
+		t.Errorf("FilePath = %q, want /tmp/payload", evt.FilePath)
+	}
+}
