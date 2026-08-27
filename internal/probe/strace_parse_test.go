@@ -413,6 +413,71 @@ func TestUnescapeStraceBuf(t *testing.T) {
 	}
 }
 
+// TestExtractDNSQueryFromMsg pins the sendmsg / sendmmsg DNS
+// extraction path. sendto had DNS extraction; sendmsg / sendmmsg
+// were previously silent because their buffer lives inside a
+// msg_iov entry (`iov_base="..."`) rather than as a direct argument.
+// Attacker code that constructs raw DNS packets via sendmsg to
+// avoid the more-inspected sendto path would have escaped detection.
+func TestExtractDNSQueryFromMsg(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		want string
+	}{
+		{
+			name: "sendmsg with iov_base carrying DNS",
+			line: `sendmsg(3, {msg_name={sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, msg_namelen=16, msg_iov=[{iov_base="\0\0\1\0\0\1\0\0\0\0\0\0\x06google\x03com\0\0\1\0\1", iov_len=28}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 28`,
+			want: "google.com",
+		},
+		{
+			name: "sendmmsg with iov_base inside msg_hdr",
+			line: `sendmmsg(3, [{msg_hdr={msg_name={sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, msg_iov=[{iov_base="\0\0\1\0\0\1\0\0\0\0\0\0\x04test\x03com\0\0\1\0\1", iov_len=26}], msg_iovlen=1}, msg_len=26}], 1, 0) = 1`,
+			want: "test.com",
+		},
+		{
+			name: "sendmsg with buffer that has \\f label length (\"node-edge-01\" is 12 chars)",
+			line: `sendmsg(3, {msg_name={sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, msg_namelen=16, msg_iov=[{iov_base="\314\314\1\0\0\1\0\0\0\0\0\0\fnode-edge-01\7metrics\17legit-analytics\3com\0\0\1\0\1", iov_len=58}], msg_iovlen=1}, 0) = 58`,
+			want: "node-edge-01.metrics.legit-analytics.com",
+		},
+		{
+			name: "no iov_base present (regex miss)",
+			line: `sendmsg(3, {msg_name={sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, ..., msg_flags=0}, 0) = 28`,
+			want: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := extractDNSQueryFromMsg(tc.line)
+			if got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseStraceLine_SendmsgDNS wires the parseStraceLine dispatch
+// end-to-end: a sendmsg to port 53 populates DNSQuery from the
+// iov_base buffer, so downstream analyzer rules (isDNSTunnel,
+// matchExfilService, DGA clustering, DNS chain annotation) all see
+// the queried hostname.
+func TestParseStraceLine_SendmsgDNS(t *testing.T) {
+	line := `[pid 400] sendmsg(3, {msg_name={sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, msg_namelen=16, msg_iov=[{iov_base="\0\0\1\0\0\1\0\0\0\0\0\0\x06google\x03com\0\0\1\0\1", iov_len=28}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 28`
+	evt, ok := parseStraceLine(line, NewParseState())
+	if !ok {
+		t.Fatal("parseStraceLine should recognise the sendmsg")
+	}
+	if evt.Syscall != types.EventSendmsg {
+		t.Errorf("Syscall = %q, want sendmsg", evt.Syscall)
+	}
+	if evt.DstPort != 53 {
+		t.Errorf("DstPort = %d, want 53", evt.DstPort)
+	}
+	if evt.DNSQuery != "google.com" {
+		t.Errorf("DNSQuery = %q, want google.com", evt.DNSQuery)
+	}
+}
+
 func TestParseStraceLine_NoPID(t *testing.T) {
 	line := `connect(3, {sa_family=AF_INET, sin_port=htons(8080), sin_addr=inet_addr("127.0.0.1")}, 16) = 0`
 

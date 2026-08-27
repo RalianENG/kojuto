@@ -248,10 +248,16 @@ func parseStraceLine(line string, state *ParseState) (types.SyscallEvent, bool) 
 	}
 
 	if evt, ok := parseConnectOrSendto(line, straceSendmsgRe, types.EventSendmsg); ok {
+		if evt.DstPort == 53 {
+			evt.DNSQuery = extractDNSQueryFromMsg(line)
+		}
 		return evt, true
 	}
 
 	if evt, ok := parseConnectOrSendto(line, straceSendmmsgRe, types.EventSendmmsg); ok {
+		if evt.DstPort == 53 {
+			evt.DNSQuery = extractDNSQueryFromMsg(line)
+		}
 		return evt, true
 	}
 
@@ -795,6 +801,15 @@ func parseConnectedSendtoDNS(line string) (types.SyscallEvent, bool) {
 	}, true
 }
 
+// straceMsgIovBufRe captures the buffer content from a sendmsg/sendmmsg
+// msg_iov entry: `msg_iov=[{iov_base="<escaped>", iov_len=N}]`. Used for
+// DNS extraction when the caller wrapped the wire packet in an iovec
+// instead of calling sendto directly. sendmsg on a connected UDP
+// socket is not something glibc's resolver does, but attacker code
+// can use it deliberately (advanced I/O API + fewer eyes on the
+// syscall).
+var straceMsgIovBufRe = regexp.MustCompile(`iov_base="([^"]*)"`)
+
 // straceSendtoBufRe captures the buffer content from sendto() output.
 // strace format: sendto(4, "...", len, flags, {sockaddr}).
 var straceSendtoBufRe = regexp.MustCompile(`sendto\(\d+,\s*"([^"]*)"`)
@@ -807,12 +822,32 @@ func extractDNSQuery(line string) string {
 	if matches == nil {
 		return ""
 	}
+	return decodeDNSBuffer(matches[1])
+}
 
-	raw := unescapeStraceBuf(matches[1])
+// extractDNSQueryFromMsg parses the DNS wire-format query domain from
+// a sendmsg / sendmmsg strace line. Same wire format as sendto — the
+// buffer sits inside the first msg_iov entry rather than as a direct
+// argument. Attacker code that constructs raw DNS packets via
+// sendmsg (advanced I/O API, harder to detect, no glibc involvement)
+// was previously invisible to kojuto because the sendto-specific
+// regex never matched.
+func extractDNSQueryFromMsg(line string) string {
+	matches := straceMsgIovBufRe.FindStringSubmatch(line)
+	if matches == nil {
+		return ""
+	}
+	return decodeDNSBuffer(matches[1])
+}
+
+// decodeDNSBuffer unescapes a strace C-escaped buffer capture and
+// runs the DNS-question parser. Shared between the sendto and
+// sendmsg/sendmmsg extractors so the escape handling stays uniform.
+func decodeDNSBuffer(escaped string) string {
+	raw := unescapeStraceBuf(escaped)
 	if len(raw) < 13 { // 12-byte header + at least 1 byte question.
 		return ""
 	}
-
 	// Skip 12-byte DNS header, parse question name.
 	return parseDNSName(raw[12:])
 }
