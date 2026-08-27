@@ -394,3 +394,71 @@ func TestMorphologyConsistent_CharClassFingerprint(t *testing.T) {
 		t.Error("morphology check rejected uniform hex hashes")
 	}
 }
+
+// TestAnalyze_ImportPhaseInconclusive pins the reality-check contract:
+// when the sandbox emits import_attempt events but none succeed AND
+// no HIGH event fired in install phase, the verdict is inconclusive
+// rather than clean. Silent no-ops were the historical failure mode
+// where `pkg.replace("-","_")` yielded pillow → pillow (should be
+// PIL) and every __import__ raised ImportError swallowed by
+// try/except — the scan reported "clean" for a package whose code
+// never ran.
+func TestAnalyze_ImportPhaseInconclusive(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventImportAttempt, Comm: "pillow", Cmdline: "pillow", FilePath: "fail", CodeSnippet: "ModuleNotFoundError"},
+		{Syscall: types.EventImportAttempt, Comm: "pillow", Cmdline: "pillow", FilePath: "fail", CodeSnippet: "ModuleNotFoundError"},
+		{Syscall: types.EventImportAttempt, Comm: "pillow", Cmdline: "pillow", FilePath: "fail", CodeSnippet: "ModuleNotFoundError"},
+	}
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictInconclusive {
+		t.Errorf("expected inconclusive verdict, got %s", verdict)
+	}
+	// Import-attempt events must NOT appear as classified findings —
+	// they are meta-signal only.
+	for _, e := range filtered {
+		if e.Syscall == types.EventImportAttempt {
+			t.Errorf("import_attempt event leaked into report: %+v", e)
+		}
+	}
+}
+
+// TestAnalyze_ImportPhaseSucceededThenClean pins the happy path:
+// import_attempt fires with ok, no other event is suspicious → verdict clean.
+func TestAnalyze_ImportPhaseSucceededThenClean(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventImportAttempt, Comm: "pillow", Cmdline: "PIL", FilePath: "ok"},
+	}
+	verdict, _ := Analyze(events)
+	if verdict != types.VerdictClean {
+		t.Errorf("expected clean verdict when import succeeded, got %s", verdict)
+	}
+}
+
+// TestAnalyze_ImportFailureDoesNotSuppressHIGH pins that a genuine
+// HIGH signal from install phase still flips the verdict to
+// suspicious even when the import phase's imports all failed.
+// Install-phase malware must still be reported.
+func TestAnalyze_ImportFailureDoesNotSuppressHIGH(t *testing.T) {
+	events := []types.SyscallEvent{
+		// Install-phase C2 — HIGH.
+		{Syscall: types.EventConnect, PID: 100, Family: 2, DstAddr: "203.0.113.5", DstPort: 443},
+		// Import-phase failure — every attempt failed.
+		{Syscall: types.EventImportAttempt, Comm: "evil", Cmdline: "evil", FilePath: "fail", CodeSnippet: "ImportError"},
+	}
+	verdict, _ := Analyze(events)
+	if verdict != types.VerdictSuspicious {
+		t.Errorf("expected suspicious verdict (HIGH install-phase C2), got %s", verdict)
+	}
+}
+
+// TestAnalyze_NoImportAttemptsIsFallback documents the fallback path:
+// when the events slice contains zero import_attempt records
+// (older sandbox scripts predating the reality-check probe, or an
+// install failure that killed the container before the import
+// scripts ran), verdict logic falls back to the classic behavior.
+func TestAnalyze_NoImportAttemptsIsFallback(t *testing.T) {
+	verdict, _ := Analyze(nil)
+	if verdict != types.VerdictClean {
+		t.Errorf("empty event slice: expected clean, got %s", verdict)
+	}
+}
