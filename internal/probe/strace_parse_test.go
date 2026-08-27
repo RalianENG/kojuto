@@ -489,7 +489,7 @@ func TestParseStraceLine_SendmsgDNS(t *testing.T) {
 	line := `[pid 400] sendmsg(3, {msg_name={sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, msg_namelen=16, msg_iov=[{iov_base="\0\0\1\0\0\1\0\0\0\0\0\0\x06google\x03com\0\0\1\0\1", iov_len=28}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 28`
 	evt, ok := parseStraceLine(line, NewParseState())
 	if !ok {
-		t.Fatal("parseStraceLine should recognise the sendmsg")
+		t.Fatal("parseStraceLine should recognize the sendmsg")
 	}
 	if evt.Syscall != types.EventSendmsg {
 		t.Errorf("Syscall = %q, want sendmsg", evt.Syscall)

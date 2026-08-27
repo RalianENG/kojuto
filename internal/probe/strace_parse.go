@@ -221,6 +221,23 @@ func isSensitivePath(filePath string) bool {
 	return false
 }
 
+// parseSendWithDNS wraps parseConnectOrSendto with the port-53 DNS
+// query extraction step used by every send-family branch. The
+// extract function is either extractDNSQuery (sendto buffer) or
+// extractDNSQueryFromMsg (sendmsg/sendmmsg iov_base). Split out to
+// keep parseStraceLine under the gocyclo budget without hiding the
+// dispatch order in a table.
+func parseSendWithDNS(line string, re *regexp.Regexp, syscall string, extract func(string) string) (types.SyscallEvent, bool) {
+	evt, ok := parseConnectOrSendto(line, re, syscall)
+	if !ok {
+		return evt, false
+	}
+	if evt.DstPort == 53 {
+		evt.DNSQuery = extract(line)
+	}
+	return evt, true
+}
+
 func parseStraceLine(line string, state *ParseState) (types.SyscallEvent, bool) {
 	// Audit hook output from sitecustomize.py / kojuto-require.js.
 	// These lines are interleaved with strace output on stderr.
@@ -234,11 +251,7 @@ func parseStraceLine(line string, state *ParseState) (types.SyscallEvent, bool) 
 		return evt, true
 	}
 
-	if evt, ok := parseConnectOrSendto(line, straceSendtoRe, types.EventSendto); ok {
-		// If port is 53, try to extract DNS query domain from the buffer.
-		if evt.DstPort == 53 {
-			evt.DNSQuery = extractDNSQuery(line)
-		}
+	if evt, ok := parseSendWithDNS(line, straceSendtoRe, types.EventSendto, extractDNSQuery); ok {
 		return evt, true
 	}
 
@@ -249,17 +262,11 @@ func parseStraceLine(line string, state *ParseState) (types.SyscallEvent, bool) 
 		return evt, true
 	}
 
-	if evt, ok := parseConnectOrSendto(line, straceSendmsgRe, types.EventSendmsg); ok {
-		if evt.DstPort == 53 {
-			evt.DNSQuery = extractDNSQueryFromMsg(line)
-		}
+	if evt, ok := parseSendWithDNS(line, straceSendmsgRe, types.EventSendmsg, extractDNSQueryFromMsg); ok {
 		return evt, true
 	}
 
-	if evt, ok := parseConnectOrSendto(line, straceSendmmsgRe, types.EventSendmmsg); ok {
-		if evt.DstPort == 53 {
-			evt.DNSQuery = extractDNSQueryFromMsg(line)
-		}
+	if evt, ok := parseSendWithDNS(line, straceSendmmsgRe, types.EventSendmmsg, extractDNSQueryFromMsg); ok {
 		return evt, true
 	}
 
@@ -876,8 +883,8 @@ func unescapeStraceBuf(s string) []byte {
 		if i+1 >= len(s) {
 			break
 		}
-		switch {
-		case s[i+1] == 'x' && i+4 <= len(s):
+		// \xNN hex escape.
+		if s[i+1] == 'x' && i+4 <= len(s) {
 			b, err := hex.DecodeString(s[i+2 : i+4])
 			if err == nil && len(b) == 1 {
 				buf = append(buf, b[0])
@@ -885,60 +892,73 @@ func unescapeStraceBuf(s string) []byte {
 				continue
 			}
 			buf = append(buf, s[i])
-		case s[i+1] >= '0' && s[i+1] <= '7':
-			// Octal escape: \0, \00, \000, \1, \12, \123, etc.
-			val := 0
-			j := i + 1
-			for j < len(s) && j < i+4 && s[j] >= '0' && s[j] <= '7' {
-				val = val*8 + int(s[j]-'0')
-				j++
-			}
-			buf = append(buf, byte(val))
-			i = j - 1
-		case s[i+1] == 'n':
-			buf = append(buf, '\n')
-			i++
-		case s[i+1] == 't':
-			buf = append(buf, '\t')
-			i++
-		case s[i+1] == 'r':
-			buf = append(buf, '\r')
-			i++
-		// strace uses the alphabetic C escapes \a \b \f \v alongside
-		// \n \t \r for bytes 0x07 0x08 0x0C 0x0B (but inconsistently
-		// — 0x07 sometimes shows as octal \7 too). Missing any of
-		// these decodes a wrong byte and cascades into wire-format
-		// corruption: e.g. a DNS query for "node-edge-01" has a
-		// length prefix 0x0C which strace renders as \f, and without
-		// this case parseDNSName reads a garbage byte sequence and
-		// fails silently. That's why DNS chain / DGA rules were
-		// invisible on raw-socket UDP DNS attacks.
-		case s[i+1] == 'a':
-			buf = append(buf, '\a')
-			i++
-		case s[i+1] == 'b':
-			buf = append(buf, '\b')
-			i++
-		case s[i+1] == 'f':
-			buf = append(buf, '\f')
-			i++
-		case s[i+1] == 'v':
-			buf = append(buf, '\v')
-			i++
-		case s[i+1] == '"':
-			buf = append(buf, '"')
-			i++
-		case s[i+1] == '\'':
-			buf = append(buf, '\'')
-			i++
-		case s[i+1] == '\\':
-			buf = append(buf, '\\')
-			i++
-		default:
-			buf = append(buf, s[i])
+			continue
 		}
+		// \NNN octal escape (\0, \00, \000, \1, \12, \123, ...).
+		if s[i+1] >= '0' && s[i+1] <= '7' {
+			val, end := parseOctalEscape(s, i+1)
+			buf = append(buf, byte(val))
+			i = end - 1
+			continue
+		}
+		// \n \t \r \a \b \f \v \" \' \\ single-letter escapes. See
+		// the FP-inducing history in the parser-fix commits: missing
+		// \f in particular silently broke every raw-socket DNS
+		// attack because label length 12 (0x0C) rendered as \f and
+		// dropped one byte from every DNS packet.
+		if b, ok := singleLetterEscape(s[i+1]); ok {
+			buf = append(buf, b)
+			i++
+			continue
+		}
+		// Unknown escape — copy the backslash and advance past it.
+		buf = append(buf, s[i])
 	}
 	return buf
+}
+
+// parseOctalEscape reads up to three octal digits starting at s[start]
+// and returns the decoded byte value plus the index one past the last
+// digit consumed. Callers back up by one because the outer for loop
+// increments i.
+func parseOctalEscape(s string, start int) (val, end int) {
+	end = start
+	for end < len(s) && end < start+3 && s[end] >= '0' && s[end] <= '7' {
+		val = val*8 + int(s[end]-'0')
+		end++
+	}
+	return val, end
+}
+
+// singleLetterEscape maps the second character of a `\<c>` escape to
+// the byte it represents, matching strace's alphabetic C-string
+// escapes plus the quote / apostrophe / backslash literals. The
+// second return signals whether c was recognized — unknown escapes
+// fall through in the caller.
+func singleLetterEscape(c byte) (byte, bool) {
+	switch c {
+	case 'n':
+		return '\n', true
+	case 't':
+		return '\t', true
+	case 'r':
+		return '\r', true
+	case 'a':
+		return '\a', true
+	case 'b':
+		return '\b', true
+	case 'f':
+		return '\f', true
+	case 'v':
+		return '\v', true
+	case '"':
+		return '"', true
+	case '\'':
+		return '\'', true
+	case '\\':
+		return '\\', true
+	}
+	return 0, false
 }
 
 // parseDNSName reads a DNS wire-format label sequence from the question section.
