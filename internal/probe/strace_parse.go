@@ -857,6 +857,33 @@ func unescapeStraceBuf(s string) []byte {
 		case s[i+1] == 'r':
 			buf = append(buf, '\r')
 			i++
+		// strace uses the alphabetic C escapes \a \b \f \v alongside
+		// \n \t \r for bytes 0x07 0x08 0x0C 0x0B (but inconsistently
+		// — 0x07 sometimes shows as octal \7 too). Missing any of
+		// these decodes a wrong byte and cascades into wire-format
+		// corruption: e.g. a DNS query for "node-edge-01" has a
+		// length prefix 0x0C which strace renders as \f, and without
+		// this case parseDNSName reads a garbage byte sequence and
+		// fails silently. That's why DNS chain / DGA rules were
+		// invisible on raw-socket UDP DNS attacks.
+		case s[i+1] == 'a':
+			buf = append(buf, '\a')
+			i++
+		case s[i+1] == 'b':
+			buf = append(buf, '\b')
+			i++
+		case s[i+1] == 'f':
+			buf = append(buf, '\f')
+			i++
+		case s[i+1] == 'v':
+			buf = append(buf, '\v')
+			i++
+		case s[i+1] == '"':
+			buf = append(buf, '"')
+			i++
+		case s[i+1] == '\'':
+			buf = append(buf, '\'')
+			i++
 		case s[i+1] == '\\':
 			buf = append(buf, '\\')
 			i++

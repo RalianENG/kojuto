@@ -370,6 +370,47 @@ func TestUnescapeStraceBuf(t *testing.T) {
 	if got2[28] != 4 {
 		t.Errorf("label len at byte 28: got %d, want 4", got2[28])
 	}
+
+	// Alphabetic C escapes strace uses for specific control bytes.
+	// \f is the case that broke DGA detection in live scans: a DNS
+	// label length of 12 (0x0C) is rendered as `\f`, so if the
+	// escape is dropped the label reader misaligns on the very
+	// first length byte.
+	alphaCases := []struct {
+		name  string
+		input string
+		want  []byte
+	}{
+		{"form feed (\\f = 0x0C)", `\fabc`, []byte{0x0C, 'a', 'b', 'c'}},
+		{"vertical tab (\\v = 0x0B)", `\vxy`, []byte{0x0B, 'x', 'y'}},
+		{"alert (\\a = 0x07)", `\aXY`, []byte{0x07, 'X', 'Y'}},
+		{"backspace (\\b = 0x08)", `\bZ`, []byte{0x08, 'Z'}},
+		{"escaped quote (\\\") ", `\"hi`, []byte{'"', 'h', 'i'}},
+		{"escaped apostrophe (\\')", `\'x`, []byte{'\'', 'x'}},
+	}
+	for _, tc := range alphaCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := unescapeStraceBuf(tc.input)
+			if len(got) != len(tc.want) {
+				t.Fatalf("length mismatch: got %d %v, want %d %v",
+					len(got), got, len(tc.want), tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Errorf("byte %d: got %d, want %d", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+
+	// End-to-end: d2_dga_low_entropy_multi's actual sendto line
+	// (captured from a live scan). Without the \f handler the
+	// parser dropped one byte on every DGA query and DNS name
+	// extraction silently failed.
+	dgaLine := `sendto(3, "\314\314\1\0\0\1\0\0\0\0\0\0\fnode-edge-01\7metrics\17legit-analytics\3com\0\0\1\0\1", 58, 0, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, 16) = 58`
+	if got := extractDNSQuery(dgaLine); got != "node-edge-01.metrics.legit-analytics.com" {
+		t.Errorf("d2-style DGA sendto: got %q, want node-edge-01.metrics.legit-analytics.com", got)
+	}
 }
 
 func TestParseStraceLine_NoPID(t *testing.T) {
