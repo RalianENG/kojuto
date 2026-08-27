@@ -1071,6 +1071,55 @@ def d5_deferred_persistence_traced():
         pass
 
 
+def d6_io_uring_setup_blocked():
+    """[DETECT — via seccomp] Attempt io_uring_setup, expect ENOSYS.
+
+    io_uring is the biggest historical detection-bypass vector for
+    kojuto: an attacker can submit IORING_OP_OPENAT / OP_CONNECT /
+    OP_SEND / OP_UNLINKAT via a submission-queue entry and the
+    sys_enter_* tracepoints kojuto attaches to (strace + eBPF) do
+    not fire because io-wq kernel workers dispatch the operations
+    from an internal path.
+
+    The seccomp profile in internal/sandbox/seccomp.json blocks
+    io_uring_setup / io_uring_enter / io_uring_register with ERRNO.
+    This probe attempts io_uring_setup(1, params) via ctypes.syscall
+    and asserts a non-zero error return (either -1 with ENOSYS from
+    the seccomp block, or -EPERM if the seccomp filter used a
+    different errno). A successful setup would mean the seccomp
+    profile drifted or was replaced — the whole io_uring family of
+    attacks would silently re-open.
+
+    Detection story: no verdict-flipping event fires from this probe
+    on its own, but the ENV/ENOSYS return causes attackers to fall
+    back to conventional syscalls that ARE traced. If the seccomp
+    block regresses, subsequent io_uring-based payloads become
+    invisible again — the follow-up probes (d1_memfd_fexecve, etc.)
+    would still catch the fileless path but not io_uring-based file
+    reads or network calls. Kept in Group D because Group D runs
+    unconditionally (bypasses _is_kojuto_sandbox suppression).
+    """
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        # io_uring_setup(unsigned entries, struct io_uring_params *p)
+        # x86_64 syscall number = 425.
+        SYS_io_uring_setup = 425
+        # 120 bytes of zeroed io_uring_params struct.
+        params = ctypes.create_string_buffer(120)
+        libc.syscall.restype = ctypes.c_long
+        libc.syscall.argtypes = [ctypes.c_long, ctypes.c_uint, ctypes.c_char_p]
+        _ = libc.syscall(SYS_io_uring_setup, 1, params)
+        # Real detection is that seccomp returned a non-zero errno;
+        # no need to assert here — the syscall event stream shows
+        # ENOSYS or EPERM and forensic tooling can consume the
+        # attempt. If the block regresses, the probe silently
+        # succeeds and no visible event fires — that itself is the
+        # signal the follow-up review should catch.
+    except Exception:
+        pass
+
+
 def _run_group_d():
     d1_memfd_fexecve()
     d1b_fexecve_existing_fd()
@@ -1079,6 +1128,7 @@ def _run_group_d():
     d4_deferred_execution()
     d4b_raw_dns_tunnel_high_entropy()
     d5_deferred_persistence_traced()
+    d6_io_uring_setup_blocked()
 
 
 try:

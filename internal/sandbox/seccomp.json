@@ -1,4 +1,5 @@
 {
+  "_comment": "Hardened seccomp profile for kojuto sandbox. Historical context — a review of PR #43 pointed out that the original ALLOW-by-default profile with 42 explicit denies made the sandbox WEAKER than Docker's stock profile because `--security-opt seccomp=<file>` REPLACES the Docker default rather than layering on top. That opened up ~300 syscalls Docker would have blocked, including io_uring which allows every kojuto detection category to be bypassed. This revision restores parity on the highest-impact gap (io_uring) while keeping ALLOW-by-default to avoid breaking legit install flows — a full deny-by-default allow-list is a maintenance liability we're deferring. memfd_create is deliberately REMOVED from the deny list so the analyzer's parseExecveat AT_EMPTY_PATH branch can catch the fileless-exec chain — inducing and observing malicious behaviour is more consistent with kojuto's design than silently blocking with ENOSYS (which also gives sandbox-aware payloads a definitive fingerprint).",
   "defaultAction": "SCMP_ACT_ALLOW",
   "syscalls": [
     {
@@ -6,7 +7,7 @@
         "ptrace"
       ],
       "action": "SCMP_ACT_ALLOW",
-      "comment": "Allow ptrace for strace operation only"
+      "comment": "Allow ptrace so strace itself works. Without this the strace probe cannot attach. Anti-debugging evasion (ptrace(PTRACE_TRACEME) from the tracee) is instead detected at the analyzer layer as CategoryEvasion."
     },
     {
       "names": [
@@ -15,7 +16,7 @@
       ],
       "action": "SCMP_ACT_ERRNO",
       "errnoRet": 1,
-      "comment": "Block cross-process memory access to prevent SYS_PTRACE abuse"
+      "comment": "Block cross-process memory access to prevent SYS_PTRACE abuse — a compromised process could otherwise read/write another process's memory."
     },
     {
       "names": [
@@ -30,7 +31,17 @@
           "op": "SCMP_CMP_EQ"
         }
       ],
-      "comment": "Block prctl(PR_SET_NAME) to prevent process name spoofing for probe evasion"
+      "comment": "Block prctl(PR_SET_NAME) specifically so an attacker cannot rename their process to `node` and bypass isV8JITPageOp. Legit Python threading.Thread(name=) and node worker_threads use this too — they will get an error return which they typically ignore (name-set is best-effort). If FP surfaces, fingerprint the caller's execve path here instead."
+    },
+    {
+      "names": [
+        "io_uring_setup",
+        "io_uring_enter",
+        "io_uring_register"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
+      "comment": "io_uring is the biggest detection-bypass vector kojuto had. An attacker can submit IORING_OP_OPENAT / OP_CONNECT / OP_SEND / OP_UNLINKAT via a submission-queue entry and the sys_enter_* tracepoints kojuto attaches to (strace + eBPF) will not fire because io-wq kernel workers dispatch the operations from an internal path. Docker's stock seccomp profile blocks these; the pre-hardening kojuto profile silently reopened the hole. Blocking with ERRNO forces attacker code to fall back to conventional syscalls that kojuto's probes DO observe. Sandbox-aware payloads may notice ENOSYS on io_uring_setup and pivot to declaring the environment a sandbox — that is caught separately by the CategoryEvasion rules on /proc introspection."
     },
     {
       "names": [
@@ -51,7 +62,6 @@
         "bpf",
         "userfaultfd",
         "perf_event_open",
-        "memfd_create",
         "open_by_handle_at",
         "keyctl",
         "request_key",
@@ -79,7 +89,7 @@
       ],
       "action": "SCMP_ACT_ERRNO",
       "errnoRet": 1,
-      "comment": "Block dangerous syscalls: namespace escape, kernel module loading, time manipulation, hardware access, fileless execution (memfd_create), and container breakout vectors"
+      "comment": "The pre-hardening deny list. Namespace escape (mount, umount2, pivot_root, unshare, setns, chroot); swap manipulation; host mutation (sethostname, setdomainname, reboot); kernel module loading (init/finit/delete/create_module, get_kernel_syms, query_module); kexec; eBPF; userfaultfd; perf_event_open; kernel keyring (keyctl/request_key/add_key); file handle abuse (open_by_handle_at); process comparison (kcmp); disk quota; wall-clock modification (settimeofday, clock_settime, clock_adjtime, adjtimex); nfsservctl; hardware access (ioperm, iopl, vm86, modify_ldt, personality). memfd_create is NOT in this list — see the file-level comment for the design rationale (induce + observe rather than silently block)."
     }
   ]
 }
