@@ -1105,7 +1105,10 @@ func TestParseAuditHook_IntegratedWithParseStraceLine(t *testing.T) {
 // rename event whenever a filename contained a literal `"` (escaped by
 // strace as `\"`). Without an event the analyzer never sees the hijack
 // and the verdict stays clean — a malicious package could rename
-// `/tmp/x"y` over `/usr/local/bin/python3` invisibly.
+// `/tmp/x"y` over `/usr/local/bin/python3` invisibly. The captured
+// SrcPath/DstPath now flow through unescapeStracePath so downstream
+// analyzer rules see the real filesystem path (`/tmp/x"y`), not the
+// strace-escaped rendering.
 func TestParseStraceLine_RenameWithEscapedQuotes(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -1116,14 +1119,14 @@ func TestParseStraceLine_RenameWithEscapedQuotes(t *testing.T) {
 		{
 			name:    "rename with escaped quote in src",
 			line:    `[pid 100] rename("/tmp/x\"y", "/usr/local/bin/python3") = 0`,
-			wantSrc: `/tmp/x\"y`,
+			wantSrc: `/tmp/x"y`,
 			wantDst: "/usr/local/bin/python3",
 		},
 		{
 			name:    "renameat with escaped quote in dst",
 			line:    `[pid 101] renameat(AT_FDCWD, "/tmp/legit", AT_FDCWD, "/etc/x\"y") = 0`,
 			wantSrc: "/tmp/legit",
-			wantDst: `/etc/x\"y`,
+			wantDst: `/etc/x"y`,
 		},
 		{
 			name:    "plain rename still parses",
@@ -1241,4 +1244,128 @@ func TestParseExecveat(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestEscapeUnification_FilenameRegexes pins that every filename-capturing
+// regex now (a) matches through an escaped `\"` inside the filename
+// (previously the naive `[^"]+` class truncated at the backslash and the
+// event was silently dropped) and (b) delivers the real filesystem path
+// to the analyzer via unescapeStracePath, not the strace-escaped
+// rendering. Covers the openat / execve / unlink / unlinkat / execveat
+// syscalls used by the credential_access, code_execution, and
+// anti_forensics detection paths. A regression on any single row here
+// re-opens a class-wide invisibility bug: a payload named `/tmp/x"y`
+// could then read `~/.ssh/id_rsa`, drop under `/home/dev/`, self-delete,
+// or exec, without any of it reaching the verdict.
+func TestEscapeUnification_FilenameRegexes(t *testing.T) {
+	cases := []struct {
+		name         string
+		line         string
+		wantSyscall  string
+		wantFilePath string
+	}{
+		{
+			name:         "openat with escaped quote in sensitive path",
+			line:         `[pid 100] openat(AT_FDCWD, "/home/dev/.ssh/id\"rsa", O_RDONLY) = 3`,
+			wantSyscall:  types.EventOpenat,
+			wantFilePath: `/home/dev/.ssh/id"rsa`,
+		},
+		{
+			name:         "openat with octal-encoded byte in home path",
+			line:         `[pid 100] openat(AT_FDCWD, "/home/dev/\174payload", O_WRONLY|O_CREAT, 0644) = 4`,
+			wantSyscall:  types.EventOpenat,
+			wantFilePath: "/home/dev/|payload",
+		},
+		{
+			name:         "unlink of created tmp file with escaped quote",
+			line:         `[pid 101] unlink("/tmp/x\"y") = 0`,
+			wantSyscall:  types.EventUnlink,
+			wantFilePath: `/tmp/x"y`,
+		},
+		{
+			name:         "unlinkat of created tmp file with escaped quote",
+			line:         `[pid 101] unlinkat(AT_FDCWD, "/tmp/x\"y", 0) = 0`,
+			wantSyscall:  types.EventUnlink,
+			wantFilePath: `/tmp/x"y`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			state := NewParseState()
+
+			// unlink/unlinkat only emit when the file was CREATED
+			// during this scan; seed the tracker with a preceding
+			// openat(O_CREAT) so the create->delete correlation fires.
+			if tc.wantSyscall == types.EventUnlink {
+				createLine := `[pid 101] openat(AT_FDCWD, "` +
+					escapeForStraceInput(tc.wantFilePath) +
+					`", O_WRONLY|O_CREAT, 0644) = 5`
+				trackTmpFileCreation(createLine, state)
+			}
+
+			evt, ok := parseStraceLine(tc.line, state)
+			if !ok {
+				t.Fatalf("expected event to parse: %q", tc.line)
+			}
+			if evt.Syscall != tc.wantSyscall {
+				t.Errorf("Syscall = %q, want %q", evt.Syscall, tc.wantSyscall)
+			}
+			if evt.FilePath != tc.wantFilePath {
+				t.Errorf("FilePath = %q, want %q", evt.FilePath, tc.wantFilePath)
+			}
+		})
+	}
+}
+
+// TestEscapeUnification_ExecveComm exercises the execve/execveat
+// filename escape path — a `\"` in the binary path now yields a real
+// Comm the analyzer can match against suspiciousExecDirs and benignPaths.
+func TestEscapeUnification_ExecveComm(t *testing.T) {
+	cases := []struct {
+		name     string
+		line     string
+		wantComm string
+	}{
+		{
+			name:     "execve with escaped quote in path",
+			line:     `[pid 200] execve("/tmp/x\"y", ["x\"y"], 0x7f...) = 0`,
+			wantComm: `/tmp/x"y`,
+		},
+		{
+			name:     "execveat AT_FDCWD path form with escaped quote",
+			line:     `[pid 201] execveat(AT_FDCWD, "/tmp/z\"z", ["prog"], 0x7f..., 0) = 0`,
+			wantComm: `/tmp/z"z`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			evt, ok := parseStraceLine(tc.line, NewParseState())
+			if !ok {
+				t.Fatalf("expected event to parse: %q", tc.line)
+			}
+			if evt.Syscall != types.EventExecve {
+				t.Errorf("Syscall = %q, want %q", evt.Syscall, types.EventExecve)
+			}
+			if evt.Comm != tc.wantComm {
+				t.Errorf("Comm = %q, want %q", evt.Comm, tc.wantComm)
+			}
+		})
+	}
+}
+
+// escapeForStraceInput turns a raw filename back into strace's C-escaped
+// form for constructing test lines. Only handles the `"` case; extend
+// only when a new test needs it. Kept here (test-only helper) rather
+// than in the parser file so production code has no back-conversion path.
+func escapeForStraceInput(raw string) string {
+	var b strings.Builder
+	for i := range len(raw) {
+		if raw[i] == '"' {
+			b.WriteString(`\"`)
+			continue
+		}
+		b.WriteByte(raw[i])
+	}
+	return b.String()
 }
