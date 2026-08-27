@@ -46,12 +46,20 @@ func DefaultSensitivePaths() []string {
 		// /etc/passwd is intentionally excluded: many standard tools
 		// (getpwnam, uid lookups) read it during normal operation.
 		"/proc/self/environ",
-		// /proc/self/maps and /proc/self/cgroup are intentionally excluded
-		// from defaults: glibc, V8/Node startup, Python's runpy, and
-		// container-aware libraries read these on every process launch,
-		// generating false-positive evasion events for any node-based or
-		// otherwise heavy package. Re-add them via config include if the
-		// extra signal is worth the noise.
+		// /proc/self/maps and /proc/self/cgroup were previously excluded
+		// because glibc, V8/Node startup, Python's runpy, and container-
+		// aware libraries read these on every process launch, generating
+		// multiple false-positive evasion events for any node-based or
+		// otherwise heavy package. Re-added now that Analyze()
+		// deduplicates CategoryEvasion events by FilePath — N reads of
+		// the same path collapse to one forensic breadcrumb, so the
+		// verdict rule (2+ MEDIUM events) measures DISTINCT sandbox
+		// probes, not raw read repetitions. A package that reads only
+		// /proc/self/maps still stays clean (1 evasion event); a package
+		// that reads maps + cgroup + status is flagged as an evasion
+		// cluster (3 distinct events).
+		"/proc/self/maps",      // libfaketime / LD_PRELOAD fingerprint
+		"/proc/self/cgroup",    // Docker / k8s container detection
 		"/proc/self/status",    // TracerPid detection (strace parent process)
 		"/proc/self/mountinfo", // overlay filesystem detection
 		"/sys/class/net",       // network namespace detection (no trailing slash)

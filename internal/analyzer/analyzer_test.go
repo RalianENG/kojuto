@@ -2125,3 +2125,110 @@ func TestGenerateSummary_DeterministicOrder(t *testing.T) {
 		}
 	}
 }
+
+// TestAnalyze_SandboxProbeDedupKeepsBaselineClean pins the FP gate:
+// glibc/V8/runpy reading /proc/self/maps multiple times (across the
+// same PID and across separate forked helpers) must not flip the
+// verdict. Path-only dedup collapses N reads of the same path down to
+// one CategoryEvasion event, and 1 MEDIUM event alone stays under the
+// 2+ threshold. Without this the classic node scan would fail every
+// run — V8 startup and libuv both read maps.
+func TestAnalyze_SandboxProbeDedupKeepsBaselineClean(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventOpenat, PID: 100, FilePath: "/proc/self/maps", OpenFlags: "O_RDONLY"},
+		{Syscall: types.EventOpenat, PID: 100, FilePath: "/proc/self/maps", OpenFlags: "O_RDONLY"},
+		{Syscall: types.EventOpenat, PID: 100, FilePath: "/proc/self/maps", OpenFlags: "O_RDONLY"},
+		{Syscall: types.EventOpenat, PID: 200, FilePath: "/proc/self/maps", OpenFlags: "O_RDONLY"},
+	}
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictClean {
+		t.Fatalf("verdict = %s, want %s — repeated maps reads must not flip", verdict, types.VerdictClean)
+	}
+	// One breadcrumb kept for forensics; the rest deduped.
+	evasionCount := 0
+	for _, e := range filtered {
+		if e.Category == types.CategoryEvasion {
+			evasionCount++
+		}
+	}
+	if evasionCount != 1 {
+		t.Errorf("evasion event count = %d, want 1 (path-dedup)", evasionCount)
+	}
+}
+
+// TestAnalyze_SandboxProbeConcentratedIntentFlips pins that a package
+// reading MULTIPLE DISTINCT sandbox-detection paths from the same
+// scan flips the verdict — the dedup gate does not suppress the real
+// evasion signal, only the noise floor. Three distinct paths give
+// three MEDIUM evasion events, crossing the 2+ threshold.
+func TestAnalyze_SandboxProbeConcentratedIntentFlips(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventOpenat, PID: 100, FilePath: "/proc/self/maps", OpenFlags: "O_RDONLY"},
+		{Syscall: types.EventOpenat, PID: 100, FilePath: "/proc/self/cgroup", OpenFlags: "O_RDONLY"},
+		{Syscall: types.EventOpenat, PID: 100, FilePath: "/proc/self/status", OpenFlags: "O_RDONLY"},
+	}
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictSuspicious {
+		t.Fatalf("verdict = %s, want %s — 3 distinct sandbox-detection paths must flip", verdict, types.VerdictSuspicious)
+	}
+	evasionCount := 0
+	for _, e := range filtered {
+		if e.Category == types.CategoryEvasion {
+			evasionCount++
+		}
+	}
+	if evasionCount != 3 {
+		t.Errorf("evasion event count = %d, want 3 (distinct paths kept)", evasionCount)
+	}
+}
+
+// TestAnalyze_SandboxProbeDedupPreservesPtrace pins that ptrace(TRACEME)
+// evasion events, which carry no FilePath, are NEVER deduped against
+// sandbox-probe events — they are an independent evasion modality
+// that stacks with sandbox probes rather than duplicating them. A
+// single maps read + one ptrace should count as 2 evasion events.
+func TestAnalyze_SandboxProbeDedupPreservesPtrace(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventOpenat, PID: 100, FilePath: "/proc/self/maps", OpenFlags: "O_RDONLY"},
+		{Syscall: types.EventPtrace, PID: 100},
+	}
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictSuspicious {
+		t.Fatalf("verdict = %s, want %s — ptrace + maps should flip (2 MEDIUM)", verdict, types.VerdictSuspicious)
+	}
+	evasionCount := 0
+	for _, e := range filtered {
+		if e.Category == types.CategoryEvasion {
+			evasionCount++
+		}
+	}
+	if evasionCount != 2 {
+		t.Errorf("evasion event count = %d, want 2 (ptrace never dedups against paths)", evasionCount)
+	}
+}
+
+// TestAnalyze_MapsFingerprintDetected demonstrates the intended
+// detection gain: a package that reads only /proc/self/maps (a
+// libfaketime / LD_PRELOAD fingerprint check) STAYS clean because
+// glibc does the same thing on every dlopen, but the read is now
+// visible in the report — the forensic breadcrumb was previously
+// invisible when maps was excluded from DefaultSensitivePaths.
+func TestAnalyze_MapsFingerprintDetected(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventOpenat, PID: 100, FilePath: "/proc/self/maps", OpenFlags: "O_RDONLY"},
+	}
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictClean {
+		t.Fatalf("verdict = %s, want %s — a single maps read stays clean (baseline noise)", verdict, types.VerdictClean)
+	}
+	found := false
+	for _, e := range filtered {
+		if e.Category == types.CategoryEvasion && e.FilePath == "/proc/self/maps" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected a forensic /proc/self/maps evasion event to be preserved")
+	}
+}

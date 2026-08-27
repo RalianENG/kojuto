@@ -124,6 +124,22 @@ func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
 	// because DGA is per-CLUSTER, not per-event.
 	suspicious = appendDGAFindings(state, suspicious)
 
+	// Dedup CategoryEvasion events by FilePath so glibc / V8 / runpy
+	// baseline noise (multiple reads of /proc/self/maps in one scan,
+	// often from several PIDs) collapses to one forensic breadcrumb
+	// per probed path. The verdict rule then measures DISTINCT
+	// sandbox-detection paths touched — a package reading only
+	// /proc/self/maps still stays clean (1 evasion event vs. 2+
+	// MEDIUM threshold); a package reading maps + cgroup + status is
+	// an evasion cluster (3 distinct events). Path-only dedup (not
+	// (PID, path)) is what handles cross-PID baseline correctly: pip
+	// reading maps in one PID and node reading maps in another PID
+	// is still one glibc-baseline breadcrumb, not two-fold suspicion.
+	// Path-less evasion events (ptrace(TRACEME) has no FilePath) are
+	// never deduped — they are an independent evasion modality that
+	// stacks with sandbox probes rather than duplicating them.
+	suspicious = deduplicateEvasionByPath(suspicious)
+
 	// Import-phase reality check: if the sandbox tried to import
 	// packages but every attempt failed, the import phase produced no
 	// observable target-package behavior. Historically this was
@@ -155,6 +171,42 @@ func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
 	// package. Events still flow into `suspicious` for forensic visibility
 	// in the report.
 	return decideVerdict(suspicious), suspicious
+}
+
+// deduplicateEvasionByPath collapses multiple CategoryEvasion events
+// that carry the same FilePath into a single event, preserving the
+// first occurrence (which pins the earliest PID and syscall context).
+// Rationale: glibc, V8, Python's runpy, and container-aware libraries
+// often read /proc/self/maps and /proc/self/cgroup multiple times per
+// scan — sometimes from several PIDs when npm forks — and the raw
+// event count would repeatedly cross the 2+ MEDIUM verdict threshold
+// on packages that never even try to evade analysis.
+//
+// Path-only key (not (PID, FilePath)) is deliberate: a maps read from
+// PID 100 (pip) and a maps read from PID 200 (node) are the SAME
+// glibc-baseline breadcrumb, not two independent probes; keying on PID
+// would treat every forked helper as fresh evidence and re-open the
+// FP. The verdict rule now measures DISTINCT paths probed, which is
+// the semantic that matches attacker intent (sweep every environment
+// signal available) and glibc behavior (each library needs each path
+// at most once).
+//
+// Events with an empty FilePath (ptrace(TRACEME) evasion) are passed
+// through untouched — they are an independent evasion modality that
+// stacks with sandbox probes rather than duplicating them.
+func deduplicateEvasionByPath(events []types.SyscallEvent) []types.SyscallEvent {
+	seen := make(map[string]bool)
+	out := events[:0]
+	for i := range events {
+		if events[i].Category == types.CategoryEvasion && events[i].FilePath != "" {
+			if seen[events[i].FilePath] {
+				continue
+			}
+			seen[events[i].FilePath] = true
+		}
+		out = append(out, events[i])
+	}
+	return out
 }
 
 // hasHighSeverity reports whether any classified event carries a HIGH

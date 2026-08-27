@@ -36,19 +36,24 @@ func TestDefaultSensitivePaths(t *testing.T) {
 		}
 	}
 
-	// /proc/self/maps and /proc/self/cgroup are deliberately NOT in the
-	// defaults: V8/Node startup, glibc and Python's runpy read these on
-	// every process launch, so flagging them by default produced
-	// per-scan evasion noise that swamped real signal. Pin the absence
-	// so future "let's add these back to be safe" changes have to
-	// confront this test.
-	excluded := []string{"/proc/self/maps", "/proc/self/cgroup"}
-	for _, banned := range excluded {
+	// /proc/self/maps and /proc/self/cgroup are back in the defaults
+	// now that analyzer.deduplicateEvasionByPath collapses repeated
+	// reads of the same sandbox-detection path down to one forensic
+	// breadcrumb. Pin their presence so a future "trim these for
+	// noise" change has to confront the dedup invariant — removing
+	// them here re-opens the libfaketime / LD_PRELOAD / container
+	// fingerprint blind spot.
+	sandboxProbes := []string{"/proc/self/maps", "/proc/self/cgroup"}
+	for _, want := range sandboxProbes {
+		found := false
 		for _, p := range paths {
-			if p == banned {
-				t.Errorf("default path %q must stay out of defaults — too noisy under interpreter startup; opt in via config include if needed",
-					banned)
+			if p == want {
+				found = true
+				break
 			}
+		}
+		if !found {
+			t.Errorf("sandbox-probe path %q missing from defaults — the analyzer dedup gate makes single reads safe, but only if the parser emits them in the first place", want)
 		}
 	}
 }
