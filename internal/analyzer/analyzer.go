@@ -58,8 +58,24 @@ func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
 	state := newFlowState(events)
 
 	var suspicious []types.SyscallEvent
+	importAttempted, importSucceeded := 0, 0
 
 	for i := range events {
+		// Import-attempt events emitted by the OS-simulation probe
+		// scripts do not participate in the classification pipeline;
+		// they are counted here so the verdict logic below can
+		// distinguish "no observable behavior" (verdict inconclusive
+		// — the sandbox tried imports but none succeeded, so the whole
+		// import phase produced no reachable code) from "clean
+		// behavior" (imports succeeded but did nothing malicious).
+		if events[i].Syscall == types.EventImportAttempt {
+			importAttempted++
+			if events[i].FilePath == "ok" {
+				importSucceeded++
+			}
+			continue
+		}
+
 		// Record DNS observations BEFORE any filtering. A loopback DNS
 		// query (Docker embedded resolver at 127.0.0.11:53) filters as
 		// benign for verdict purposes but the queried hostname is
@@ -108,6 +124,27 @@ func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
 	// because DGA is per-CLUSTER, not per-event.
 	suspicious = appendDGAFindings(state, suspicious)
 
+	// Import-phase reality check: if the sandbox tried to import
+	// packages but every attempt failed, the import phase produced no
+	// observable target-package behavior. Historically this was
+	// silent — `pkg.replace("-","_")` produced pillow → pillow (should
+	// be PIL), pyyaml → pyyaml (should be yaml), and every subsequent
+	// __import__ raised ImportError which the surrounding try/except
+	// swallowed. The scan reported "clean" without executing a single
+	// line of target-package code. An attacker who deliberately
+	// mismatched dist and module names bypassed the import phase
+	// entirely. Verdict inconclusive is the honest signal: kojuto
+	// cannot say "this package is safe" when it never ran the code.
+	//
+	// If NO attempts were made at all (importAttempted == 0) the older
+	// path applies: either the probe scripts didn't run (an install
+	// failure kojuto already reported upstream) or the scan predates
+	// this feature. Either way the verdict falls back to the
+	// suspicious-events tally without forcing inconclusive.
+	if importAttempted > 0 && importSucceeded == 0 && !hasHighSeverity(suspicious) {
+		return types.VerdictInconclusive, suspicious
+	}
+
 	if len(suspicious) == 0 {
 		return types.VerdictClean, nil
 	}
@@ -118,6 +155,27 @@ func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
 	// package. Events still flow into `suspicious` for forensic visibility
 	// in the report.
 	return decideVerdict(suspicious), suspicious
+}
+
+// hasHighSeverity reports whether any classified event carries a HIGH
+// severity category. Used by Analyze() so that a genuine HIGH signal
+// caught during install phase still flips the verdict to suspicious
+// even when the import-phase reality check failed — install-phase
+// malware still gets reported.
+func hasHighSeverity(events []types.SyscallEvent) bool {
+	for i := range events {
+		if events[i].Category == "" {
+			continue
+		}
+		sev, known := types.CategorySeverity[events[i].Category]
+		if !known {
+			sev = types.SeverityHigh
+		}
+		if sev == types.SeverityHigh {
+			return true
+		}
+	}
+	return false
 }
 
 // appendDGAFindings runs the structural DGA detector on the
