@@ -18,13 +18,58 @@ type ParseState struct {
 	// during this scan are flagged as anti-forensics — pre-existing file
 	// cleanup (pip temp dirs) is ignored.
 	createdTmpFiles map[string]bool
+
+	// openFDs maps PID → fd → absolute path, populated from
+	// successful open()/openat() lines with an AT_FDCWD dirfd and an
+	// absolute path. The dirfd resolver in parseOpenat consults this
+	// map on `openat(<numeric-fd>, "<relative-path>", ...)` to
+	// reconstruct the real filesystem path — without it, an attacker
+	// who opens `/etc/` once and then reads `openat(fd, "shadow",
+	// O_RDONLY)` never trips sensitivePathPatterns (which match
+	// `/etc/shadow`, not the bare `shadow`). Per-PID because fd
+	// values are process-scoped.
+	openFDs map[uint32]map[int]string
 }
 
 // NewParseState creates a fresh parse state for a scan phase.
 func NewParseState() *ParseState {
 	return &ParseState{
 		createdTmpFiles: make(map[string]bool),
+		openFDs:         make(map[uint32]map[int]string),
 	}
+}
+
+// recordFD stores fd → absPath for pid in the openFDs map. Overwrites
+// any prior entry for the same (pid, fd) pair: kernel fd reuse after
+// close() would otherwise leave a stale mapping, and the fresh open()
+// gives us ground truth without needing to also parse close() lines.
+func (s *ParseState) recordFD(pid uint32, fd int, absPath string) {
+	if s == nil {
+		return
+	}
+	perPID, ok := s.openFDs[pid]
+	if !ok {
+		perPID = make(map[int]string)
+		s.openFDs[pid] = perPID
+	}
+	perPID[fd] = absPath
+}
+
+// resolveFD returns the recorded absolute path for (pid, fd), or "" if
+// no such entry exists. Callers must handle the empty case — an
+// unresolved dirfd fall-through gets recorded with the bare relative
+// path, so the analyzer still sees SOMETHING (better than dropping
+// the event) even when the open() that produced the fd happened before
+// the trace started or was itself missed.
+func (s *ParseState) resolveFD(pid uint32, fd int) string {
+	if s == nil {
+		return ""
+	}
+	perPID, ok := s.openFDs[pid]
+	if !ok {
+		return ""
+	}
+	return perPID[fd]
 }
 
 // straceOpenatCreateRe matches openat calls with O_CREAT flag for tracking
@@ -106,9 +151,18 @@ var (
 	)
 
 	// openat(AT_FDCWD, "/home/dev/.ssh/id_rsa", O_RDONLY|O_CLOEXEC) = 3.
-	straceOpenatRe = regexp.MustCompile(
-		`openat\([^,]+,\s*"((?:\\.|[^"\\])+)",\s*([A-Z_|]+)`,
+	// Captures the dirfd token (AT_FDCWD or a decimal number) as
+	// group 1 so parseOpenat can resolve fd-relative paths via
+	// ParseState.openFDs.
+	straceOpenatWithDirFDRe = regexp.MustCompile(
+		`openat\((AT_FDCWD|-?\d+),\s*"((?:\\.|[^"\\])+)",\s*([A-Z_|]+)`,
 	)
+
+	// straceOpenReturnRe captures the return value of a successful
+	// open()/openat() line so the fd tracker can record fd → path.
+	// A negative return (or an "= -1 EFOO" tail) means the call
+	// failed; the anchor `= (\d+)` only matches non-negative decimals.
+	straceOpenReturnRe = regexp.MustCompile(`\)\s*=\s*(\d+)\s*$`)
 
 	// rename("/tmp/evil", "/usr/local/bin/python3") = 0.
 	// `(?:\\.|[^"\\])+` accepts strace's C-style backslash escapes
@@ -256,6 +310,13 @@ func parseStraceLine(line string, state *ParseState) (types.SyscallEvent, bool) 
 
 	// Track file creation in suspicious dirs (side effect, no event emitted).
 	trackTmpFileCreation(line, state)
+
+	// Track fd → path from every successful open()/openat(). Runs
+	// regardless of whether parseOpenat later emits an event: the map
+	// is consulted on subsequent dirfd-relative openat lines whose
+	// target may or may not be sensitive, and both cases need the
+	// dirfd resolved before classification.
+	trackOpenFD(line, state)
 	if evt, ok := parseConnectOrSendto(line, straceConnectRe, types.EventConnect); ok {
 		return evt, true
 	}
@@ -303,7 +364,7 @@ func parseStraceLine(line string, state *ParseState) (types.SyscallEvent, bool) 
 		return evt, true
 	}
 
-	if evt, ok := parseOpenat(line); ok {
+	if evt, ok := parseOpenat(line, state); ok {
 		return evt, true
 	}
 
@@ -357,20 +418,87 @@ func isSystemBinaryWrite(filePath string) bool {
 		strings.HasPrefix(filePath, "/bin/")
 }
 
+// trackOpenFD records fd → absolute path for every successful
+// open()/openat() line, per PID. Consulted by parseOpenat to resolve
+// subsequent `openat(<numeric-fd>, "<relative>", ...)` back to a real
+// absolute path. Failed calls (negative return / EFOO tail) do not
+// match straceOpenReturnRe. AT_FDCWD-anchored calls with a relative
+// path are ignored — the working directory is unknown to the parser
+// and guessing it invents facts (an attacker could hide behind an
+// unknown chdir); such fds are simply not resolvable.
+func trackOpenFD(line string, state *ParseState) {
+	if state == nil {
+		return
+	}
+	matches := straceOpenatWithDirFDRe.FindStringSubmatch(line)
+	if matches == nil {
+		return
+	}
+	ret := straceOpenReturnRe.FindStringSubmatch(line)
+	if ret == nil {
+		return
+	}
+	fd64, err := strconv.ParseInt(ret[1], 10, 32)
+	if err != nil {
+		return
+	}
+	dirfd, capturedPath := matches[1], unescapeStracePath(matches[2])
+
+	absPath := resolveOpenatPath(dirfd, capturedPath, state, extractPID(line))
+	if absPath == "" || !strings.HasPrefix(absPath, "/") {
+		return
+	}
+	state.recordFD(extractPID(line), int(fd64), absPath)
+}
+
+// resolveOpenatPath returns the absolute path an openat call resolves
+// to, or "" when it cannot be determined. Rules:
+//   - AT_FDCWD + absolute path      → the path as-is
+//   - AT_FDCWD + relative path      → "" (working directory unknown)
+//   - numeric dirfd + absolute path → the path as-is (POSIX: absolute
+//     path ignores dirfd)
+//   - numeric dirfd + relative path → dirfd's recorded path + "/" + path
+func resolveOpenatPath(dirfd, path string, state *ParseState, pid uint32) string {
+	if strings.HasPrefix(path, "/") {
+		return path
+	}
+	if dirfd == "AT_FDCWD" {
+		return ""
+	}
+	fd, err := strconv.Atoi(dirfd)
+	if err != nil {
+		return ""
+	}
+	base := state.resolveFD(pid, fd)
+	if base == "" {
+		return ""
+	}
+	return base + "/" + path
+}
+
 // parseOpenat emits events for:
 //  1. Sensitive file paths (credentials, keys, etc.) — any access mode.
 //  2. ANY write to the user home directory (/home/) — pip/npm never write here.
 //  3. Writes to system binary paths — binary hijack for benignPaths bypass.
-func parseOpenat(line string) (types.SyscallEvent, bool) {
-	matches := straceOpenatRe.FindStringSubmatch(line)
+//
+// Dirfd resolution: when the openat line uses a numeric dirfd (not
+// AT_FDCWD) with a relative path, the path is rewritten to its
+// absolute form via ParseState.openFDs. Without this, an attacker who
+// pre-opens `/etc/` (fd 3) and then does `openat(3, "shadow",
+// O_RDONLY)` never trips sensitivePathPatterns — the bare `shadow`
+// matches nothing, and the credential read is invisible to the analyzer.
+func parseOpenat(line string, state *ParseState) (types.SyscallEvent, bool) {
+	matches := straceOpenatWithDirFDRe.FindStringSubmatch(line)
 	if matches == nil {
 		return types.SyscallEvent{}, false
 	}
 
-	filePath := unescapeStracePath(matches[1])
-	var flags string
-	if len(matches) > 2 {
-		flags = matches[2]
+	dirfd := matches[1]
+	filePath := unescapeStracePath(matches[2])
+	flags := matches[3]
+
+	if resolved := resolveOpenatPath(dirfd, filePath, state, extractPID(line)); resolved != "" {
+		filePath = resolved
 	}
 
 	isWrite := strings.Contains(flags, "O_WRONLY") ||

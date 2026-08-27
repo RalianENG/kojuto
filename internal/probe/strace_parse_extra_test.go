@@ -1369,3 +1369,111 @@ func escapeForStraceInput(raw string) string {
 	}
 	return b.String()
 }
+
+// TestOpenatDirFDResolution closes the "openat dirfd bypass" gap: a
+// process that opens `/etc/` once and then reads `openat(fd, "shadow",
+// O_RDONLY)` was previously invisible to the analyzer, because the
+// captured filename `shadow` matched none of the sensitive-path
+// patterns. Now the parser records fd → absolute path across strace
+// lines and rewrites the fd-relative openat to `/etc/shadow` before
+// classification. Cases pin: the credential read is emitted, an
+// unrelated fd-relative openat under an unsensitive directory does
+// NOT fabricate an event, and PID scoping isolates one process's fd
+// table from another (kernel fds are process-scoped).
+func TestOpenatDirFDResolution(t *testing.T) {
+	tests := []struct {
+		name       string
+		setupLines []string
+		targetLine string
+		wantEvent  bool
+		wantPath   string
+	}{
+		{
+			name: "sensitive read via dirfd resolves to /etc/shadow",
+			setupLines: []string{
+				`[pid 100] openat(AT_FDCWD, "/etc", O_RDONLY|O_DIRECTORY|O_CLOEXEC) = 3`,
+			},
+			targetLine: `[pid 100] openat(3, "shadow", O_RDONLY) = 4`,
+			wantEvent:  true,
+			wantPath:   "/etc/shadow",
+		},
+		{
+			name: "ssh dir + private key read via dirfd resolves",
+			setupLines: []string{
+				`[pid 100] openat(AT_FDCWD, "/home/dev/.ssh", O_RDONLY|O_DIRECTORY|O_CLOEXEC) = 5`,
+			},
+			targetLine: `[pid 100] openat(5, "id_rsa", O_RDONLY) = 6`,
+			wantEvent:  true,
+			wantPath:   "/home/dev/.ssh/id_rsa",
+		},
+		{
+			name: "unresolved dirfd (open() before trace) falls through cleanly",
+			setupLines: []string{
+				// No prior open — fd 7 has no recorded path.
+			},
+			targetLine: `[pid 100] openat(7, "somewhere", O_RDONLY) = 8`,
+			wantEvent:  false,
+		},
+		{
+			name: "dirfd from a different PID does not leak across processes",
+			setupLines: []string{
+				`[pid 100] openat(AT_FDCWD, "/etc", O_RDONLY|O_DIRECTORY|O_CLOEXEC) = 3`,
+			},
+			targetLine: `[pid 200] openat(3, "shadow", O_RDONLY) = 4`,
+			wantEvent:  false,
+		},
+		{
+			name: "absolute path with numeric dirfd ignores dirfd (POSIX)",
+			setupLines: []string{
+				// dirfd 3 not recorded; would resolve to bare "" if consulted.
+			},
+			targetLine: `[pid 100] openat(3, "/home/dev/.aws/credentials", O_RDONLY) = 4`,
+			wantEvent:  true,
+			wantPath:   "/home/dev/.aws/credentials",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			state := NewParseState()
+			for _, s := range tc.setupLines {
+				parseStraceLine(s, state)
+			}
+			evt, ok := parseStraceLine(tc.targetLine, state)
+			if ok != tc.wantEvent {
+				t.Fatalf("emit=%v, want %v", ok, tc.wantEvent)
+			}
+			if !tc.wantEvent {
+				return
+			}
+			if evt.FilePath != tc.wantPath {
+				t.Errorf("FilePath = %q, want %q", evt.FilePath, tc.wantPath)
+			}
+		})
+	}
+}
+
+// TestOpenatDirFDResolution_FDReuseAfterReopen covers the fd-reuse
+// case: the kernel reuses a freed fd number on the next open(), so the
+// second open() must overwrite the map entry — otherwise a stale
+// `/etc/` mapping would rewrite an unrelated later `openat(3, "config",
+// ...)` into a phantom `/etc/config` credential event.
+func TestOpenatDirFDResolution_FDReuseAfterReopen(t *testing.T) {
+	state := NewParseState()
+	parseStraceLine(`[pid 100] openat(AT_FDCWD, "/etc", O_RDONLY|O_DIRECTORY|O_CLOEXEC) = 3`, state)
+	parseStraceLine(`[pid 100] openat(AT_FDCWD, "/var/tmp", O_RDONLY|O_DIRECTORY|O_CLOEXEC) = 3`, state)
+	evt, ok := parseStraceLine(`[pid 100] openat(3, "shadow", O_RDONLY) = 4`, state)
+	if ok {
+		t.Fatalf("expected no event: fd 3 was reopened onto /var/tmp, /var/tmp/shadow is not sensitive; got evt=%+v", evt)
+	}
+}
+
+// TestTrackOpenFD_IgnoresFailedOpens: a failed open (= -1 EACCES) must
+// not enter the fd map. Otherwise the failed open's dirfd argument
+// could be recorded as an aliased path via a stale return value.
+func TestTrackOpenFD_IgnoresFailedOpens(t *testing.T) {
+	state := NewParseState()
+	parseStraceLine(`[pid 100] openat(AT_FDCWD, "/etc", O_RDONLY|O_DIRECTORY|O_CLOEXEC) = -1 EACCES (Permission denied)`, state)
+	if state.resolveFD(100, 3) != "" {
+		t.Fatalf("failed open should not populate fd map")
+	}
+}
