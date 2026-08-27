@@ -42,6 +42,8 @@ An OSS tool that detects suspicious syscalls during package installation and imp
 | `listen(2)` | Listen for incoming connections | Backdoor listener setup |
 | `accept(2)` / `accept4(2)` | Accept incoming connections | Active backdoor operation |
 | `execve(2)` | Process creation | Malware binary execution, reverse shell |
+| `execveat(2)` | Fd-relative and fexecve process creation | Fileless execution via `memfd_create` + `execveat(fd, "", ..., AT_EMPTY_PATH)`, glibc 2.34+ path-execve routing |
+| `clone(2)` / `clone3(2)` | Thread / process creation | Attribution of child syscalls (V8 worker threads that never call execve) to the parent's comm for the JIT filter |
 | `openat(2)` | File access (sensitive paths + home dir writes) | Credential theft, persistence, sandbox detection |
 | `rename(2)` / `renameat(2)` / `renameat2(2)` | File rename / move | Trusted binary hijacking (`/usr/local/bin/python3`) |
 | `mmap(2)` | Memory mapping with PROT_WRITE\|PROT_EXEC | Shellcode injection via ctypes/ffi-napi (RWX anonymous mapping) |
@@ -86,17 +88,22 @@ Two complementary detection strategies:
 - Suspicious if `dst_path` overwrites a known trusted binary (e.g. `python3`, `node`, `sh` in `/usr/bin/` or `/usr/local/bin/`)
 - Benign if the destination is not a whitelisted binary (e.g. pip installing a new CLI script)
 
-### DNS Tunneling Detection
+### DNS Detection Layers
 
-- Extracts DNS query domain from `sendto` payload when destination port is 53
-- Parses DNS wire format (RFC 1035) to reconstruct the queried domain name
-- Events include `dns_query` field with the extracted domain
-- Heuristics for tunneling detection:
-  - Subdomain label length > 30 characters
-  - Total query length > 80 characters
-  - Shannon entropy > 3.5 bits/char in subdomain labels (indicates base64/hex-encoded data)
-- Benign suffixes excluded: `pypi.org`, `npmjs.org`, `pythonhosted.org`, `googleapis.com`, etc.
-- Loopback DNS queries with clean domains are treated as benign
+Three complementary layers cover the DNS attack surface:
+
+1. **Per-query classification** — extracts the DNS query domain from `sendto`/`sendmsg`/`sendmmsg` payload when destination port is 53. Parses DNS wire format (RFC 1035) to reconstruct the queried domain. Emits `dns_query` on the event. Heuristics that flip severity per query:
+   - Length: subdomain label > 30 chars OR total query > 80 chars → `dns_tunneling` MEDIUM
+   - Entropy: Shannon > 3.5 bits/char in any subdomain label → `dns_tunneling` MEDIUM
+   - Known exfil service (Discord/Telegram/Pastebin/webhook.site/ipinfo.io/…) → `data_exfiltration` HIGH
+   - Loopback DNS with clean domain → benign (filtered before classification)
+   - Isolated non-loopback lookups otherwise → `dns_lookup` LOW forensic record
+
+2. **Structural DGA detection** — post-classification pass groups accumulated DNS observations by `(PID, 2LD)`. A group with **≥10 distinct subdomains** whose labels share consistent morphology (length variance ≤3 AND identical character-class fingerprint over lowercase / uppercase / digit / hyphen) fires **`dga` MEDIUM**. Catches SUNBURST-style dictionary-word DGA that per-query entropy checks cannot see — each individual subdomain has low entropy but the cluster is algorithmic. Two clusters or one DGA + any other MEDIUM tips the verdict.
+
+3. **DNS→connect chain annotation** — when a non-DoH non-53 `connect` fires `c2_communication` HIGH, `classifyConnect` consults `FlowState.DNSHostnamesForPID(pid)` and appends the hostnames the same PID queried earlier to the Reason string. Additive forensic enrichment — no category or severity change. Under `--network=none` the resolver responses fail so DNS lookups alone are LOW; the connect to the resolved IP is the harm-firing event and now carries the causal chain in its explanation.
+
+Buffer-decoding contract for all three layers: `unescapeStraceBuf` handles `\n \t \r \a \b \f \v \" \' \\` plus `\xNN` hex and `\NNN` octal. Buffer-capture regexes use the `(?:\\.|[^"\\])*` alternation so DNS packets whose bytes include `0x22` do not truncate at the first escape-quote pair.
 
 ---
 
@@ -121,10 +128,14 @@ CLI (cobra)
   │   └─ Audit hooks (Python PEP 578 + Node.js --require, multiplexed on strace stderr)
   │
   ├─ Analyzer         Event classification and risk assessment
+  │   ├─ FlowState: per-scan context shared across rules
+  │   │   ├─ PIDComm — execve binary path per PID (+ clone propagation)
+  │   │   ├─ ExecutedPaths — set of paths that were executed (anti-forensics correlation)
+  │   │   └─ dnsQueries — per-PID DNS observations for DGA + chain rules
   │   ├─ Network events: filter out loopback/unspecified/link-local
-  │   ├─ DNS tunneling: entropy-based detection of exfil via subdomains
-  │   ├─ execve: path validation + shell command content inspection
-  │   ├─ openat: sensitive file access detection (credentials, keys)
+  │   ├─ DNS: per-query entropy → dns_tunneling, structural DGA over FlowState, chain annotation
+  │   ├─ execve/execveat: path validation + shell command content inspection
+  │   ├─ openat: sensitive file access, home-dir writes, library hijacking (npm + PyPI)
   │   ├─ rename: trusted binary hijacking detection
   │   └─ Parse failures (empty address) treated as suspicious
   │

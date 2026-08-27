@@ -17,7 +17,7 @@ An EDR for package installations — monitors syscalls during install and import
 
 1. **Download** — Fetch the target package to the host (network allowed)
 2. **Isolate** — Run installation inside a hardened Docker container with network isolation
-3. **Install + Monitor** — Record `connect`, `sendto`, `sendmsg`, `sendmmsg`, `bind`, `listen`, `accept`/`accept4`, `execve`, `openat`, `rename`/`renameat`/`renameat2`, `sendfile`, `ptrace`, `mmap`, `mprotect`, and `unlink`/`unlinkat` syscalls via strace (or eBPF). Audit hooks intercept `compile`/`exec`/`import` (Python PEP 578) and `eval`/`Function`/`vm` (Node.js `--require`) for dynamic code execution detection
+3. **Install + Monitor** — Record `connect`, `sendto`, `sendmsg`, `sendmmsg`, `bind`, `listen`, `accept`/`accept4`, `execve`/`execveat`, `openat`, `rename`/`renameat`/`renameat2`, `sendfile`, `ptrace`, `mmap`, `mprotect`, `clone`/`clone3`, and `unlink`/`unlinkat` syscalls via strace (or eBPF). Audit hooks intercept `compile`/`exec`/`import` (Python PEP 578) and `eval`/`Function`/`vm` (Node.js `--require`) for dynamic code execution detection
 4. **Import + Monitor** — Import/require the package under 3 simulated OS identities (Linux, Windows, macOS) with time shifted +30–180 days (randomized) via `libfaketime` to trigger platform-gated and date-gated payloads
 5. **Report** — Output findings as JSON
 
@@ -235,6 +235,12 @@ kojuto does not rely solely on passive syscall observation. It actively creates 
 
 This approach detects environment-aware and delayed-execution supply chain attacks that would remain dormant in a sterile sandbox.
 
+Detection rules run against a shared `FlowState` context — a per-scan struct that carries process attribution (`PIDComm`, `ExecutedPaths`) and cross-event correlation (`dnsQueries`) so classifiers can reason about a syscall in the flow it belongs to rather than as an isolated point event. Series-aware rules that use this foundation include the DGA structural check (many same-2LD queries from one PID) and the DNS→connect chain annotation (a C2 event's Reason names the hostnames the same PID resolved earlier).
+
+**No whitelists.** Detection thresholds use entropy, morphology, and structural heuristics rather than allowlists of "known safe" domains, packages, or binaries — an allowlist is a maintenance liability AND a single-file compromise vector.
+
+**Severity tiers.** HIGH categories flip the verdict on one event (`c2_communication`, `credential_access`, `code_execution`, `memory_execution`, `binary_hijacking`, `backdoor`, `persistence`, `data_exfiltration`, `library_hijacking`). MEDIUM categories require two events (`dns_tunneling`, `dga`, `evasion`). LOW categories are forensic breadcrumbs that never flip the verdict alone (`dns_lookup`, `dynamic_code_execution`, `unknown_binary`) — they exist so the analyst sees the causal chain without false-positive noise.
+
 ## Detection Benchmarks
 
 True-positive rate validated against 300 randomly sampled malicious packages from [Datadog's malicious-software-packages-dataset](https://github.com/DataDog/malicious-software-packages-dataset) (seed=42, reproducible). False-positive rate re-measured (2026-05) against 100 popular non-corporate PyPI packages + 100 popular non-corporate npm packages.
@@ -261,9 +267,12 @@ Of the 300 malicious samples, 238 failed to install (dependencies already remove
 | Backdoor (`backdoor`) | `bind` + `listen` + `accept` on attacker-controlled port | Server socket operations during install |
 | Persistence (`persistence`) | Write to `.bashrc`, `.config/systemd/user/`, any `/home/` path | `openat` with write flags to shell startup files or user home directory |
 | DNS tunneling (`dns_tunneling`) | `airio` → high-entropy subdomain queries, DoH connections | `sendto` port 53 with entropy > 3.5, `connect` to known DoH servers |
+| **Structural DGA (`dga`)** | SUNBURST-style `<word>-<word>-NN.metrics.legit-analytics.com` beacon families — each individual subdomain has low entropy but the cluster is algorithmic | Per-PID DNS observations grouped by 2LD; a group with ≥10 distinct subdomains sharing morphology (length variance ≤3 AND same character-class fingerprint) fires MEDIUM. Complements the per-query `dns_tunneling` entropy check |
+| **Library hijacking (`library_hijacking`)** | Scanned package appends a backdoor stub to a sibling's `__init__.py` or `node_modules/<other>/index.js` — harm fires when a later workflow imports the hijacked package, outside kojuto's scan window | For npm: any write to `/install/node_modules/<other_pkg>/` from the scanned package. For PyPI: `O_APPEND` write into another package's `site-packages/<other>/` (pip's own extraction uses `O_TRUNC` only, so the append flag cleanly excludes pip) |
 | Evasion (`evasion`) | `ptrace(PTRACE_TRACEME)`, reading `/proc/self/status`, `/sys/class/net` | `ptrace` self-check or sandbox detection via `/proc`/`/sys` introspection |
 | Anti-forensics (`anti_forensics`) | Create `/tmp/payload` → execute → delete | `unlink` correlated with prior `openat(O_CREAT)` + `execve` for same path |
 | Dynamic code execution (`dynamic_code_execution`) | `eval(base64(...))`, `new Function()`, `vm.runInNewContext()` | Audit hooks: Python PEP 578 (`compile`/`exec`) and Node.js `--require` (`eval`/`Function`/`vm`) |
+| DNS lookup (`dns_lookup`, LOW) | `getaddrinfo("evil.example")` at import time — kojuto records the resolver connect + query domain but does NOT flip the verdict on the lookup alone | `connect(:53)` and benign DNS `sendto`/`sendmsg` recorded as forensic breadcrumbs. Under `--network=none` resolution never completes; the real C2 signal is the follow-up TCP connect (fires `c2_communication` HIGH independently). Same-PID hostnames are surfaced in the C2 event's Reason as the causal chain |
 
 ### Configuration
 
@@ -289,7 +298,7 @@ kojuto detects malicious behavior at the syscall level. The following attack vec
 - **Environment variable reads** — `os.environ.get()` is a pure memory operation with no syscall (honeypot values are planted to mitigate impact)
 - **W^X shellcode** — `mmap(RW)` → `mprotect(RX)` is indistinguishable from V8 JIT (simultaneous RWX IS detected)
 - **Function-call-gated payloads** — import phase only executes top-level code, not function calls
-- **Low-entropy DNS tunneling** — dictionary-encoded data bypasses Shannon entropy heuristic (mitigated by `--network=none`)
+- **Low-entropy DNS tunneling (single-query form)** — dictionary-encoded data in a small number of queries still bypasses the Shannon entropy heuristic. Structural DGA at scale (≥10 same-2LD queries with uniform morphology) IS caught by the `dga` category; between-those-two-poles usage (2-9 dictionary queries under one 2LD) remains a gap. Mitigated by `--network=none`
 - **Strace/network-none detection** — `/proc/self/status` TracerPid and `/sys/class/net` reveal the sandbox (reads are detected as `evasion` but cannot be prevented with strace-based probing)
 
 See [SECURITY.md](SECURITY.md) for full details.

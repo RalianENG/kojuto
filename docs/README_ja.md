@@ -10,7 +10,7 @@ kojuto は、パッケージを強化された Docker コンテナ内でイン�
 
 1. **ダウンロード** — パッケージをホストにダウンロード（ネットワーク許可）
 2. **隔離実行** — ネットワーク隔離された Docker コンテナでインストール実行
-3. **インストール監視** — `connect`, `sendto`, `sendmsg`, `sendmmsg`, `bind`, `listen`, `accept`/`accept4`, `execve`, `openat`, `rename`/`renameat`/`renameat2`, `mmap`, `mprotect`, `unlink`/`unlinkat`, `sendfile`, `ptrace` syscall を記録。audit hook により `compile`/`exec`/`import`（Python PEP 578）および `eval`/`Function`/`vm`（Node.js `--require`）の動的コード実行を検知
+3. **インストール監視** — `connect`, `sendto`, `sendmsg`, `sendmmsg`, `bind`, `listen`, `accept`/`accept4`, `execve`/`execveat`, `openat`, `rename`/`renameat`/`renameat2`, `mmap`, `mprotect`, `clone`/`clone3`, `unlink`/`unlinkat`, `sendfile`, `ptrace` syscall を記録。audit hook により `compile`/`exec`/`import`（Python PEP 578）および `eval`/`Function`/`vm`（Node.js `--require`）の動的コード実行を検知
 4. **インポート監視** — Linux / Windows / macOS の 3 つの OS ID で、`libfaketime` により時刻を +30〜180 日（ランダム）進めた状態でパッケージをインポートし、プラットフォーム依存・日付依存のペイロードを検知
 5. **レポート** — 検知結果を JSON で出力
 
@@ -120,6 +120,12 @@ kojuto は受動的な syscall 監視だけに頼りません。マルウェア�
 
 このアプローチにより、無菌なサンドボックスでは休眠したままの環境依存型・遅延実行型のサプライチェーン攻撃を検知します。
 
+検知ルールは共有された `FlowState` コンテキスト上で動作します — スキャン単位で構築されるこの構造体は、プロセス属性（`PIDComm`、`ExecutedPaths`）とイベント間相関（`dnsQueries`）を保持し、分類器が個々の syscall を「単発の点イベント」ではなく「所属するフロー」の中で理解できるようにします。この基盤上に構築されている series-aware ルールとして、DGA 構造検知（同一 PID から同一 2LD への大量クエリ）と DNS→connect チェーン注記（C2 イベントの Reason に、同一 PID が先行して解決したホスト名を追記）があります。
+
+**ホワイトリスト非採用**。閾値はエントロピー、morphology、構造的ヒューリスティックで決定 — 「既知安全ドメイン/パッケージ/バイナリ」のリストは保守負債かつ単一ファイル改竄で無効化される攻撃面。
+
+**severity 階層**: HIGH カテゴリは 1 event で verdict flip (`c2_communication`, `credential_access`, `code_execution`, `memory_execution`, `binary_hijacking`, `backdoor`, `persistence`, `data_exfiltration`, `library_hijacking`)。MEDIUM は 2 event 必要 (`dns_tunneling`, `dga`, `evasion`)。LOW は forensic 記録のみで単独では verdict を動かさない (`dns_lookup`, `dynamic_code_execution`, `unknown_binary`) — 因果チェーンを analyst に見せるためのブレッドクラム。
+
 ## 検知ベンチマーク
 
 [Datadog malicious-software-packages-dataset](https://github.com/DataDog/malicious-software-packages-dataset) からランダムに 300 件を抽出して検証（seed=42、再現可能）。
@@ -145,9 +151,12 @@ kojuto は受動的な syscall 監視だけに頼りません。マルウェア�
 | バックドア (`backdoor`) | `bind` + `listen` + `accept` | インストール中のサーバソケット操作 |
 | 永続化 (`persistence`) | `.bashrc`、`.config/systemd/user/`、`/home/` への書き込み | `openat` のホームディレクトリ書き込み検知（ホワイトリスト方式） |
 | DNS トンネリング (`dns_tunneling`) | 高エントロピーサブドメインクエリ、DoH 接続 | `sendto` port 53 エントロピー > 3.5、既知 DoH サーバへの `connect` |
+| **構造的 DGA (`dga`)** | SUNBURST 系 `<word>-<word>-NN.metrics.legit-analytics.com` ビーコン群 — 個々のサブドメインは低エントロピーだが集合として algorithmic | `FlowState` の PID 別 DNS 観測を 2LD でグルーピング、10+ 個の distinct subdomain が morphology (長さ variance ≤3 かつ同一文字クラス fingerprint) 一致で MEDIUM 発火。per-query entropy 検知の穴を埋める |
+| **ライブラリハイジャック (`library_hijacking`)** | スキャン対象パッケージが sibling の `__init__.py` や `node_modules/<other>/index.js` に backdoor stub を追記 — 実 harm は scan window 外での後発 import で発火 | npm: `/install/node_modules/<other_pkg>/` へのスキャン対象パッケージからの write を全て検知。PyPI: 他パッケージの `site-packages/<other>/` への `O_APPEND` write を検知 (pip 自身の展開は `O_TRUNC` のみで append を使わない、これで clean に区別) |
 | 回避行為 (`evasion`) | `ptrace(PTRACE_TRACEME)`、`/proc/self/status`、`/sys/class/net` の読み取り | ptrace 自己チェック、サンドボックス検知の `/proc`/`/sys` 読み取り |
 | アンチフォレンジック (`anti_forensics`) | `/tmp/payload` 作成→実行→削除 | `unlink` と `openat(O_CREAT)` + `execve` の 3 点相関 |
 | 動的コード実行 (`dynamic_code_execution`) | `eval(base64(...))`、`new Function()`、`vm.runInNewContext()` | audit hook: Python PEP 578（`compile`/`exec`）、Node.js `--require`（`eval`/`Function`/`vm`） |
+| DNS lookup (`dns_lookup`, LOW) | import 時の `getaddrinfo("evil.example")` — kojuto は resolver connect + query domain を記録するが lookup 単独では verdict flip しない | `connect(:53)` と benign な DNS `sendto`/`sendmsg` を forensic breadcrumb として記録。`--network=none` 下では解決自体が失敗するので、本物の C2 signal は解決 IP への follow-up TCP connect (`c2_communication` HIGH で独立発火)。同一 PID の hostname は C2 event の Reason に因果チェーンとして注記される |
 
 ### 設定
 
@@ -169,7 +178,7 @@ kojuto は syscall レベルで悪性挙動を検知します。以下の攻撃�
 - **環境変数の読み取り** — `os.environ.get()` は syscall を生成しない純粋メモリ操作（ハニーポット値を設置して影響を緩和）
 - **W^X シェルコード** — `mmap(RW)` → `mprotect(RX)` は V8 JIT と区別不能（同時 RWX は検知可能）
 - **関数呼び出しゲート型ペイロード** — import フェーズではトップレベルコードのみ実行、関数呼び出しは行わない
-- **低エントロピー DNS トンネリング** — 辞書エンコードされたデータは Shannon エントロピーヒューリスティックを回避（`--network=none` で緩和）
+- **低エントロピー DNS トンネリング（単発クエリ形式）** — 辞書エンコードされたデータを少数のクエリで送る形式は Shannon エントロピーヒューリスティックを回避。大規模な構造的 DGA (≥10 同一 2LD + morphology 一貫) は `dga` カテゴリで捕捉可能。その中間（2〜9 個の辞書ワードクエリを 1 2LD 下で発火）は依然 gap。`--network=none` で緩和
 - **strace/network-none 検知** — `/proc/self/status` の TracerPid や `/sys/class/net` がサンドボックスを暴露（読み取りは `evasion` として検知するが、strace ベースでは防止不可）
 
 詳細は [SECURITY.md](../SECURITY.md) を参照してください。
