@@ -47,8 +47,10 @@ var (
 	// Pattern: sendto(4, "...", 29, MSG_NOSIGNAL, NULL, 0) = 29
 	// Connected-socket sendto (e.g. DNS via glibc on connected UDP socket).
 	// No sockaddr — destination was set by prior connect().
+	// See straceMsgIovBufRe for why the buffer capture uses the
+	// alternation-escape pattern instead of naive [^"]*.
 	straceSendtoConnectedRe = regexp.MustCompile(
-		`sendto\((\d+),\s*"([^"]*)",\s*\d+,\s*[^,]+,\s*NULL`,
+		`sendto\((\d+),\s*"((?:\\.|[^"\\])*)",\s*\d+,\s*[^,]+,\s*NULL`,
 	)
 
 	// sendmsg(3, {msg_name={sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("1.2.3.4")}, ...}, 0).
@@ -808,11 +810,21 @@ func parseConnectedSendtoDNS(line string) (types.SyscallEvent, bool) {
 // socket is not something glibc's resolver does, but attacker code
 // can use it deliberately (advanced I/O API + fewer eyes on the
 // syscall).
-var straceMsgIovBufRe = regexp.MustCompile(`iov_base="([^"]*)"`)
+//
+// The `(?:\\.|[^"\\])*` alternation is critical: it consumes escaped
+// sequences (including \" and \\) as a unit so the outer quote pair
+// closes correctly. Naive `[^"]*` would stop at the first byte of a
+// `\"` escape, silently truncating any DNS packet whose header or
+// payload contains a 0x22 byte (query ID 0x22XX / 0xXX22 is a
+// 0.8% probability accident, or an attacker-picked adversarial value).
+var straceMsgIovBufRe = regexp.MustCompile(`iov_base="((?:\\.|[^"\\])*)"`)
 
 // straceSendtoBufRe captures the buffer content from sendto() output.
 // strace format: sendto(4, "...", len, flags, {sockaddr}).
-var straceSendtoBufRe = regexp.MustCompile(`sendto\(\d+,\s*"([^"]*)"`)
+// See straceMsgIovBufRe for the alternation-escape rationale — the
+// same 0x22-byte truncation risk applies to sendto and equally
+// silently breaks DNS extraction for adversarial query IDs.
+var straceSendtoBufRe = regexp.MustCompile(`sendto\(\d+,\s*"((?:\\.|[^"\\])*)"`)
 
 // extractDNSQuery parses the DNS wire-format query domain from a sendto strace line.
 // DNS wire format: [header 12 bytes][question: label-length-prefixed name, type, class]

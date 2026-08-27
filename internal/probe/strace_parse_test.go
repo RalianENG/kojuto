@@ -456,6 +456,30 @@ func TestExtractDNSQueryFromMsg(t *testing.T) {
 	}
 }
 
+// TestExtractDNSQuery_EscapedQuoteInBuffer pins the buffer-capture
+// regex against DNS wire packets whose bytes include 0x22 (rendered
+// by strace as `\"`). Query IDs and lengths land on 0x22 a small but
+// non-zero fraction of the time, and an attacker can deliberately
+// pick one to silence detection. Before the alternation-escape fix
+// the outer regex terminated at the first byte of `\"`, capturing an
+// almost-empty buffer and returning "".
+func TestExtractDNSQuery_EscapedQuoteInBuffer(t *testing.T) {
+	// Live-captured line: query ID 0x2222 → header renders as \"\".
+	line := `sendto(3, "\"\"\1\0\0\1\0\0\0\0\0\0\4test\3com\0\0\1\0\1", 26, 0, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, 16) = 26`
+	if got := extractDNSQuery(line); got != "test.com" {
+		t.Errorf("query ID with 0x22 byte: got %q, want test.com — silent truncation regressed", got)
+	}
+}
+
+// TestExtractDNSQueryFromMsg_EscapedQuoteInBuffer mirrors the
+// escaped-quote test for the sendmsg / sendmmsg path.
+func TestExtractDNSQueryFromMsg_EscapedQuoteInBuffer(t *testing.T) {
+	line := `sendmsg(3, {msg_name={sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, msg_namelen=16, msg_iov=[{iov_base="\"\"\1\0\0\1\0\0\0\0\0\0\4test\3com\0\0\1\0\1", iov_len=26}], msg_iovlen=1}, 0) = 26`
+	if got := extractDNSQueryFromMsg(line); got != "test.com" {
+		t.Errorf("sendmsg with 0x22 byte: got %q, want test.com", got)
+	}
+}
+
 // TestParseStraceLine_SendmsgDNS wires the parseStraceLine dispatch
 // end-to-end: a sendmsg to port 53 populates DNSQuery from the
 // iov_base buffer, so downstream analyzer rules (isDNSTunnel,
