@@ -10,7 +10,7 @@ kojuto は、パッケージを強化された Docker コンテナ内でイン�
 
 1. **ダウンロード** — パッケージをホストにダウンロード（ネットワーク許可）
 2. **隔離実行** — ネットワーク隔離された Docker コンテナでインストール実行
-3. **インストール監視** — `connect`, `sendto`, `sendmsg`, `sendmmsg`, `bind`, `listen`, `accept`/`accept4`, `execve`, `openat`, `rename`/`renameat`/`renameat2`, `mmap`, `mprotect`, `unlink`/`unlinkat`, `sendfile`, `ptrace` syscall を記録。audit hook により `compile`/`exec`/`import`（Python PEP 578）および `eval`/`Function`/`vm`（Node.js `--require`）の動的コード実行を検知
+3. **インストール監視** — `connect`, `sendto`, `sendmsg`, `sendmmsg`, `bind`, `listen`, `accept`/`accept4`, `execve`, `execveat`, `clone`, `clone3`, `openat`, `rename`/`renameat`/`renameat2`, `mmap`, `mprotect`, `unlink`/`unlinkat`, `sendfile`, `ptrace` syscall を記録。audit hook により `compile`/`exec`/`import`（Python PEP 578）および `eval`/`Function`/`vm`（Node.js `--require`）の動的コード実行を検知
 4. **インポート監視** — Linux / Windows / macOS の 3 つの OS ID で、`libfaketime` により時刻を +30〜180 日（ランダム）進めた状態でパッケージをインポートし、プラットフォーム依存・日付依存のペイロードを検知
 5. **レポート** — 検知結果を JSON で出力
 
@@ -21,7 +21,7 @@ kojuto は、パッケージを強化された Docker コンテナ内でイン�
 
 全ての値はスキャンごとに `crypto/rand` でランダム生成され、シグネチャベースの回避を防止します。
 
-`openat` により認証情報ファイル（SSH/GPG 鍵、クラウド認証情報、暗号資産ウォレット、ブラウザデータ等 ~60 パス、`kojuto.yml` でカスタマイズ可能）へのアクセスを検知し、`/home/` ディレクトリへの書き込みをホワイトリスト方式で検知します（pip/npm は site-packages と `/usr/local/bin` にのみ書き込むため、ホームディレクトリへの書き込みは全て不正）。`rename` により信頼されたバイナリの差し替えを、`bind`/`listen`/`accept` によりバックドアサーバーの設置を検知します。`mmap`/`mprotect` により PROT_WRITE+PROT_EXEC の同時指定（シェルコード注入）を検知します。`unlink` はファイル作成→実行→削除の 3 点相関によりアンチフォレンジック（ペイロード自己削除）を検知します。DNS トンネリング検知は `sendto` ペイロードからクエリドメインを抽出し、高エントロピーなサブドメインによるデータ流出を検出します。`/proc/self/status`、`/proc/self/mountinfo`、`/sys/class/net` 等の読み取りをサンドボックス検知の回避行為として検知します（`/proc/self/maps`・`/proc/self/cgroup` は誤検知が多いためデフォルトでは無効、必要なら `kojuto.yml` の `include` で有効化）。`ptrace(PTRACE_TRACEME)` によりアンチデバッグ回避を検知します。
+`openat` により認証情報ファイル（SSH/GPG 鍵、クラウド認証情報、暗号資産ウォレット、ブラウザデータ等 ~60 パス、`kojuto.yml` でカスタマイズ可能）へのアクセスを検知し、`/home/` ディレクトリへの書き込みをホワイトリスト方式で検知します（pip/npm は site-packages と `/usr/local/bin` にのみ書き込むため、ホームディレクトリへの書き込みは全て不正）。捕捉ファイル名は C エスケープ解除・dirfd 解決（PID 別 fd→パス マップにより `openat(<fd>, "shadow", ...)` を `/etc/shadow` に復元）・`path.Clean` 正規化（`/etc/./shadow`・`/etc//shadow`・`/etc/foo/../shadow` を `/etc/shadow` に集約）を経てから sensitive パターン照合に入るため、装飾的な変形や dirfd 迂回を許しません。`rename` により信頼されたバイナリの差し替えを、`bind`/`listen`/`accept` によりバックドアサーバーの設置を検知します。`mmap`/`mprotect` により PROT_WRITE+PROT_EXEC の同時指定（シェルコード注入）を検知します。`unlink` はファイル作成→実行→削除の 3 点相関によりアンチフォレンジック（ペイロード自己削除）を検知します。DNS トンネリング検知は `sendto` ペイロードからクエリドメインを抽出し、高エントロピーなサブドメインによるデータ流出を検出します。`/proc/self/maps`・`/proc/self/cgroup`・`/proc/self/status`・`/proc/self/mountinfo`・`/sys/class/net` の読み取りをサンドボックス検知の回避行為として分類します。glibc / V8 / Python `runpy` が毎起動で `/proc/self/maps` を読む正当なノイズは、analyzer 層で「同一パスの複数読み取り＝1 forensic breadcrumb」に集約するため、verdict ルール（2+ MEDIUM で flip）は「触られた *異なる* sandbox 検知パス数」を測ります — 単発の maps 読み取りは clean のまま、maps + cgroup + status のクラスタは suspicious に flip します。`ptrace(PTRACE_TRACEME)` によりアンチデバッグ回避を検知します。
 
 正規のパッケージは通常、インストール・インポート時に予期しない外部通信、無関係なプロセスの生成、認証情報ファイルへのアクセス、信頼されたバイナリの変更を行いません。そのような活動を検出した場合は「要確認」として報告します。
 
