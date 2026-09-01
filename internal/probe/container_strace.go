@@ -29,6 +29,20 @@ type ContainerStrace struct {
 	events  chan types.SyscallEvent
 	done    chan struct{}
 	dropped uint64 // events dropped due to full buffer
+	// phase, when non-empty, is stamped onto every emitted event's Phase
+	// field so the analyzer can apply a phase-specific profile. The
+	// install/import probes leave it empty; the download probe sets it
+	// to types.PhaseDownload.
+	phase string
+	// workdir, when non-empty, is passed to `docker exec --workdir`. The
+	// download probe sets it so `npm install` finds the staging
+	// package.json; install/import probes leave it empty.
+	workdir string
+	// diagnosticStderrTail keeps the last N bytes of stderr lines that
+	// were NOT parsed as strace events (pip/npm error tracebacks, warnings,
+	// SSL errors). Surfaced by DiagnosticStderr() so error paths can print
+	// what actually went wrong instead of just an exit code.
+	diagnosticStderrTail []byte
 }
 
 // NewContainerStrace creates a new in-container strace probe.
@@ -37,6 +51,18 @@ func NewContainerStrace() *ContainerStrace {
 		events: make(chan types.SyscallEvent, 8192),
 		done:   make(chan struct{}),
 	}
+}
+
+// NewContainerStraceForDownload creates a probe for the download phase: the
+// traced command runs with its working directory set to workdir, and every
+// emitted event is stamped with types.PhaseDownload so the analyzer applies
+// the download-phase profile (network egress is expected; staging-dir
+// execve is an unpacking-time exploit).
+func NewContainerStraceForDownload(workdir string) *ContainerStrace {
+	c := NewContainerStrace()
+	c.phase = types.PhaseDownload
+	c.workdir = workdir
+	return c
 }
 
 // Start is not supported for ContainerStrace. Use StartAndInstall instead.
@@ -88,8 +114,15 @@ func (c *ContainerStrace) StartAndInstall(ctx context.Context, containerID strin
 }
 
 func (c *ContainerStrace) buildCommand(ctx context.Context, containerID string, installCmd []string) *exec.Cmd {
-	args := []string{
-		"exec", containerID,
+	args := []string{"exec"}
+	if c.workdir != "" {
+		// Download phase: npm install resolves its manifest relative to
+		// the working directory, so the traced command must run inside
+		// the bind-mounted staging dir.
+		args = append(args, "--workdir="+c.workdir)
+	}
+	args = append(args,
+		containerID,
 		"strace", "-f",
 		"-s", "256",
 		// --quiet=attach suppresses the "strace: Process N attached"
@@ -114,7 +147,7 @@ func (c *ContainerStrace) buildCommand(ctx context.Context, containerID string, 
 		"-e", "trace=connect,sendto,sendmsg,sendmmsg,bind,listen,accept,accept4,execve,execveat,clone,clone3,openat,rename,renameat,renameat2,sendfile,ptrace,mmap,mprotect,unlink,unlinkat",
 		"-e", "signal=none",
 		"--",
-	}
+	)
 	args = append(args, installCmd...)
 
 	return exec.CommandContext(ctx, "docker", args...)
@@ -127,10 +160,28 @@ func (c *ContainerStrace) parseStraceOutput(stderr io.ReadCloser, done chan<- st
 	scanner := bufio.NewScanner(stderr)
 	scanner.Buffer(make([]byte, 64*1024), straceMaxLine)
 
+	const diagnosticCap = 8 * 1024
 	for scanner.Scan() {
-		evt, ok := parseStraceLine(scanner.Text(), state)
+		line := scanner.Text()
+		evt, ok := parseStraceLine(line, state)
 		if !ok {
+			// Non-strace stderr line — most commonly pip/npm warnings
+			// and error tracebacks. Keep the last diagnosticCap bytes so
+			// DiagnosticStderr() can surface them when the traced
+			// command exits non-zero. Bounded to avoid unbounded growth
+			// on chatty tracees.
+			c.diagnosticStderrTail = append(c.diagnosticStderrTail, line...)
+			c.diagnosticStderrTail = append(c.diagnosticStderrTail, '\n')
+			if len(c.diagnosticStderrTail) > diagnosticCap {
+				c.diagnosticStderrTail = c.diagnosticStderrTail[len(c.diagnosticStderrTail)-diagnosticCap:]
+			}
 			continue
+		}
+
+		// Stamp the scan phase so the analyzer can route the event
+		// through the right profile. Empty for install/import probes.
+		if c.phase != "" {
+			evt.Phase = c.phase
 		}
 
 		select {
@@ -204,4 +255,13 @@ func (c *ContainerStrace) Method() string {
 // Dropped returns events discarded because the events channel was full.
 func (c *ContainerStrace) Dropped() uint64 {
 	return c.dropped
+}
+
+// DiagnosticStderr returns the last few KiB of stderr lines the strace
+// parser could not decode as events — typically pip/npm error tracebacks
+// or SSL warnings. Callers surface this in error paths so a non-zero exit
+// from the traced command shows WHY it failed instead of only an exit
+// code. Safe to call after the parse goroutine has exited.
+func (c *ContainerStrace) DiagnosticStderr() string {
+	return string(c.diagnosticStderrTail)
 }

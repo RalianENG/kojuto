@@ -301,7 +301,7 @@ func scanSinglePackage(pkg, version, ecosystem string) (*pinnedDep, error) {
 	flagVersion = version
 	flagEcosystem = ecosystem
 
-	dlDir, err := downloadPackage(ctx, pkg)
+	dlDir, dlEvents, err := downloadPackage(ctx, pkg)
 	if err != nil {
 		return nil, err
 	}
@@ -328,6 +328,11 @@ func scanSinglePackage(pkg, version, ecosystem string) (*pinnedDep, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Prepend the download-phase events so the analyzer sees the full
+	// timeline — the download ran first, under its own strace, inside the
+	// network-enabled download sandbox.
+	result.events = append(dlEvents, result.events...)
 
 	if err := outputReport(pkg, result); err != nil {
 		return nil, err
@@ -434,7 +439,7 @@ func runBatchScreening(deps []depfile.Dep, ecosystem string) (string, error) {
 
 	flagEcosystem = ecosystem
 	phaseInfo("download", fmt.Sprintf("%d packages", len(pkgNames)))
-	downloadBatchPackages(ctx, deps, targets, dlDir, ecosystem)
+	downloadEvents := downloadBatchPackages(ctx, deps, targets, dlDir, ecosystem)
 
 	// Start a single sandbox with all packages.
 	method := selectProbeMethod()
@@ -465,7 +470,10 @@ func runBatchScreening(deps []depfile.Dep, ecosystem string) (string, error) {
 	}
 	installPhase.end()
 
-	var events []types.SyscallEvent
+	// Seed the timeline with the download-phase events (captured under
+	// their own strace inside the network-enabled download sandbox), then
+	// append the install-phase events.
+	events := append([]types.SyscallEvent(nil), downloadEvents...)
 	for evt := range cp.Events() {
 		events = append(events, evt)
 	}
@@ -501,9 +509,12 @@ func runBatchScreening(deps []depfile.Dep, ecosystem string) (string, error) {
 	return verdict, nil
 }
 
-// downloadBatchPackages downloads all packages using the appropriate batch method.
-// Falls back to individual downloads if the batch method fails.
-func downloadBatchPackages(ctx context.Context, deps []depfile.Dep, pipTargets []string, dlDir, ecosystem string) {
+// downloadBatchPackages downloads all packages using the appropriate batch
+// method and returns the download-phase syscall events captured inside the
+// download sandbox. Falls back to individual downloads if the batch method
+// fails (in which case the partial batch events are discarded — the
+// individual re-download produces the authoritative event stream).
+func downloadBatchPackages(ctx context.Context, deps []depfile.Dep, pipTargets []string, dlDir, ecosystem string) []types.SyscallEvent {
 	if ecosystem == types.EcosystemNpm {
 		npmDeps := make(map[string]string, len(deps))
 		for _, dep := range deps {
@@ -513,25 +524,35 @@ func downloadBatchPackages(ctx context.Context, deps []depfile.Dep, pipTargets [
 				npmDeps[dep.Name] = "*"
 			}
 		}
-		if dlErr := downloader.DownloadAllNpm(ctx, npmDeps, dlDir); dlErr != nil {
+		events, dlErr := downloader.DownloadAllNpm(ctx, npmDeps, dlDir)
+		if dlErr != nil {
 			fmt.Fprintf(os.Stderr, "[!] Batch npm download failed, downloading individually...\n")
-			downloadIndividually(ctx, deps, dlDir, ecosystem)
+			return downloadIndividually(ctx, deps, dlDir, ecosystem)
 		}
-		return
+		return events
 	}
 
-	if dlErr := downloader.DownloadAll(ctx, pipTargets, dlDir); dlErr != nil {
+	events, dlErr := downloader.DownloadAll(ctx, pipTargets, dlDir)
+	if dlErr != nil {
 		fmt.Fprintf(os.Stderr, "[!] Batch pip download failed, downloading individually...\n")
-		downloadIndividually(ctx, deps, dlDir, ecosystem)
+		return downloadIndividually(ctx, deps, dlDir, ecosystem)
 	}
+	return events
 }
 
-func downloadIndividually(ctx context.Context, deps []depfile.Dep, dlDir, ecosystem string) {
+// downloadIndividually downloads each package in its own download sandbox,
+// accumulating the syscall events from every download. A failed download is
+// logged and skipped — its events (if any) are still returned.
+func downloadIndividually(ctx context.Context, deps []depfile.Dep, dlDir, ecosystem string) []types.SyscallEvent {
+	var events []types.SyscallEvent
 	for _, dep := range deps {
-		if _, dlErr := downloaderDownload(ctx, dep.Name, dep.Version, dlDir, ecosystem); dlErr != nil {
+		_, evts, dlErr := downloaderDownload(ctx, dep.Name, dep.Version, dlDir, ecosystem)
+		events = append(events, evts...)
+		if dlErr != nil {
 			fmt.Fprintf(os.Stderr, "[!] Failed to download %s: %v\n", dep.Name, dlErr)
 		}
 	}
+	return events
 }
 
 // runPerPackageScan falls back to the original per-package scanning approach.
@@ -876,28 +897,29 @@ func prepareLocalNpm(sourceDir, pkg string) (string, error) {
 	return stagingDir, nil
 }
 
-func downloadPackage(ctx context.Context, pkg string) (string, error) {
+func downloadPackage(ctx context.Context, pkg string) (string, []types.SyscallEvent, error) {
 	phaseInfo("download", fmt.Sprintf("%s (%s)", pkg, flagEcosystem))
 
 	tmpDir, err := os.MkdirTemp("", "kojuto-*")
 	if err != nil {
-		return "", fmt.Errorf("creating temp dir: %w", err)
+		return "", nil, fmt.Errorf("creating temp dir: %w", err)
 	}
 
 	dlDir := filepath.Join(tmpDir, "packages")
 	if mkErr := os.MkdirAll(dlDir, 0o755); mkErr != nil {
-		return "", fmt.Errorf("creating download dir: %w", mkErr)
+		return "", nil, fmt.Errorf("creating download dir: %w", mkErr)
 	}
 
-	if _, dlErr := downloaderDownload(ctx, pkg, flagVersion, dlDir, flagEcosystem); dlErr != nil {
-		return "", fmt.Errorf("downloading package: %w\n\n%s", dlErr, downloadHint(flagEcosystem, dlErr))
+	_, dlEvents, dlErr := downloaderDownload(ctx, pkg, flagVersion, dlDir, flagEcosystem)
+	if dlErr != nil {
+		return "", nil, fmt.Errorf("downloading package: %w\n\n%s", dlErr, downloadHint(flagEcosystem, dlErr))
 	}
 
 	if flagVersion == "" {
 		flagVersion = downloaderDetectVersion(dlDir, pkg)
 	}
 
-	return dlDir, nil
+	return dlDir, dlEvents, nil
 }
 
 func selectProbeMethod() string {

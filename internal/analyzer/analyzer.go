@@ -89,21 +89,36 @@ func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
 		// interpreter is legitimate JIT page management, not shellcode
 		// injection. The detection comment in strace_parse.go has been
 		// documenting this as a known false-positive source; this is
-		// the implementation it pointed at.
+		// the implementation it pointed at. Phase-independent: node JITs
+		// in both the download (npm) and install/import phases.
 		if isV8JITPageOp(&events[i], state.PIDComm) {
 			continue
 		}
 
-		if isBenign(&events[i]) {
+		// Download-phase events run through their own profile: the
+		// download sandbox HAS network egress (it must reach the
+		// registry), so the install/import connect rules — which treat
+		// every non-loopback connect as C2 — cannot apply. See
+		// classifyDownloadEvent.
+		var keep bool
+		if events[i].Phase == types.PhaseDownload {
+			keep = classifyDownloadEvent(&events[i], state)
+		} else {
+			if isBenign(&events[i]) {
+				continue
+			}
+			classify(&events[i], state)
+			keep = true
+		}
+		if !keep {
 			continue
 		}
-
-		classify(&events[i], state)
 
 		// Anti-forensics refinement: only keep unlink events for files
 		// that were also EXECUTED during this scan. This distinguishes
 		// malware payload self-deletion (create→execute→delete) from
-		// pip temp file cleanup (create→delete without execute).
+		// pip temp file cleanup (create→delete without execute). Applies
+		// regardless of phase.
 		if events[i].Category == types.CategoryAntiForensics {
 			if !state.ExecutedPaths[events[i].FilePath] {
 				continue
@@ -559,6 +574,8 @@ func categoryShortDesc(c string) string {
 		return "isolated name resolution (info; C2 fires on the follow-up connect)"
 	case types.CategoryDGA:
 		return "structural DGA: many uniform-morphology subdomains under one 2LD"
+	case types.CategoryDownloadEgress:
+		return "registry/CDN connect during download (forensic, info)"
 	}
 	return c
 }
@@ -640,6 +657,8 @@ func buildDescription(_ []types.SyscallEvent, categories []string) string {
 			parts = append(parts, "writable+executable memory allocation (shellcode injection indicator)")
 		case types.CategoryAntiForensics:
 			parts = append(parts, "file deletion in temporary directory (anti-forensics/payload self-cleanup)")
+		case types.CategoryDownloadEgress:
+			parts = append(parts, "outbound connection during dependency download (registry/CDN fetch, recorded for forensics)")
 		}
 	}
 	return strings.Join(parts, "; ") + "."
@@ -724,6 +743,99 @@ func classify(evt *types.SyscallEvent, state *FlowState) {
 		evt.Reason = "Dynamic code execution detected via audit hook (" + evt.AuditEvent +
 			") — eval/exec/compile/Function generates no execve syscall, " +
 			"commonly used by supply chain malware to execute obfuscated payloads."
+	}
+}
+
+// downloadStagingPrefix is the in-container path the host staging directory
+// is bind-mounted at during the download phase. Mirrors
+// sandbox.DownloadOutMountPath ("/out") — kept as a local const so the
+// analyzer does not take a dependency on the sandbox package for one string.
+const downloadStagingPrefix = "/out/"
+
+// classifyDownloadEvent applies the download-phase profile to an event
+// stamped with types.PhaseDownload and reports whether it should be kept in
+// the report. The download phase runs `pip download` /
+// `npm install --ignore-scripts` inside the network-enabled download
+// sandbox, so its expected behavior is narrow and differs from
+// install/import in two ways:
+//
+//   - It HAS network egress. A plain outbound connect is the phase doing
+//     its job — fetching from the registry and its CDN — and cannot be
+//     condemned without a trusted resolver, so it is recorded LOW as
+//     CategoryDownloadEgress and never flips the verdict alone. The
+//     whitelist-free heuristics still apply: a connect whose DNS query
+//     hits a known exfil service or shows tunneling entropy keeps its
+//     data_exfiltration / dns_tunneling category via the shared classify.
+//
+//   - No package code should run. `--ignore-scripts` (npm) and
+//     `--only-binary` (pip) mean the scanned package's own code is never
+//     executed during download, so an execve out of the staging mount is
+//     a freshly-downloaded artifact running mid-download — an
+//     unpacking-time exploit (package-manager parser RCE, a tarball that
+//     dropped an executable) — and is HIGH.
+//
+// Every other syscall — file writes that escape the staging dir into
+// $HOME / system bins / sensitive paths, rename-onto-system-binary, RWX
+// memory, bind/listen, payload self-deletion — is judged by the SAME
+// rules as install/import: those are the path-traversal-escape signals
+// and need no phase-specific handling.
+func classifyDownloadEvent(evt *types.SyscallEvent, state *FlowState) bool {
+	switch evt.Syscall {
+	case types.EventConnect, types.EventSendto, types.EventSendmsg, types.EventSendmmsg:
+		// Loopback / link-local / unspecified — never interesting.
+		if isBenignNetwork(evt) {
+			return false
+		}
+		// Whitelist-free exfil/tunnel heuristics still fire during download.
+		if evt.DNSQuery != "" && (matchExfilService(evt.DNSQuery) != "" || isDNSTunnel(evt.DNSQuery)) {
+			classify(evt, state)
+			return true
+		}
+		// Plain outbound connect: expected registry/CDN egress. Recorded
+		// LOW for forensic visibility; never flips the verdict alone.
+		evt.Category = types.CategoryDownloadEgress
+		evt.Reason = "Outbound connection to " + evt.DstAddr + ":" + portStr(evt.DstPort) +
+			" during dependency download — the download phase fetches packages " +
+			"from the registry and its CDN over the network. Recorded for forensic " +
+			"visibility; a bare-IP destination cannot be attributed as malicious " +
+			"without a trusted resolver."
+		return true
+
+	case types.EventExecve:
+		// A binary executing out of the staging mount during download is a
+		// downloaded artifact running before analysis has even begun —
+		// --ignore-scripts / --only-binary mean nothing here should exec.
+		if strings.HasPrefix(evt.Comm, downloadStagingPrefix) {
+			evt.Category = types.CategoryCodeExecution
+			evt.Reason = "Execution from the download staging directory: " + evt.Comm +
+				" — `pip download` / `npm install --ignore-scripts` must not run any " +
+				"downloaded code. A binary executing here indicates an unpacking-time " +
+				"exploit (package-manager parser RCE or a tarball that dropped an executable)."
+			return true
+		}
+		// Otherwise the install/import execve rules apply unchanged:
+		// pip/npm/node/python from trusted dirs are benign, /tmp and
+		// inline-exec stay HIGH, unrecognized binaries record LOW.
+		if isBenignExec(evt) {
+			return false
+		}
+		classifyExecve(evt)
+		return true
+
+	case types.EventClone:
+		// Pure PID-correlation signal consumed by collectPIDComm; never a
+		// report event. Mirrors isBenign's EventClone handling.
+		return false
+
+	default:
+		// File writes escaping the staging dir, rename-onto-system-binary,
+		// RWX memory, bind/listen, unlink, dynamic exec — identical meaning
+		// to install/import, so reuse the shared benign filter + classify.
+		if isBenign(evt) {
+			return false
+		}
+		classify(evt, state)
+		return true
 	}
 }
 
