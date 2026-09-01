@@ -349,30 +349,30 @@ func TestSetLocalMode_InstallCommand(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestInstallAllCommand_PyPI(t *testing.T) {
+	// stageInstallScript runs `docker exec` to write install.sh into the
+	// container's cache tmpfs; stub it so the test never touches Docker.
+	dockerCalls := 0
+	orig := execCommand
+	execCommand = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		dockerCalls++
+		return exec.CommandContext(ctx, "true")
+	}
+	t.Cleanup(func() { execCommand = orig })
+
 	sb := New("/mnt/packages", "requests", false, types.EcosystemPyPI, "")
 	sb.mountPoint = testMountPoint
+	sb.containerID = testContainerID
 
 	pkgs := []string{"requests", "flask", "numpy"}
 	cmd, err := sb.InstallAllCommand(context.Background(), pkgs)
 	if err != nil {
 		t.Fatalf("InstallAllCommand: %v", err)
 	}
-
-	if len(cmd) == 0 {
-		t.Fatal("InstallAllCommand returned empty")
+	if len(cmd) != 2 || cmd[0] != "sh" || cmd[1] != installScriptPath {
+		t.Fatalf("InstallAllCommand = %v, want [sh %s] (script-based to bypass pip resolver)", cmd, installScriptPath)
 	}
-	if cmd[0] != "pip" {
-		t.Errorf("expected pip, got %s", cmd[0])
-	}
-	if cmd[1] != "install" {
-		t.Errorf("expected install, got %s", cmd[1])
-	}
-	// The last 3 args should be the package names.
-	tail := cmd[len(cmd)-3:]
-	for i, want := range pkgs {
-		if tail[i] != want {
-			t.Errorf("arg[%d] = %q, want %q", i, tail[i], want)
-		}
+	if dockerCalls == 0 {
+		t.Error("stageInstallScript did not invoke docker to write the script")
 	}
 }
 

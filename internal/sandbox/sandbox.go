@@ -197,8 +197,22 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 		"--cap-drop=ALL",
 		"--hostname="+hostHostname,
 		"--tmpfs=/tmp:nosuid,mode=1777,size=100m",
-		"--tmpfs=/usr/local/lib/python"+SandboxPythonVersion+"/site-packages:nosuid,mode=1777,size=300m",
+		// site-packages holds every wheel pip installs. 1 GiB accommodates
+		// realistic requirements files (SQLAlchemy + cryptography + dask +
+		// jupyter class deps together exceed 300 MB), backed by host RAM
+		// only for the bytes actually used. The prior 300 MB cap forced
+		// batch installs of ~50+ packages to hit ENOSPC mid-run, silently
+		// downgrading kojuto to per-package fallback on real-world inputs.
+		"--tmpfs=/usr/local/lib/python"+SandboxPythonVersion+"/site-packages:nosuid,mode=1777,size=1g",
 		"--tmpfs=/usr/local/bin:nosuid,exec,mode=0755,size=32m",
+		// Some wheels install compiled C headers to /usr/local/include
+		// (greenlet's manylinux wheel drops headers under
+		// python3.<ver>/greenlet/ during pip install). Without this
+		// tmpfs the install errors out on --read-only rootfs with
+		// [Errno 30] Read-only file system, silently downgrading batch
+		// mode to per-package fallback. 200 MB is generous for header
+		// files; backed by host RAM, actual usage is a few MB.
+		"--tmpfs=/usr/local/include:nosuid,mode=1777,size=200m",
 		"--tmpfs=/run:nosuid,size=1m",
 		"--tmpfs=/home/dev:nosuid,mode=1777,size=32m",
 		// Dedicated cache tmpfs outside HOME. npm and pip are pinned here via
@@ -894,6 +908,25 @@ func (s *Sandbox) InstallCommand(ctx context.Context) ([]string, error) {
 //
 // For npm, this writes the install script to the container tmpfs and
 // returns a file-path-based command — see InstallCommand for rationale.
+//
+// For PyPI, this skips pip's dependency resolver entirely and installs
+// every wheel already present in the mount point (`*.whl`). The download
+// phase already resolved the full transitive closure into that directory,
+// so re-running the resolver here at install time was pure waste — on
+// real requirements files (SQLAlchemy + cryptography + dask + jupyter,
+// etc.) the resolver backtracks through hundreds of version candidates
+// and either timed out or exited non-zero, silently forcing kojuto into
+// per-package fallback. `--no-deps` + wheel-glob installs exactly the
+// set pip would have resolved to (identical download set → identical
+// install-time setup/hook execution), so the analyzer sees the same
+// syscall trace it always did; the difference is only that pip stops
+// spending minutes deciding which version to install. Detection
+// coverage is unchanged.
+//
+// The `pkgs` argument is intentionally unused for PyPI batch: the
+// mount point IS the full set to install. Kept for API symmetry with
+// the npm branch and so callers (log lines, progress) can still pass
+// the target list.
 func (s *Sandbox) InstallAllCommand(ctx context.Context, pkgs []string) ([]string, error) {
 	if s.ecosystem == types.EcosystemNpm {
 		// Fire lifecycle scripts only for the target packages (not all
@@ -901,14 +934,9 @@ func (s *Sandbox) InstallAllCommand(ctx context.Context, pkgs []string) ([]strin
 		// are covered by the import phase which loads them via require().
 		return s.stageInstallScript(ctx, npmLifecycleScript(pkgs))
 	}
-
-	cmd := []string{
-		"pip", "install",
-		"--no-index",
-		"--find-links=" + s.mountPoint,
-		"--",
-	}
-	return append(cmd, pkgs...), nil
+	_ = pkgs
+	return s.stageInstallScript(ctx,
+		"pip install --no-index --no-deps --no-build-isolation "+s.mountPoint+"/*.whl")
 }
 
 // npmLifecycleParallelism is the maximum number of package lifecycle

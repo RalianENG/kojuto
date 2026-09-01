@@ -409,6 +409,19 @@ func runBatchScan(_ []string) error {
 	return runPerPackageScan(deps, ecosystem)
 }
 
+// dumpInstallDiagnostics writes both halves of a failed install's captured
+// output to stderr so the caller can see WHY pip exited non-zero. pip's
+// stdout carries the "Successfully installed ..." verdict (or an empty
+// tail on early failure); the strace parser consumes stderr but keeps
+// the last few KiB of non-strace lines in DiagnosticStderr — that is
+// where pip's actual error traceback lives.
+func dumpInstallDiagnostics(stdout []byte, stderrTail string) {
+	fmt.Fprintf(os.Stderr, "[!] Install stdout:\n%s\n", string(stdout))
+	if stderrTail != "" {
+		fmt.Fprintf(os.Stderr, "[!] Install stderr (non-strace tail):\n%s\n", stderrTail)
+	}
+}
+
 // runBatchScreening installs all packages in a single sandbox and monitors for suspicious activity.
 func runBatchScreening(deps []depfile.Dep, ecosystem string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), flagTimeout)
@@ -465,7 +478,7 @@ func runBatchScreening(deps []depfile.Dep, ecosystem string) (string, error) {
 	}
 	installOut, installErr := cp.StartAndInstall(ctx, sb.ContainerID(), installCmd)
 	if installErr != nil {
-		fmt.Fprintf(os.Stderr, "[!] Install output:\n%s\n", string(installOut))
+		dumpInstallDiagnostics(installOut, cp.DiagnosticStderr())
 		return "", fmt.Errorf("batch install failed: %w", installErr)
 	}
 	installPhase.end()
