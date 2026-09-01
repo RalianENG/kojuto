@@ -112,6 +112,20 @@ func (d *DownloadSandbox) Start(ctx context.Context) error {
 	}
 	d.seccompDir = seccompDir
 
+	// The sandbox image runs as USER dev (UID 1000). The host staging
+	// directory is bind-mounted at /out; without world-writable perms the
+	// dev user inside the container cannot save downloaded wheels to it.
+	// Under `sudo ./kojuto` on Linux (the CI integration path) the host
+	// dir is owned by root, so pip.download errors with:
+	//   PermissionError: [Errno 13] Permission denied: '/out/*.whl'
+	// Docker Desktop on Windows/macOS masks this by translating host
+	// permissions on bind mounts, which is why local scans succeeded.
+	// chmod 0777 is safe here — the directory is a per-scan tempdir the
+	// caller owns and cleans up; nothing sensitive shares it.
+	if err := os.Chmod(d.hostOutDir, 0o777); err != nil {
+		return fmt.Errorf("chmod host staging dir for download sandbox: %w", err)
+	}
+
 	cmd := execCommand(ctx, "docker", d.createArgs(seccompOpt)...)
 	out, err := cmd.Output()
 	if err != nil {
