@@ -42,7 +42,9 @@ An OSS tool that detects suspicious syscalls during package installation and imp
 | `listen(2)` | Listen for incoming connections | Backdoor listener setup |
 | `accept(2)` / `accept4(2)` | Accept incoming connections | Active backdoor operation |
 | `execve(2)` | Process creation | Malware binary execution, reverse shell |
-| `openat(2)` | File access (sensitive paths + home dir writes) | Credential theft, persistence, sandbox detection |
+| `execveat(2)` | Process creation via dirfd (glibc 2.34+ path form + `AT_EMPTY_PATH` fexecve) | `memfd_create` + `execveat(fd, "", ..., AT_EMPTY_PATH)` fileless loader (synthesized as `/proc/self/fd/<n>` — matches `suspiciousExecDirs` HIGH) |
+| `clone(2)` / `clone3(2)` / `vfork(2)` | Thread and process creation | Parent-comm propagation to worker threads that never execve (V8 JIT / `posix_spawn` correlations depend on it) |
+| `openat(2)` | File access (sensitive paths + home dir writes). Paths are C-unescaped, dirfd-resolved via a per-PID fd→path map, and `path.Clean`-normalized before matching so `openat(<fd>, "shadow", ...)` after `openat(AT_FDCWD, "/etc", ...) = <fd>` resolves to `/etc/shadow` and `/etc/./shadow` / `/etc/foo/../shadow` collapse to the canonical form. | Credential theft, persistence, sandbox detection, path-form and dirfd bypass attempts |
 | `rename(2)` / `renameat(2)` / `renameat2(2)` | File rename / move | Trusted binary hijacking (`/usr/local/bin/python3`) |
 | `mmap(2)` | Memory mapping with PROT_WRITE\|PROT_EXEC | Shellcode injection via ctypes/ffi-napi (RWX anonymous mapping) |
 | `mprotect(2)` | Memory permission change to WRITE+EXEC | Shellcode injection (modify then execute pattern) |
@@ -71,10 +73,10 @@ Audit hook output is multiplexed with strace output on stderr using a `KOJUTO:` 
 
 Two complementary detection strategies:
 
-1. **Sensitive path matching** (any access mode): ~60 path patterns including SSH/GPG keys, cloud credentials (AWS/Azure/GCP/OCI/Aliyun), crypto wallets (Bitcoin/Ethereum/Solana/Monero/Electrum/Exodus/Atomic), browser data (Chrome/Firefox/Brave/Opera/Vivaldi/Edge + extension Local Storage/IndexedDB), shell startup files, desktop keyrings, application tokens, and sandbox detection paths (`/proc/self/status`, `/proc/self/mountinfo`, `/sys/class/net`). `/proc/self/maps` and `/proc/self/cgroup` are deliberately omitted from defaults — V8/Node startup, glibc, and Python's runpy read them on every launch — opt in via config include only if the extra signal is worth the per-scan noise.
+1. **Sensitive path matching** (any access mode): ~60 path patterns including SSH/GPG keys, cloud credentials (AWS/Azure/GCP/OCI/Aliyun), crypto wallets (Bitcoin/Ethereum/Solana/Monero/Electrum/Exodus/Atomic), browser data (Chrome/Firefox/Brave/Opera/Vivaldi/Edge + extension Local Storage/IndexedDB), shell startup files, desktop keyrings, application tokens, and sandbox-detection paths (`/proc/self/maps`, `/proc/self/cgroup`, `/proc/self/status`, `/proc/self/mountinfo`, `/sys/class/net`). The captured filename is C-unescaped, dirfd-resolved (for `openat(<fd>, "<relative>", ...)` where a prior `open`/`openat` recorded the base — per-PID scoping matches kernel fd tables), and `path.Clean`-normalized (POSIX slashes; `/etc/./shadow`, `/etc//shadow`, `/etc/foo/../shadow`, `/tmp/../etc/shadow` all collapse to `/etc/shadow` before matching) so cosmetic and escape-form bypasses cannot slip past the substring check.
 2. **Home directory write detection** (whitelist-based): ANY write (`O_WRONLY`/`O_RDWR`/`O_CREAT`) to `/home/` or `/root/` is flagged — pip/npm only write to site-packages, `/usr/local/bin`, `/tmp`, and `/install`. This catches systemd persistence, LaunchAgent injection, and unknown attack paths without maintaining a blacklist
 3. **System binary write detection**: writes to known system binaries (`python3`, `node`, `pip`, `sh`, etc.) in `/usr/local/bin/` or `/usr/bin/` are classified as `binary_hijacking` — prevents benignPaths bypass where an attacker overwrites a trusted binary on a writable tmpfs mount
-4. **Sandbox detection classification**: reads to `/proc/self/status`, `/proc/self/mountinfo`, `/proc/<pid>/comm`, and `/sys/class/net` are classified as `evasion` (not `credential_access`) to indicate environment probing. If `/proc/self/maps` or `/proc/self/cgroup` are added back via custom config include, they are also classified as `evasion`.
+4. **Sandbox detection classification**: reads to `/proc/self/maps`, `/proc/self/cgroup`, `/proc/self/status`, `/proc/self/mountinfo`, `/proc/<pid>/comm`, and `/sys/class/net` are classified as `evasion` (not `credential_access`) to indicate environment probing. Multiple reads of the same path (glibc/V8/Python `runpy` all read `/proc/self/maps` on every process launch) are deduplicated by path at the analyzer layer so the verdict rule (2+ MEDIUM events to flip) measures DISTINCT sandbox-detection paths touched, not raw read repetitions — a package that reads only `/proc/self/maps` stays clean (1 evasion event) but is preserved as a forensic breadcrumb; a package that reads maps + cgroup + status is flagged as an evasion cluster (3 distinct events). Path-less evasion events like `ptrace(TRACEME)` stack with sandbox probes as an independent modality and are never deduped against them.
 
 - `.npmrc` and `.pypirc` are excluded (npm/pip read these during normal operation)
 - Events include `open_flags` (e.g. `O_RDONLY`) to indicate read/write intent
@@ -154,6 +156,12 @@ CLI (cobra)
 - Node.js: overrides `process.platform` via `Object.defineProperty` before require
 - Detects OS-gated malware (e.g. `if platform.system() == "Windows": attack()`) dynamically
 
+### Import Phase Reality Check
+
+- Python resolves distribution → module name via `importlib.metadata.top_level.txt`, then a file-walk of the installed RECORD, then the canonical name — so packages whose install name differs from their import name (`pillow` → `PIL`, `pyyaml` → `yaml`, `opencv-python` → `cv2`, `python-dateutil` → `dateutil`, `beautifulsoup4` → `bs4`) are actually imported. Node.js tries `require()` first and falls back to dynamic `import()` on `ERR_REQUIRE_ESM`.
+- Each attempt emits `KOJUTO:import_attempt:<dist>:<module>:<result>` to stderr so the analyzer can distinguish "no observable behavior" from "clean behavior".
+- Verdict rule: if attempts > 0 and successes == 0 AND no HIGH-severity event was independently observed, the verdict is `inconclusive` — kojuto refuses to claim "clean" on a package whose install-phase or import-phase code never actually ran. HIGH-severity findings (network exfil, credential access, library hijack, binary hijack, dropper, backdoor) still flip the verdict to `suspicious` even when every import failed, so an install-time attack that crashes before import completes is not masked.
+
 ### Time-Shifted Import (libfaketime)
 
 - Import probes run with `LD_PRELOAD=libfaketime.so` and `FAKETIME=+Nd` where N is randomized between 30 and 180
@@ -179,7 +187,7 @@ CLI (cobra)
 | Network | `--network=none` | Zero network connectivity (no bridge, no embedded DNS resolver attack surface) |
 | Filesystem | `--read-only` + tmpfs | Restrict writes |
 | Capabilities | `--cap-drop=ALL` | Minimize privileges |
-| seccomp | Custom profile (always applied) | Block `mount`, `unshare`, `setns`, `bpf`, `memfd_create`, `prctl(PR_SET_NAME)`, etc. |
+| seccomp | Custom profile (always applied) | Block `mount`, `unshare`, `setns`, `bpf`, `io_uring_setup`/`io_uring_enter`/`io_uring_register`, `prctl(PR_SET_NAME)`, etc. `memfd_create` is intentionally allowed — the `execveat(fd, "", ..., AT_EMPTY_PATH)` fileless-loader pattern is caught downstream (see below), so blocking it silently would remove evidence rather than provide it. |
 | Privilege escalation | `--no-new-privileges` | Prevent |
 | Resources | Host CPU/memory mirrored (capped at 4 cores / 4GB) | Anti-fingerprint |
 | PID | `--pids-limit=256` | Prevent fork bombs |

@@ -172,7 +172,7 @@ sudo ./scripts/setup-caps.sh ./kojuto
 |---------|-----------|---------|
 | `clean` | 0 | No suspicious activity detected during install or import |
 | `suspicious` | 2 | Suspicious events detected — review the `events` array |
-| `inconclusive` | 2 | Probe data was lost (buffer overflow) — treat as failure |
+| `inconclusive` | 2 | Probe data was lost (buffer overflow) OR the sandbox tried imports but none succeeded and no HIGH-severity event was independently observed — treat as failure |
 
 ## GitHub Actions
 
