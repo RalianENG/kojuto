@@ -33,6 +33,10 @@ func TestDownloadSandbox_CreateArgs(t *testing.T) {
 		"--security-opt=seccomp=/tmp/seccomp.json",
 		"--read-only",
 		"--cap-drop=ALL",
+		// SYS_PTRACE re-added so strace can attach to the traced pip/npm
+		// command; without it strace's initial PTRACE_ATTACH is EPERM and
+		// the download exits non-zero. Mirrors the analysis sandbox.
+		"--cap-add=SYS_PTRACE",
 		"--pids-limit=256",
 		"--tmpfs=/var/cache/kojuto:",
 		"--env=NPM_CONFIG_CACHE=/var/cache/kojuto/npm",

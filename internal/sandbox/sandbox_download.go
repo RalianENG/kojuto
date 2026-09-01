@@ -76,6 +76,15 @@ func (d *DownloadSandbox) createArgs(seccompOpt string) []string {
 		"--security-opt=" + seccompOpt,
 		"--read-only",
 		"--cap-drop=ALL",
+		// SYS_PTRACE is required so strace can attach to the traced pip/npm
+		// process inside this container. Without it strace fails with EPERM
+		// on the initial ptrace(PTRACE_ATTACH), the traced command never runs,
+		// and the download exits with a non-zero status. Mirrors the analysis
+		// sandbox's re-add for needsPtrace=true; the seccomp profile still
+		// blocks the cross-process ptrace surface (process_vm_readv /
+		// process_vm_writev), so the added capability cannot be abused to
+		// read another process's memory.
+		"--cap-add=SYS_PTRACE",
 		"--tmpfs=/tmp:nosuid,mode=1777,size=100m",
 		"--tmpfs=/home/dev:nosuid,mode=1777,size=64m",
 		// Package-manager caches. The analysis sandbox pins these here too;
