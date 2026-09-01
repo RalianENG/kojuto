@@ -122,8 +122,8 @@ func (d *DownloadSandbox) Start(ctx context.Context) error {
 	// permissions on bind mounts, which is why local scans succeeded.
 	// chmod 0777 is safe here — the directory is a per-scan tempdir the
 	// caller owns and cleans up; nothing sensitive shares it.
-	if err := os.Chmod(d.hostOutDir, 0o777); err != nil {
-		return fmt.Errorf("chmod host staging dir for download sandbox: %w", err)
+	if chmodErr := os.Chmod(d.hostOutDir, 0o777); chmodErr != nil {
+		return fmt.Errorf("chmod host staging dir for download sandbox: %w", chmodErr)
 	}
 
 	cmd := execCommand(ctx, "docker", d.createArgs(seccompOpt)...)
