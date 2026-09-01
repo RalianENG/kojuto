@@ -13,6 +13,10 @@ import (
 	"github.com/RalianENG/kojuto/internal/types"
 )
 
+// Test-local constant to satisfy goconst — same lodash version used
+// as the fixture across many independent test cases.
+const testLodashVersion = "4.17.21"
+
 // ---------------------------------------------------------------------------
 // runInSandbox stub
 //
@@ -141,7 +145,7 @@ func TestDetectVersionFromTgz(t *testing.T) {
 		pkg  string
 		want string
 	}{
-		{"lodash-4.17.21.tgz", "lodash", "4.17.21"},
+		{"lodash-4.17.21.tgz", "lodash", testLodashVersion},
 		{"express-4.18.2.tgz", "express", "4.18.2"},
 		{"pkg-1.0.0.tgz", "@scope/pkg", "1.0.0"},
 		{"unmatched.tgz", "other", ""},
@@ -213,7 +217,7 @@ func TestDetectVersion_Tgz(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "lodash-4.17.21.tgz"), []byte{}, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := DetectVersion(dir, "lodash"); got != "4.17.21" {
+	if got := DetectVersion(dir, "lodash"); got != testLodashVersion {
 		t.Errorf("DetectVersion tgz = %q, want '4.17.21'", got)
 	}
 }
@@ -373,7 +377,7 @@ func TestDownloadNpm_Mock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, _, err := downloadNpm(context.Background(), "lodash", "4.17.21", dir)
+	got, _, err := downloadNpm(context.Background(), "lodash", testLodashVersion, dir)
 	if err != nil {
 		t.Fatalf("downloadNpm error: %v", err)
 	}
@@ -396,7 +400,7 @@ func TestDownloadNpm_Mock(t *testing.T) {
 		t.Fatalf("staging package.json is not valid JSON: %v", err)
 	}
 	deps, ok := parsed["dependencies"].(map[string]any)
-	if !ok || deps["lodash"] != "4.17.21" {
+	if !ok || deps["lodash"] != testLodashVersion {
 		t.Errorf("staging package.json dependencies = %v, want lodash@4.17.21", parsed["dependencies"])
 	}
 }
@@ -436,7 +440,7 @@ func TestDownloadNpm_NoNodeModules(t *testing.T) {
 
 	dir := t.TempDir()
 	// Don't create node_modules — should error.
-	_, _, err := downloadNpm(context.Background(), "lodash", "4.17.21", dir)
+	_, _, err := downloadNpm(context.Background(), "lodash", testLodashVersion, dir)
 	if err == nil {
 		t.Error("expected error when node_modules not created, got nil")
 	}
@@ -449,7 +453,7 @@ func TestDownloadNpm_SandboxError(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dir, "node_modules"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err := downloadNpm(context.Background(), "lodash", "4.17.21", dir)
+	_, _, err := downloadNpm(context.Background(), "lodash", testLodashVersion, dir)
 	if err == nil {
 		t.Error("expected error when the download sandbox fails, got nil")
 	}
@@ -484,7 +488,7 @@ func TestDownload_Npm_Mock(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, _, err := Download(context.Background(), "lodash", "4.17.21", dir, types.EcosystemNpm)
+	got, _, err := Download(context.Background(), "lodash", testLodashVersion, dir, types.EcosystemNpm)
 	if err != nil {
 		t.Fatalf("Download npm error: %v", err)
 	}
@@ -553,7 +557,7 @@ func TestDownloadAllNpm_Mock(t *testing.T) {
 	}
 
 	deps := map[string]string{
-		"lodash":  "4.17.21",
+		"lodash":  testLodashVersion,
 		"express": "4.18.2",
 	}
 
@@ -582,8 +586,8 @@ func TestDownloadAllNpm_Mock(t *testing.T) {
 	if !ok {
 		t.Fatal("package.json dependencies is not a map")
 	}
-	if depsMap["lodash"] != "4.17.21" {
-		t.Errorf("dependencies[lodash] = %v, want %q", depsMap["lodash"], "4.17.21")
+	if depsMap["lodash"] != testLodashVersion {
+		t.Errorf("dependencies[lodash] = %v, want %q", depsMap["lodash"], testLodashVersion)
 	}
 }
 

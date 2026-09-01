@@ -10,6 +10,15 @@ import (
 	"github.com/RalianENG/kojuto/internal/types"
 )
 
+// Test-local constants to satisfy goconst — the strings appear repeatedly
+// across the download-probe tests only.
+const (
+	downloadTestMethod      = "strace-container"
+	downloadTestContainerID = "abc123"
+	downloadTestStraceArg   = "strace"
+	downloadTestExecArg     = "exec"
+)
+
 func TestNewContainerStraceForDownload(t *testing.T) {
 	cs := NewContainerStraceForDownload("/out")
 	if cs.phase != types.PhaseDownload {
@@ -20,8 +29,8 @@ func TestNewContainerStraceForDownload(t *testing.T) {
 	}
 	// Still the same probe method — the analyzer, not the probe name,
 	// branches on the download phase.
-	if cs.Method() != "strace-container" {
-		t.Errorf("Method() = %q, want %q", cs.Method(), "strace-container")
+	if cs.Method() != downloadTestMethod {
+		t.Errorf("Method() = %q, want %q", cs.Method(), downloadTestMethod)
 	}
 }
 
@@ -30,20 +39,20 @@ func TestNewContainerStraceForDownload(t *testing.T) {
 // package.json bind-mounted at /out.
 func TestBuildCommand_DownloadWorkdir(t *testing.T) {
 	cs := NewContainerStraceForDownload("/out")
-	cmd := cs.buildCommand(context.Background(), "abc123", []string{"npm", "install", "--ignore-scripts"})
+	cmd := cs.buildCommand(context.Background(), downloadTestContainerID, []string{"npm", "install", "--ignore-scripts"})
 	args := cmd.Args
 
-	if args[1] != "exec" {
-		t.Fatalf("args[1] = %q, want %q", args[1], "exec")
+	if args[1] != downloadTestExecArg {
+		t.Fatalf("args[1] = %q, want %q", args[1], downloadTestExecArg)
 	}
 	if args[2] != "--workdir=/out" {
 		t.Errorf("args[2] = %q, want %q", args[2], "--workdir=/out")
 	}
-	if args[3] != "abc123" {
-		t.Errorf("args[3] = %q, want the container ID %q", args[3], "abc123")
+	if args[3] != downloadTestContainerID {
+		t.Errorf("args[3] = %q, want the container ID %q", args[3], downloadTestContainerID)
 	}
-	if args[4] != "strace" {
-		t.Errorf("args[4] = %q, want %q", args[4], "strace")
+	if args[4] != downloadTestStraceArg {
+		t.Errorf("args[4] = %q, want %q", args[4], downloadTestStraceArg)
 	}
 
 	// The traced command still lands after the "--" separator.
