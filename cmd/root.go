@@ -465,7 +465,15 @@ func runBatchScreening(deps []depfile.Dep, ecosystem string) (string, error) {
 	}
 	installOut, installErr := cp.StartAndInstall(ctx, sb.ContainerID(), installCmd)
 	if installErr != nil {
-		fmt.Fprintf(os.Stderr, "[!] Install output:\n%s\n", string(installOut))
+		// installOut is pip's stdout (the "Successfully installed ..." verdict
+		// or an empty tail on early failure). Pip's actual error text goes to
+		// stderr, which the strace parser consumes and DiagnosticStderr
+		// captures the last few KiB of. Both are surfaced so `batch install
+		// failed: exit status 1` is followed by pip's real error message.
+		fmt.Fprintf(os.Stderr, "[!] Install stdout:\n%s\n", string(installOut))
+		if diag := cp.DiagnosticStderr(); diag != "" {
+			fmt.Fprintf(os.Stderr, "[!] Install stderr (non-strace tail):\n%s\n", diag)
+		}
 		return "", fmt.Errorf("batch install failed: %w", installErr)
 	}
 	installPhase.end()

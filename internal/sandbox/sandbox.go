@@ -205,6 +205,14 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 		// downgrading kojuto to per-package fallback on real-world inputs.
 		"--tmpfs=/usr/local/lib/python"+SandboxPythonVersion+"/site-packages:nosuid,mode=1777,size=1g",
 		"--tmpfs=/usr/local/bin:nosuid,exec,mode=0755,size=32m",
+		// Some wheels install compiled C headers to /usr/local/include
+		// (greenlet's manylinux wheel drops headers under
+		// python3.<ver>/greenlet/ during pip install). Without this
+		// tmpfs the install errors out on --read-only rootfs with
+		// [Errno 30] Read-only file system, silently downgrading batch
+		// mode to per-package fallback. 200 MB is generous for header
+		// files; backed by host RAM, actual usage is a few MB.
+		"--tmpfs=/usr/local/include:nosuid,mode=1777,size=200m",
 		"--tmpfs=/run:nosuid,size=1m",
 		"--tmpfs=/home/dev:nosuid,mode=1777,size=32m",
 		// Dedicated cache tmpfs outside HOME. npm and pip are pinned here via
