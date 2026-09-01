@@ -65,7 +65,7 @@ func runInDownloadSandbox(ctx context.Context, hostOutDir string, command []stri
 		// consumed by the strace parser; stdout carries the "Successfully
 		// downloaded" vs. "ERROR: ..." verdict — losing it hides the real
 		// cause when a download dies inside the sandbox.
-		return out, events, fmt.Errorf("download command failed: %w\n--- captured stdout tail ---\n%s\n--- end ---", err, tailBytes(out, 4096))
+		return out, events, fmt.Errorf("download command failed: %w\n--- captured stdout tail ---\n%s\n--- non-strace stderr tail (pip/npm errors) ---\n%s\n--- end ---", err, tailBytes(out, 4096), cp.DiagnosticStderr())
 	}
 
 	// Fail closed: a dropped event could be the one that would have flagged

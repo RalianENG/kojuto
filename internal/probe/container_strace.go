@@ -38,6 +38,11 @@ type ContainerStrace struct {
 	// download probe sets it so `npm install` finds the staging
 	// package.json; install/import probes leave it empty.
 	workdir string
+	// diagnosticStderrTail keeps the last N bytes of stderr lines that
+	// were NOT parsed as strace events (pip/npm error tracebacks, warnings,
+	// SSL errors). Surfaced by DiagnosticStderr() so error paths can print
+	// what actually went wrong instead of just an exit code.
+	diagnosticStderrTail []byte
 }
 
 // NewContainerStrace creates a new in-container strace probe.
@@ -155,9 +160,21 @@ func (c *ContainerStrace) parseStraceOutput(stderr io.ReadCloser, done chan<- st
 	scanner := bufio.NewScanner(stderr)
 	scanner.Buffer(make([]byte, 64*1024), straceMaxLine)
 
+	const diagnosticCap = 8 * 1024
 	for scanner.Scan() {
-		evt, ok := parseStraceLine(scanner.Text(), state)
+		line := scanner.Text()
+		evt, ok := parseStraceLine(line, state)
 		if !ok {
+			// Non-strace stderr line — most commonly pip/npm warnings
+			// and error tracebacks. Keep the last diagnosticCap bytes so
+			// DiagnosticStderr() can surface them when the traced
+			// command exits non-zero. Bounded to avoid unbounded growth
+			// on chatty tracees.
+			c.diagnosticStderrTail = append(c.diagnosticStderrTail, line...)
+			c.diagnosticStderrTail = append(c.diagnosticStderrTail, '\n')
+			if len(c.diagnosticStderrTail) > diagnosticCap {
+				c.diagnosticStderrTail = c.diagnosticStderrTail[len(c.diagnosticStderrTail)-diagnosticCap:]
+			}
 			continue
 		}
 
@@ -238,4 +255,13 @@ func (c *ContainerStrace) Method() string {
 // Dropped returns events discarded because the events channel was full.
 func (c *ContainerStrace) Dropped() uint64 {
 	return c.dropped
+}
+
+// DiagnosticStderr returns the last few KiB of stderr lines the strace
+// parser could not decode as events — typically pip/npm error tracebacks
+// or SSL warnings. Callers surface this in error paths so a non-zero exit
+// from the traced command shows WHY it failed instead of only an exit
+// code. Safe to call after the parse goroutine has exited.
+func (c *ContainerStrace) DiagnosticStderr() string {
+	return string(c.diagnosticStderrTail)
 }
