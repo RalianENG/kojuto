@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -61,7 +60,11 @@ var (
 	sandboxNew              = sandbox.New
 	sandboxEnsureImage      = sandbox.EnsureImage
 	depfileParse            = depfile.Parse
-	execCommandCmd          = exec.CommandContext
+	// downloaderInstallLocalNpm resolves a local npm tarball inside the
+	// download sandbox. Replaces the former execCommandCmd seam, which
+	// existed only so tests could stub the host-side `npm install` that
+	// prepareLocalNpm used to run — that call is gone.
+	downloaderInstallLocalNpm = downloader.InstallLocalNpm
 )
 
 var rootCmd = &cobra.Command{
@@ -768,19 +771,30 @@ func runLocalScan(_ []string) error {
 	flagEcosystem = ecosystem
 	flagVersion = acceptDetectedVersion(pkg, downloaderDetectVersion(dlDir, pkg))
 
-	// For npm local packages, we need to create a node_modules structure
-	// from the .tgz so the sandbox can run npm install with lifecycle scripts.
+	// ctx is established BEFORE the npm staging step. That step now runs npm
+	// inside the download sandbox, so a hostile manifest that stalls the
+	// resolver has to be bounded by --timeout like every other phase; the
+	// previous host-side npm call passed context.Background() and was
+	// therefore unbounded.
+	ctx, cancel := context.WithTimeout(context.Background(), flagTimeout)
+	defer cancel()
+
+	// For npm local packages, resolve the .tgz into a node_modules tree so
+	// the analysis sandbox can re-fire lifecycle scripts under strace. The
+	// resolution runs inside the download sandbox — see InstallLocalNpm for
+	// why it must not happen on the host.
+	var dlEvents []types.SyscallEvent
 	if ecosystem == types.EcosystemNpm {
-		npmDir, npmErr := prepareLocalNpm(dlDir, pkg)
+		staging, npmErr := prepareLocalNpm(ctx, dlDir, pkg)
+		if staging.root != "" {
+			defer os.RemoveAll(staging.root)
+		}
 		if npmErr != nil {
 			return fmt.Errorf("preparing local npm package: %w", npmErr)
 		}
-		defer os.RemoveAll(npmDir)
-		dlDir = npmDir
+		dlEvents = staging.events
+		dlDir = staging.dir
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), flagTimeout)
-	defer cancel()
 
 	method := selectProbeMethod()
 
@@ -801,6 +815,13 @@ func runLocalScan(_ []string) error {
 	if err != nil {
 		return err
 	}
+
+	// Prepend the download-phase events, matching scanSinglePackage. For npm
+	// these come from the staging resolve inside the download sandbox, where
+	// npm unpacked an attacker-authored tarball — the analyzer's
+	// download-phase profile is what judges them. PyPI local scans have no
+	// download phase (the file is already on disk), so dlEvents is nil.
+	result.events = append(dlEvents, result.events...)
 
 	return outputReport(pkg, result)
 }
@@ -849,66 +870,109 @@ func detectPackageName(filename string) string {
 	return strings.Join(nameParts, "-")
 }
 
-// prepareLocalNpm creates a staging directory with node_modules from
-// a local .tgz file. This mirrors what downloadNpm does for registry
-// packages: npm install --ignore-scripts on the host, then the sandbox
-// fires lifecycle scripts under strace.
-func prepareLocalNpm(sourceDir, pkg string) (string, error) {
-	stagingDir, err := os.MkdirTemp("", "kojuto-local-npm-*")
+// localNpmStaging is what prepareLocalNpm hands back: the directory to
+// bind-mount into the analysis sandbox, the private parent to delete on
+// cleanup, and the download-phase events captured while npm resolved the
+// dependency tree.
+type localNpmStaging struct {
+	dir    string // handed to the analysis sandbox as the package mount
+	root   string // private 0o700 parent; RemoveAll target
+	events []types.SyscallEvent
+}
+
+// prepareLocalNpm builds a staging directory holding the local .tgz plus a
+// package.json that depends on it, then resolves node_modules by running
+// npm --ignore-scripts inside the download sandbox. This mirrors what
+// downloadNpm does for registry packages; the analysis sandbox then fires
+// the lifecycle hooks under strace.
+//
+// The resolve deliberately does NOT run on the host. npm unpacks the
+// tarball, parses attacker-authored manifest fields, and reaches the
+// registry for the tarball's own dependencies — the exact work downloadNpm
+// was moved into a sandbox to contain. --local is the flag documented for
+// scanning known-malicious samples, so it was the one entry point whose
+// input is hostile by construction and yet ran package-manager code on the
+// host.
+//
+// Directory layout is load-bearing. DownloadSandbox bind-mounts the staging
+// directory and relaxes it to 0o777, because the container runs as UID 1000
+// and that is not the host UID. Nesting it one level below a 0o700 parent
+// keeps that world-writable bit unreachable to other local accounts: the
+// previous code chmod'd the top-level MkdirTemp directory itself, leaving a
+// soon-to-be world-writable directory sitting directly in the system temp
+// directory where any local user could drop a tarball into the scan.
+func prepareLocalNpm(ctx context.Context, sourceDir, pkg string) (localNpmStaging, error) {
+	root, err := os.MkdirTemp("", "kojuto-local-npm-*")
 	if err != nil {
-		return "", fmt.Errorf("creating npm staging dir: %w", err)
+		return localNpmStaging{}, fmt.Errorf("creating npm staging dir: %w", err)
 	}
-	// MkdirTemp creates with 0o700 — the sandbox container's `dev` user
-	// (UID 1000) is not the host UID, so without world-execute on this
-	// directory the in-container user cannot traverse the bind-mounted
-	// node_modules tree. find returns nothing, the lifecycle hooks never
-	// fire, and the scan silently misses every install-time payload.
-	// Mirrors the explicit 0o755 used in runLocalScan's PyPI path.
-	if chmodErr := os.Chmod(stagingDir, 0o755); chmodErr != nil {
-		return "", fmt.Errorf("relaxing staging dir perms: %w", chmodErr)
+	st := localNpmStaging{root: root, dir: filepath.Join(root, "staging")}
+	// 0o755 on the child only — the in-container dev user must traverse it.
+	if mkErr := os.MkdirAll(st.dir, 0o755); mkErr != nil {
+		return st, fmt.Errorf("creating npm staging dir: %w", mkErr)
 	}
 
-	// Find .tgz in source directory.
-	entries, err := os.ReadDir(sourceDir)
+	tgzName, err := findLocalTarball(sourceDir)
 	if err != nil {
-		return "", fmt.Errorf("reading source dir: %w", err)
+		return st, err
 	}
 
-	var tgzPath string
-	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".tgz") {
-			tgzPath = filepath.Join(sourceDir, e.Name())
-			break
-		}
-	}
-	if tgzPath == "" {
-		return "", fmt.Errorf("no .tgz file found in %s\n\nFor npm local scans, provide a tarball (.tgz) created by 'npm pack'", sourceDir)
+	// Copy the tarball in so the dependency spec can be relative. The
+	// container sees only this directory (mounted at DownloadOutMountPath),
+	// so the old absolute host path would not resolve inside it.
+	if copyErr := stageFile(filepath.Join(sourceDir, tgzName), filepath.Join(st.dir, tgzName)); copyErr != nil {
+		return st, copyErr
 	}
 
-	// Create package.json that references the local tarball.
 	pkgJSON := map[string]interface{}{
 		"name":         "kojuto-local-staging",
 		"private":      true,
-		"dependencies": map[string]string{pkg: "file:" + tgzPath},
+		"dependencies": map[string]string{pkg: "file:./" + tgzName},
 	}
 	jsonBytes, err := json.Marshal(pkgJSON)
 	if err != nil {
-		return "", fmt.Errorf("marshaling staging package.json: %w", err)
+		return st, fmt.Errorf("marshaling staging package.json: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(stagingDir, "package.json"), jsonBytes, 0o644); err != nil {
-		return "", fmt.Errorf("writing staging package.json: %w", err)
-	}
-
-	// Install without scripts on host to resolve deps and create node_modules.
-	cmd := execCommandCmd(context.Background(), "npm", "install", "--ignore-scripts")
-	cmd.Dir = stagingDir
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("npm install (local staging) failed: %w", err)
+	if writeErr := os.WriteFile(filepath.Join(st.dir, "package.json"), jsonBytes, 0o644); writeErr != nil {
+		return st, fmt.Errorf("writing staging package.json: %w", writeErr)
 	}
 
-	return stagingDir, nil
+	events, err := downloaderInstallLocalNpm(ctx, st.dir)
+	st.events = events
+	if err != nil {
+		return st, err
+	}
+
+	return st, nil
+}
+
+// findLocalTarball returns the name (not path) of the first .tgz entry in
+// dir. The name is a single path component by construction — os.ReadDir
+// never yields a separator — so callers can join it without traversal risk.
+func findLocalTarball(dir string) (string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", fmt.Errorf("reading source dir: %w", err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".tgz") {
+			return e.Name(), nil
+		}
+	}
+	return "", fmt.Errorf("no .tgz file found in %s\n\nFor npm local scans, provide a tarball (.tgz) created by 'npm pack'", dir)
+}
+
+// stageFile copies src to dst world-readable — the in-container dev user
+// has to read the tarball npm unpacks, and it is not the host UID.
+func stageFile(src, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return fmt.Errorf("reading local tarball: %w", err)
+	}
+	if err := os.WriteFile(dst, data, 0o644); err != nil {
+		return fmt.Errorf("staging local tarball: %w", err)
+	}
+	return nil
 }
 
 func downloadPackage(ctx context.Context, pkg string) (string, []types.SyscallEvent, error) {

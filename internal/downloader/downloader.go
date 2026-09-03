@@ -339,6 +339,38 @@ func DetectNpmVersion(destDir string) string {
 	return parsed.Version
 }
 
+// InstallLocalNpm resolves a local npm tarball's dependency tree inside the
+// download sandbox. stagingDir must already contain the tarball and a
+// package.json whose sole dependency is a relative `file:` reference to it;
+// the directory is bind-mounted at DownloadOutMountPath and npm runs with
+// that as its working directory, so the reference resolves inside the
+// container and never names a host path.
+//
+// This exists so `kojuto scan --local <pkg>.tgz` gets the containment the
+// registry path already had. npm unpacks the tarball (archive extraction is
+// a path-traversal surface), parses attacker-authored manifest fields, and
+// reaches the registry for the tarball's own dependencies. All of that used
+// to run on the host for local scans, even though downloadNpm had been moved
+// into a sandbox for exactly those reasons — and --local is the flag
+// documented for scanning known-malicious samples, so it was the one entry
+// point whose input is hostile by construction.
+//
+// --ignore-scripts still suppresses lifecycle hooks here: they are re-fired
+// inside the analysis sandbox under strace, which is where kojuto wants to
+// observe them. The returned events are the download-phase syscall trace,
+// which the caller prepends to the install/import timeline.
+func InstallLocalNpm(ctx context.Context, stagingDir string) ([]types.SyscallEvent, error) {
+	out, events, err := runInSandbox(ctx, stagingDir, []string{"npm", "install", "--ignore-scripts"})
+	echoSandboxOutput(out)
+	if err != nil {
+		return events, fmt.Errorf("npm install (local staging) failed: %w", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(stagingDir, "node_modules")); statErr != nil {
+		return events, errors.New("node_modules not created for local tarball")
+	}
+	return events, nil
+}
+
 // echoSandboxOutput relays pip/npm output from inside the sandbox to the
 // user's terminal with terminal-steering control bytes rendered inert.
 //
