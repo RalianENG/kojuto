@@ -11,6 +11,7 @@ import (
 	"github.com/fatih/color"
 	"golang.org/x/term"
 
+	"github.com/RalianENG/kojuto/internal/safeout"
 	"github.com/RalianENG/kojuto/internal/types"
 )
 
@@ -146,11 +147,18 @@ func padRight(s string, n int) string {
 // pkgCoord returns "name@version" or just "name" when version is empty.
 // Used as the human-readable package identifier in headers and verdict
 // blocks.
+//
+// Both halves are escaped even though each is validated upstream
+// (downloaderValidate on the name, acceptDetectedVersion on the version).
+// This string is printed adjacent to the verdict, which is the one line an
+// attacker most wants to redraw, so it is worth not depending on a caller
+// two layers away having done the right thing.
 func pkgCoord(name, version string) string {
+	name = safeout.String(name)
 	if version == "" {
 		return name
 	}
-	return name + "@" + version
+	return name + "@" + safeout.String(version)
 }
 
 // renderVerdictBlock writes the post-scan verdict + breakdown to w.

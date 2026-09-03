@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"io"
 	"reflect"
-	"strings"
 	"time"
 
+	"github.com/RalianENG/kojuto/internal/safeout"
 	"github.com/RalianENG/kojuto/internal/types"
 )
 
@@ -73,39 +73,12 @@ func sanitizeEventStrings(e *types.SyscallEvent) {
 	}
 }
 
-// sanitizeControl escapes C0 control bytes and DEL to printable forms.
-// Common whitespace bytes use the conventional \n / \r / \t shorthand;
-// all others render as \xNN. Any other byte (printable ASCII, UTF-8
-// multibyte, etc.) passes through unchanged.
+// sanitizeControl escapes C0 control bytes and DEL to printable forms so
+// an attacker-supplied string cannot smuggle an ANSI escape sequence into
+// a report field. Delegates to safeout.String, which is the same routine
+// the console output path uses — keeping one implementation means a fix
+// to the escaping rules cannot land on the JSON path and miss the
+// terminal path (or the reverse).
 func sanitizeControl(s string) string {
-	if !needsControlEscape(s) {
-		return s
-	}
-	var b strings.Builder
-	b.Grow(len(s))
-	for _, r := range s {
-		switch {
-		case r == '\n':
-			b.WriteString(`\n`)
-		case r == '\r':
-			b.WriteString(`\r`)
-		case r == '\t':
-			b.WriteString(`\t`)
-		case r < 0x20 || r == 0x7f:
-			fmt.Fprintf(&b, `\x%02x`, r)
-		default:
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
-}
-
-func needsControlEscape(s string) bool {
-	for i := range len(s) {
-		c := s[i]
-		if c < 0x20 || c == 0x7f {
-			return true
-		}
-	}
-	return false
+	return safeout.String(s)
 }
