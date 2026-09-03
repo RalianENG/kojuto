@@ -149,6 +149,15 @@ jobs:
       - name: Scan known-clean package
         run: |
           sudo ./kojuto scan six -o report-clean.json
+          # kojuto writes reports 0600 and here it ran as root under sudo, so
+          # the runner user cannot read the file back without taking
+          # ownership. This step only ever passed because report-clean.json
+          # was committed to the repo: O_TRUNC on the checked-out file kept
+          # the runner's ownership and hid the problem. The artifact is no
+          # longer tracked, so the chown is now doing real work — and the
+          # same fix is applied in action.yml, where there was no
+          # pre-existing file and the verdict read was simply broken.
+          sudo chown "$(id -u):$(id -g)" report-clean.json
           VERDICT=$(jq -r '.verdict' report-clean.json)
           echo "Verdict: $VERDICT"
           if [ "$VERDICT" != "clean" ]; then

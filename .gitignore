@@ -59,3 +59,9 @@ __pycache__/
 
 # Claude Code local state
 .claude/*.lock
+
+# Scan reports produced by CI / local runs. report-clean.json used to be
+# tracked, which silently masked a permissions bug: `sudo kojuto -o` writes
+# 0600 as root, and the integration test's `jq` only worked because O_TRUNC
+# reused the checked-out file's ownership.
+report-*.json
