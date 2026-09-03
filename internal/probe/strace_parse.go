@@ -30,6 +30,41 @@ type ParseState struct {
 	// `/etc/shadow`, not the bare `shadow`). Per-PID because fd
 	// values are process-scoped.
 	openFDs map[uint32]map[int]string
+
+	// fdEntries counts the entries across every per-PID map in openFDs so
+	// the total can be bounded without walking the nested maps.
+	fdEntries int
+
+	// overflowed records that a correlation map hit its ceiling and stopped
+	// accepting entries. Surfaced via Overflowed() so the probe can degrade
+	// the verdict to inconclusive: past this point a dirfd-relative openat
+	// may fail to resolve, and an unresolved path is one the sensitive-path
+	// check cannot match.
+	overflowed bool
+}
+
+// Correlation-state ceilings. Both maps are keyed by attacker-influenced
+// values — file descriptors a package chooses to open, filenames it chooses
+// to create — so neither is self-limiting. The container's own limits do
+// not help: a process can raise RLIMIT_NOFILE to the hard limit and, with
+// 256 PIDs available, drive the fd map into the millions of entries, while
+// a /tmp tmpfs holds far more empty files than the host wants to index.
+//
+// The values are set where legitimate installs are nowhere near them (pip
+// unpacking a large wheel set peaks in the low thousands of concurrent fds)
+// but the memory stays bounded at a few tens of MB.
+const (
+	maxTrackedFDs   = 200_000
+	maxTrackedPaths = 200_000
+)
+
+// Overflowed reports whether a correlation map stopped accepting entries.
+// Callers treat this as lost visibility, not a benign truncation.
+func (s *ParseState) Overflowed() bool {
+	if s == nil {
+		return false
+	}
+	return s.overflowed
 }
 
 // NewParseState creates a fresh parse state for a scan phase.
@@ -52,6 +87,16 @@ func (s *ParseState) recordFD(pid uint32, fd int, absPath string) {
 	if !ok {
 		perPID = make(map[int]string)
 		s.openFDs[pid] = perPID
+	}
+	// Overwriting an existing (pid, fd) is free — fd reuse replaces a stale
+	// entry rather than growing the map — so only a genuinely new entry is
+	// charged against the ceiling.
+	if _, exists := perPID[fd]; !exists {
+		if s.fdEntries >= maxTrackedFDs {
+			s.overflowed = true
+			return
+		}
+		s.fdEntries++
 	}
 	perPID[fd] = absPath
 }
@@ -738,6 +783,15 @@ func trackTmpFileCreation(line string, state *ParseState) {
 
 	for _, dir := range suspiciousUnlinkDirs {
 		if strings.HasPrefix(filePath, dir) {
+			if _, exists := state.createdTmpFiles[filePath]; !exists &&
+				len(state.createdTmpFiles) >= maxTrackedPaths {
+				// Ceiling reached. Dropping the entry would silently disable
+				// the create→execute→delete anti-forensics correlation for
+				// every later file, so flag it and let the probe degrade the
+				// verdict to inconclusive.
+				state.overflowed = true
+				return
+			}
 			state.createdTmpFiles[filePath] = true
 			return
 		}

@@ -13,6 +13,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -78,8 +79,10 @@ type EBPFProbe struct {
 	readerWg        sync.WaitGroup
 	createdTmpMu    sync.Mutex
 	createdTmpFiles map[string]bool
-	LostSamples     uint64
-	dropped         uint64 // events dropped due to full events channel
+	lostSamples     atomic.Uint64
+	dropped         atomic.Uint64 // full channel, or MaxProbeEvents reached
+	emitted         atomic.Uint64 // handed to the consumer; bounded by MaxProbeEvents
+	capNoted        atomic.Bool   // ensures the cap warning prints once
 }
 
 // NewEBPF creates a new eBPF-based probe.
@@ -191,7 +194,7 @@ func (p *EBPFProbe) readNetworkLoop() {
 		}
 
 		if record.LostSamples > 0 {
-			p.LostSamples += record.LostSamples
+			p.lostSamples.Add(record.LostSamples)
 			continue
 		}
 
@@ -220,15 +223,8 @@ func (p *EBPFProbe) readNetworkLoop() {
 			DstAddr:   formatAddr(raw.Family, raw.Daddr),
 		}
 
-		select {
-		case p.events <- evt:
-		case <-p.done:
+		if !p.emit(evt) {
 			return
-		default:
-			// Buffer full — drop rather than block. The BPF reader must
-			// not stall: if it does, the perf buffer overflows and the
-			// analyzer reports `inconclusive`.
-			p.dropped++
 		}
 	}
 }
@@ -245,7 +241,7 @@ func (p *EBPFProbe) readFileLoop() {
 		}
 
 		if record.LostSamples > 0 {
-			p.LostSamples += record.LostSamples
+			p.lostSamples.Add(record.LostSamples)
 			continue
 		}
 
@@ -271,12 +267,8 @@ func (p *EBPFProbe) readFileLoop() {
 			continue
 		}
 
-		select {
-		case p.events <- evt:
-		case <-p.done:
+		if !p.emit(evt) {
 			return
-		default:
-			p.dropped++
 		}
 	}
 }
@@ -302,7 +294,15 @@ func (p *EBPFProbe) classifyFileEvent(raw *probeFileEvent, path, path2 string) (
 		// Track create→delete candidates for anti-forensics correlation.
 		if raw.Extra1&oCreat != 0 && isSuspiciousTmpPath(path) {
 			p.createdTmpMu.Lock()
-			p.createdTmpFiles[path] = true
+			if _, seen := p.createdTmpFiles[path]; !seen && len(p.createdTmpFiles) >= maxTrackedPaths {
+				// Ceiling reached: stop growing, and count it as lost
+				// visibility so the verdict degrades to inconclusive
+				// rather than silently losing the create-then-delete
+				// anti-forensics correlation for every later file.
+				p.dropped.Add(1)
+			} else {
+				p.createdTmpFiles[path] = true
+			}
 			p.createdTmpMu.Unlock()
 		}
 	case evtRename:
@@ -375,7 +375,7 @@ func (p *EBPFProbe) Method() string {
 
 // Dropped returns events discarded because the events channel was full.
 func (p *EBPFProbe) Dropped() uint64 {
-	return p.dropped
+	return p.dropped.Load()
 }
 
 // isSuspiciousTmpPath reports whether path lives under a directory where
@@ -473,4 +473,49 @@ func formatAddr(family uint16, addr [16]uint8) string {
 		return net.IP(addr[:4]).String()
 	}
 	return net.IP(addr[:]).String()
+}
+
+// emit hands evt to the consumer, returning false when the probe is closing
+// and the caller should stop reading.
+//
+// Both perf-buffer reader goroutines funnel through here so the shared
+// counters have exactly one writer path. They are atomics because the two
+// goroutines run concurrently: the previous plain `p.dropped++` and
+// `p.LostSamples +=` were racing, and a lost increment on the counter that
+// decides `inconclusive` is the one loss that must not happen — it turns a
+// scan that lost visibility back into a "clean" verdict.
+//
+// The MaxProbeEvents ceiling is the same host-memory guard container_strace
+// applies; see that constant for why an unbounded consumer slice is a
+// denial-of-service surface reachable by any scanned package.
+func (p *EBPFProbe) emit(evt types.SyscallEvent) bool {
+	if p.emitted.Load() >= MaxProbeEvents {
+		p.dropped.Add(1)
+		if p.capNoted.CompareAndSwap(false, true) {
+			fmt.Fprintf(os.Stderr,
+				"warning: probe event cap (%d) reached — remaining events are discarded "+
+					"and the verdict will be inconclusive\n", MaxProbeEvents)
+		}
+		return true
+	}
+
+	select {
+	case p.events <- evt:
+		p.emitted.Add(1)
+	case <-p.done:
+		return false
+	default:
+		// Buffer full — drop rather than block. The BPF reader must not
+		// stall: if it does, the perf buffer overflows and the analyzer
+		// reports `inconclusive`.
+		p.dropped.Add(1)
+	}
+	return true
+}
+
+// LostSamples returns the number of perf-buffer samples the kernel dropped
+// before userspace could read them. Non-zero means the scan lost visibility
+// and the caller must not report `clean`.
+func (p *EBPFProbe) LostSamples() uint64 {
+	return p.lostSamples.Load()
 }

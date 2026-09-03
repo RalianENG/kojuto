@@ -13,7 +13,7 @@ func TestEBPFProbe_Dropped_Getter(t *testing.T) {
 	if got := p.Dropped(); got != 0 {
 		t.Errorf("Dropped() on fresh probe = %d, want 0", got)
 	}
-	p.dropped = 7
+	p.dropped.Store(7)
 	if got := p.Dropped(); got != 7 {
 		t.Errorf("Dropped() after increment = %d, want 7", got)
 	}

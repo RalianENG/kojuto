@@ -25,7 +25,6 @@ func NewStrace() *unsupportedProbe {
 }
 
 type unsupportedProbe struct {
-	LostSamples uint64
 }
 
 func (p *unsupportedProbe) Start(_ uint32) error {
@@ -54,5 +53,12 @@ func (p *unsupportedProbe) Method() string {
 
 // Dropped always returns 0 on non-Linux platforms.
 func (p *unsupportedProbe) Dropped() uint64 {
+	return 0
+}
+
+// LostSamples always returns 0 on non-Linux platforms. Present so callers
+// can read the counter uniformly across platforms; the Linux probe backs it
+// with an atomic because two perf-buffer readers update it concurrently.
+func (p *unsupportedProbe) LostSamples() uint64 {
 	return 0
 }

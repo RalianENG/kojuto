@@ -21,14 +21,39 @@ import (
 // loop exits and subsequent strace events are silently dropped).
 const straceMaxLine = 16 * 1024 * 1024
 
+// MaxProbeEvents bounds how many events one probe instance will hand to its
+// consumer.
+//
+// The sandbox is capped at 4 GB / 4 CPUs / 256 PIDs, but the kojuto process
+// on the HOST had no ceiling at all: every consumer drains the events
+// channel into an unbounded slice that lives until the report is written.
+// A package that loops on a traced syscall — clone/exit, or an audit-hook
+// event such as eval("") — produces events for as long as the scan runs, so
+// a 5-minute --timeout was enough to grow that slice without limit and take
+// the host down. That is a denial of service against the scanner, reachable
+// by any package it is pointed at.
+//
+// The cap is deliberately far above real workloads: a clean scan reports
+// events in the tens, and even a large npm batch with parallel lifecycle
+// hooks and V8 JIT churn stays orders of magnitude below this. Anything
+// that reaches it is generating syscalls at a rate no install does.
+//
+// Exceeding the cap increments the dropped counter, which the caller
+// already maps to a verdict of `inconclusive`. That is the point: the scan
+// gave up visibility, and a truncated trace must never be reported as
+// clean.
+const MaxProbeEvents = 250_000
+
 // ContainerStrace monitors connect(2) syscalls by running strace inside the Docker container.
 // This works on all platforms where Docker is available (Linux, macOS, Windows).
 // ContainerStrace monitors connect(2) syscalls by running strace inside the Docker container.
 // This works on all platforms where Docker is available (Linux, macOS, Windows).
 type ContainerStrace struct {
-	events  chan types.SyscallEvent
-	done    chan struct{}
-	dropped uint64 // events dropped due to full buffer
+	events   chan types.SyscallEvent
+	done     chan struct{}
+	dropped  uint64 // events dropped due to full buffer or MaxProbeEvents
+	emitted  uint64 // events handed to the consumer, bounded by MaxProbeEvents
+	capNoted bool   // ensures the cap warning is printed once, not per event
 	// phase, when non-empty, is stamped onto every emitted event's Phase
 	// field so the analyzer can apply a phase-specific profile. The
 	// install/import probes leave it empty; the download probe sets it
@@ -184,8 +209,26 @@ func (c *ContainerStrace) parseStraceOutput(stderr io.ReadCloser, done chan<- st
 			evt.Phase = c.phase
 		}
 
+		// Host-side memory ceiling. Consumers drain this channel into a
+		// slice that lives for the whole scan, so without a bound a package
+		// that spins on a traced syscall can exhaust host RAM. See
+		// MaxProbeEvents. Keep scanning (the tracee's stderr must not
+		// block) but stop retaining.
+		if c.emitted >= MaxProbeEvents {
+			c.dropped++
+			if !c.capNoted {
+				c.capNoted = true
+				fmt.Fprintf(os.Stderr,
+					"warning: probe event cap (%d) reached — the traced process is generating "+
+						"syscalls far faster than any real install; remaining events are discarded "+
+						"and the verdict will be inconclusive\n", MaxProbeEvents)
+			}
+			continue
+		}
+
 		select {
 		case c.events <- evt:
+			c.emitted++
 		case <-c.done:
 			return
 		default:
@@ -194,6 +237,21 @@ func (c *ContainerStrace) parseStraceOutput(stderr io.ReadCloser, done chan<- st
 			c.dropped++
 		}
 	}
+
+	// The dirfd and created-file correlation maps have their own ceilings.
+	// Overflowing them does not lose an event outright, but it does lose the
+	// context that turns `openat(<fd>, "shadow")` into `/etc/shadow` — an
+	// attacker who opens a hundred thousand files first could otherwise
+	// blind the resolver and then read credentials unnoticed. Fold that into
+	// the same dropped counter so the verdict goes inconclusive rather than
+	// clean.
+	if state.Overflowed() {
+		c.dropped++
+		fmt.Fprintln(os.Stderr,
+			"warning: strace correlation state overflowed — path resolution is no longer "+
+				"reliable for this scan; the verdict will be inconclusive")
+	}
+
 	if err := scanner.Err(); err != nil {
 		// bufio.ErrTooLong here means the tracee wrote a >16 MiB
 		// chunk to the shared docker-exec stderr without a newline,

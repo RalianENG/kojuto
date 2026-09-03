@@ -1076,7 +1076,7 @@ func runEBPFProbe(ctx context.Context, sb *sandbox.Sandbox, _ string) (*scanResu
 	return &scanResult{
 		events:      events,
 		method:      ep.Method(),
-		lostSamples: ep.LostSamples,
+		lostSamples: ep.LostSamples(),
 		dropped:     ep.Dropped(),
 	}, nil
 }
