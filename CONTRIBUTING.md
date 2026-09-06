@@ -111,7 +111,20 @@ Releases are automated via GoReleaser on tag push. Checksums are signed with [co
 git tag v0.4.0
 git push origin v0.4.0
 # → CI runs → GoReleaser builds + cosign signs → GitHub Release created
+#            → the tag is requested from proxy.golang.org, which publishes
+#              the module to the Go ecosystem (pkg.go.dev, `go install`)
 ```
+
+The Go module proxy and pkg.go.dev are pull-based: a tag is only fetched,
+recorded in `sum.golang.org`, and indexed once somebody asks the proxy for
+that exact version. The release workflow makes that request itself via
+`go install`, which doubles as a check that the tag really is installable
+through the Go toolchain.
+
+Note that `go install github.com/RalianENG/kojuto@latest` gives you the
+binary only. The sandbox image is not part of the module, so a scan still
+needs `kojuto-sandbox:latest` to exist — build it once with
+`make sandbox-image` from a clone.
 
 ### Verifying a release
 
