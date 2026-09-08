@@ -223,7 +223,7 @@ func (p *EBPFProbe) readNetworkLoop() {
 			DstAddr:   formatAddr(raw.Family, raw.Daddr),
 		}
 
-		if !p.emit(evt) {
+		if !p.emit(&evt) {
 			return
 		}
 	}
@@ -267,7 +267,7 @@ func (p *EBPFProbe) readFileLoop() {
 			continue
 		}
 
-		if !p.emit(evt) {
+		if !p.emit(&evt) {
 			return
 		}
 	}
@@ -488,7 +488,11 @@ func formatAddr(family uint16, addr [16]uint8) string {
 // The MaxProbeEvents ceiling is the same host-memory guard container_strace
 // applies; see that constant for why an unbounded consumer slice is a
 // denial-of-service surface reachable by any scanned package.
-func (p *EBPFProbe) emit(evt types.SyscallEvent) bool {
+//
+// evt is taken by pointer because SyscallEvent is ~300 bytes and this runs
+// once per captured syscall on the hot path of both reader goroutines; the
+// value is copied exactly once, at the channel send.
+func (p *EBPFProbe) emit(evt *types.SyscallEvent) bool {
 	if p.emitted.Load() >= MaxProbeEvents {
 		p.dropped.Add(1)
 		if p.capNoted.CompareAndSwap(false, true) {
@@ -500,7 +504,7 @@ func (p *EBPFProbe) emit(evt types.SyscallEvent) bool {
 	}
 
 	select {
-	case p.events <- evt:
+	case p.events <- *evt:
 		p.emitted.Add(1)
 	case <-p.done:
 		return false
