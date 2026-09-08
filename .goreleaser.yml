@@ -26,11 +26,11 @@ builds:
 
 archives:
   - id: default
-    format: tar.gz
+    formats: [tar.gz]
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     format_overrides:
       - goos: windows
-        format: zip
+        formats: [zip]
 
 checksum:
   name_template: "checksums.txt"
@@ -39,6 +39,18 @@ signs:
   - cmd: cosign
     artifacts: checksum
     output: true
+    # certificate MUST be declared: GoReleaser only exports the
+    # ${certificate} template variable when this field is set. Without it
+    # the variable expanded to the empty string, cosign was invoked with
+    # `--output-certificate=` and failed on the empty path — so every
+    # tagged release built, archived, and checksummed, then died at the
+    # signing step and never produced a GitHub Release. ${signature} was
+    # unaffected because it defaults to ${artifact}.sig.
+    #
+    # The .pem / .sig pair is what CONTRIBUTING.md's `cosign verify-blob`
+    # instructions already tell users to fetch, so this restores the
+    # documented behaviour rather than switching to the newer bundle form.
+    certificate: "${artifact}.pem"
     args:
       - "sign-blob"
       - "--yes"
