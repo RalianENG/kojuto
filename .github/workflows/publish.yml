@@ -43,3 +43,46 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ──────────────────────────────────────────────
+  # Publish to the Go ecosystem
+  # ──────────────────────────────────────────────
+  #
+  # A GitHub Release does not, on its own, publish anything to Go. The
+  # module proxy and pkg.go.dev are pull-based: a tag is only fetched,
+  # checksummed into sum.golang.org, and indexed once somebody asks the
+  # proxy for that exact version. Until then `go install
+  # github.com/RalianENG/kojuto@latest` resolves to whatever older version
+  # the proxy already knows, and the new release is absent from pkg.go.dev.
+  #
+  # Asking for it ourselves is the whole mechanism, and `go install` is the
+  # request worth making: it warms the proxy AND proves the released tag is
+  # actually installable through the Go toolchain, which no other job here
+  # covers.
+  go-module:
+    name: Publish Go module
+    runs-on: ubuntu-latest
+    needs: release
+    steps:
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      # `go install pkg@version` deliberately ignores any surrounding
+      # go.mod, so this needs no checkout. Retried because proxy indexing
+      # of a brand-new tag is not instantaneous.
+      - name: Warm proxy.golang.org and verify go install
+        env:
+          GOPROXY: https://proxy.golang.org,direct
+          MODULE: github.com/RalianENG/kojuto
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if go install "${MODULE}@${GITHUB_REF_NAME}"; then
+              echo "::notice::${MODULE}@${GITHUB_REF_NAME} published to the Go module proxy"
+              exit 0
+            fi
+            echo "attempt ${attempt} failed — the proxy may not have indexed the tag yet"
+            sleep 20
+          done
+          echo "::error::${MODULE}@${GITHUB_REF_NAME} is not installable via the Go module proxy"
+          exit 1

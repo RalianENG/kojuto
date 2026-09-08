@@ -59,10 +59,18 @@ inputs:
     default: 'false'
 
 outputs:
+  # A composite action only exposes an output if it carries an explicit
+  # `value:`. Without these two lines the outputs were declared but always
+  # resolved to the empty string, so a caller gating on
+  # `steps.kojuto.outputs.verdict == 'suspicious'` — the documented usage,
+  # and the natural one when the step runs under continue-on-error — never
+  # fired and a suspicious package passed the gate.
   verdict:
-    description: 'Scan verdict: clean, suspicious, or inconclusive'
+    description: 'Scan verdict: clean, suspicious, inconclusive, or error if the scan did not produce a report'
+    value: ${{ steps.scan.outputs.verdict }}
   report:
     description: 'Path to JSON report'
+    value: ${{ steps.scan.outputs.report }}
 
 runs:
   using: 'composite'
@@ -70,13 +78,13 @@ runs:
     - name: Build kojuto
       shell: bash
       run: |
-        cd ${{ github.action_path }}
+        cd "${{ github.action_path }}"
         make build
 
     - name: Build sandbox image
       shell: bash
       run: |
-        cd ${{ github.action_path }}
+        cd "${{ github.action_path }}"
         docker build -f Dockerfile.sandbox -t kojuto-sandbox:latest .
 
     - name: Run scan
@@ -139,9 +147,37 @@ runs:
           ARGS+=("--no-color")
         fi
 
-        sudo "${{ github.action_path }}/kojuto" scan "${ARGS[@]}" \
-          -o /tmp/kojuto-report.json
+        REPORT=/tmp/kojuto-report.json
 
-        echo "report=/tmp/kojuto-report.json" >> "$GITHUB_OUTPUT"
-        VERDICT=$(jq -r '.verdict' /tmp/kojuto-report.json)
+        # kojuto exits 2 on a suspicious or inconclusive verdict. Capture the
+        # status instead of letting the shell abort here, so the outputs are
+        # always published before the step fails — previously the exit
+        # propagated immediately and the two lines below never ran, leaving
+        # the outputs empty on exactly the runs a caller most needs them.
+        set +e
+        sudo "${{ github.action_path }}/kojuto" scan "${ARGS[@]}" -o "$REPORT"
+        STATUS=$?
+        set -e
+
+        # kojuto writes the report 0600, and it ran as root under sudo, so
+        # the runner user cannot read it back without this.
+        if [ -f "$REPORT" ]; then
+          sudo chown "$(id -u):$(id -g)" "$REPORT"
+        fi
+
+        echo "report=$REPORT" >> "$GITHUB_OUTPUT"
+
+        VERDICT=""
+        if [ -f "$REPORT" ]; then
+          VERDICT=$(jq -r '.verdict // empty' "$REPORT")
+        fi
+        if [ -z "$VERDICT" ]; then
+          # The scan died before producing a report (Docker unavailable,
+          # download failure, timeout). Emit an explicit sentinel rather than
+          # an empty string: a caller comparing against 'clean' must not read
+          # "we never scanned" as "nothing was found".
+          VERDICT="error"
+        fi
         echo "verdict=$VERDICT" >> "$GITHUB_OUTPUT"
+
+        exit $STATUS

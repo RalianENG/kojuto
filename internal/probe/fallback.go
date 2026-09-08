@@ -69,17 +69,43 @@ func (s *StraceFallback) StartWithPID(pid uint32) error {
 		state := NewParseState()
 		scanner := bufio.NewScanner(stderr)
 		scanner.Buffer(make([]byte, 64*1024), straceMaxLine)
+		var emitted uint64
+		capNoted := false
 		for scanner.Scan() {
 			evt, ok := parseStraceLine(scanner.Text(), state)
-			if ok {
-				select {
-				case s.events <- evt:
-				case <-s.done:
-					return
-				default:
-					s.dropped++
-				}
+			if !ok {
+				continue
 			}
+			// Host-memory ceiling, same rationale as container_strace: the
+			// consumer keeps every event for the whole scan, so an unbounded
+			// producer is a denial of service against the host. See
+			// MaxProbeEvents.
+			if emitted >= MaxProbeEvents {
+				s.dropped++
+				if !capNoted {
+					capNoted = true
+					fmt.Fprintf(os.Stderr,
+						"warning: probe event cap (%d) reached — remaining events are discarded "+
+							"and the verdict will be inconclusive\n", MaxProbeEvents)
+				}
+				continue
+			}
+			select {
+			case s.events <- evt:
+				emitted++
+			case <-s.done:
+				return
+			default:
+				s.dropped++
+			}
+		}
+		// A correlation map that stopped accepting entries means dirfd
+		// resolution is no longer trustworthy — see ParseState.Overflowed.
+		if state.Overflowed() {
+			s.dropped++
+			fmt.Fprintln(os.Stderr,
+				"warning: strace correlation state overflowed — path resolution is no longer "+
+					"reliable for this scan; the verdict will be inconclusive")
 		}
 		if err := scanner.Err(); err != nil {
 			// See straceMaxLine: an unrecoverable scanner failure

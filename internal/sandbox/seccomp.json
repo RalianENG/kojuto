@@ -1,13 +1,52 @@
 {
-  "_comment": "Hardened seccomp profile for kojuto sandbox. Historical context — a review of PR #43 pointed out that the original ALLOW-by-default profile with 42 explicit denies made the sandbox WEAKER than Docker's stock profile because `--security-opt seccomp=<file>` REPLACES the Docker default rather than layering on top. That opened up ~300 syscalls Docker would have blocked, including io_uring which allows every kojuto detection category to be bypassed. This revision restores parity on the highest-impact gap (io_uring) while keeping ALLOW-by-default to avoid breaking legit install flows — a full deny-by-default allow-list is a maintenance liability we're deferring. memfd_create is deliberately REMOVED from the deny list so the analyzer's parseExecveat AT_EMPTY_PATH branch can catch the fileless-exec chain — inducing and observing malicious behaviour is more consistent with kojuto's design than silently blocking with ENOSYS (which also gives sandbox-aware payloads a definitive fingerprint).",
+  "_comment": "Hardened seccomp profile for kojuto sandbox. Historical context — a review of PR #43 pointed out that the original ALLOW-by-default profile with 42 explicit denies made the sandbox WEAKER than Docker's stock profile because `--security-opt seccomp=<file>` REPLACES the Docker default rather than layering on top. That opened up ~300 syscalls Docker would have blocked, including io_uring which allows every kojuto detection category to be bypassed. This revision restores parity on the highest-impact gap (io_uring) while keeping ALLOW-by-default to avoid breaking legit install flows — a full deny-by-default allow-list is a maintenance liability we're deferring. memfd_create is deliberately REMOVED from the deny list so the analyzer's parseExecveat AT_EMPTY_PATH branch can catch the fileless-exec chain — inducing and observing malicious behaviour is more consistent with kojuto's design than silently blocking with ENOSYS (which also gives sandbox-aware payloads a definitive fingerprint). Because the profile is still ALLOW-by-default, the residual gap versus Docker's stock deny-by-default profile is the set of syscalls Docker blocks that are absent from the list below; the deny list now covers the ones reachable without a capability kojuto does not grant, so what remains open are calls that would EPERM against --cap-drop=ALL anyway. Any new syscall that becomes a detection-bypass or escape vector must be added here explicitly — nothing is blocked implicitly.",
+  "_archComment": "archMap is REQUIRED, not cosmetic. libseccomp resolves syscall NAMES to numbers for one architecture only; a filter installed without arch coverage matches solely on the native arch (AUDIT_ARCH_X86_64). A payload that ships a static 32-bit ELF, or that issues the x32 form of a syscall (nr | 0x40000000), lands on an arch this filter has no rules for and falls straight through to defaultAction — i.e. every deny below (io_uring, mount, bpf, ptrace-attach, ...) is bypassed by recompiling for i386. Docker's stock profile carries the same archMap for exactly this reason. Entries cover kojuto's release targets (amd64, arm64); Docker selects the entry matching the host arch and adds the sub-architectures, so a host arch absent from this map degrades to the previous native-only behaviour rather than failing.",
+  "archMap": [
+    {
+      "architecture": "SCMP_ARCH_X86_64",
+      "subArchitectures": [
+        "SCMP_ARCH_X86",
+        "SCMP_ARCH_X32"
+      ]
+    },
+    {
+      "architecture": "SCMP_ARCH_AARCH64",
+      "subArchitectures": [
+        "SCMP_ARCH_ARM"
+      ]
+    }
+  ],
   "defaultAction": "SCMP_ACT_ALLOW",
   "syscalls": [
     {
       "names": [
         "ptrace"
       ],
-      "action": "SCMP_ACT_ALLOW",
-      "comment": "Allow ptrace so strace itself works. Without this the strace probe cannot attach. Anti-debugging evasion (ptrace(PTRACE_TRACEME) from the tracee) is instead detected at the analyzer layer as CategoryEvasion."
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
+      "args": [
+        {
+          "index": 0,
+          "value": 16,
+          "op": "SCMP_CMP_EQ"
+        }
+      ],
+      "comment": "Block PTRACE_ATTACH (16). ptrace itself must stay reachable — strace is the probe — but `strace -f -- <cmd>` never uses ATTACH: it forks, the child calls PTRACE_TRACEME, and subsequent children are picked up automatically via PTRACE_O_TRACEFORK/VFORK/CLONE. ATTACH is only needed by `strace -p <pid>`, which kojuto does not run inside the container. Leaving ATTACH open let a payload attach to the strace process that is monitoring it (CAP_SYS_PTRACE bypasses the Yama ptrace_scope restriction) and stop or manipulate the tracer — an attack on monitoring integrity, not just on a sibling process. PTRACE_TRACEME (0) stays allowed so anti-debugging self-checks still execute and are reported as CategoryEvasion."
+    },
+    {
+      "names": [
+        "ptrace"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
+      "args": [
+        {
+          "index": 0,
+          "value": 16902,
+          "op": "SCMP_CMP_EQ"
+        }
+      ],
+      "comment": "Block PTRACE_SEIZE (0x4206 = 16902) for the same reason as PTRACE_ATTACH above — it is the modern equivalent and grants the same cross-process control. Split into its own entry because the `args` list within one entry is ANDed, so two request values need two rules."
     },
     {
       "names": [
@@ -16,7 +55,7 @@
       ],
       "action": "SCMP_ACT_ERRNO",
       "errnoRet": 1,
-      "comment": "Block cross-process memory access to prevent SYS_PTRACE abuse — a compromised process could otherwise read/write another process's memory."
+      "comment": "Block the bulk cross-process memory interfaces. NOTE: on its own this is NOT what makes --cap-add=SYS_PTRACE safe — PTRACE_PEEKDATA/POKEDATA read and write another process's memory without touching process_vm_*, so an earlier version of this comment (and of SECURITY.md) overstated the guarantee. The actual control is the PTRACE_ATTACH/SEIZE deny above, which removes the ability to get a handle on a process you did not fork in the first place. This rule remains as defence in depth."
     },
     {
       "names": [
@@ -85,7 +124,19 @@
         "modify_ldt",
         "create_module",
         "get_kernel_syms",
-        "query_module"
+        "query_module",
+        "umount",
+        "name_to_handle_at",
+        "uselib",
+        "ustat",
+        "sysfs",
+        "_sysctl",
+        "syslog",
+        "fanotify_init",
+        "mbind",
+        "move_pages",
+        "set_mempolicy",
+        "get_mempolicy"
       ],
       "action": "SCMP_ACT_ERRNO",
       "errnoRet": 1,

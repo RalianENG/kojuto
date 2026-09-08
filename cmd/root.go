@@ -23,6 +23,7 @@ import (
 	"github.com/RalianENG/kojuto/internal/downloader"
 	"github.com/RalianENG/kojuto/internal/probe"
 	"github.com/RalianENG/kojuto/internal/report"
+	"github.com/RalianENG/kojuto/internal/safeout"
 	"github.com/RalianENG/kojuto/internal/sandbox"
 	"github.com/RalianENG/kojuto/internal/types"
 )
@@ -410,6 +411,19 @@ func runBatchScan(_ []string) error {
 	return runPerPackageScan(deps, ecosystem)
 }
 
+// dumpInstallDiagnostics writes both halves of a failed install's captured
+// output to stderr so the caller can see WHY pip exited non-zero. pip's
+// stdout carries the "Successfully installed ..." verdict (or an empty
+// tail on early failure); the strace parser consumes stderr but keeps
+// the last few KiB of non-strace lines in DiagnosticStderr — that is
+// where pip's actual error traceback lives.
+func dumpInstallDiagnostics(stdout []byte, stderrTail string) {
+	dumpUntrusted("Install stdout", stdout)
+	if stderrTail != "" {
+		dumpUntrusted("Install stderr (non-strace tail)", []byte(stderrTail))
+	}
+}
+
 // runBatchScreening installs all packages in a single sandbox and monitors for suspicious activity.
 func runBatchScreening(deps []depfile.Dep, ecosystem string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), flagTimeout)
@@ -466,7 +480,7 @@ func runBatchScreening(deps []depfile.Dep, ecosystem string) (string, error) {
 	}
 	installOut, installErr := cp.StartAndInstall(ctx, sb.ContainerID(), installCmd)
 	if installErr != nil {
-		fmt.Fprintf(os.Stderr, "[!] Install output:\n%s\n", string(installOut))
+		dumpInstallDiagnostics(installOut, cp.DiagnosticStderr())
 		return "", fmt.Errorf("batch install failed: %w", installErr)
 	}
 	installPhase.end()
@@ -798,7 +812,7 @@ func runLocalScan(_ []string) error {
 	phaseInfo("scanning", fmt.Sprintf("%s (%s)", pkg, ecosystem))
 
 	flagEcosystem = ecosystem
-	flagVersion = downloaderDetectVersion(dlDir, pkg)
+	flagVersion = acceptDetectedVersion(pkg, downloaderDetectVersion(dlDir, pkg))
 
 	// For npm local packages, we need to create a node_modules structure
 	// from the .tgz so the sandbox can run npm install with lifecycle scripts.
@@ -962,7 +976,7 @@ func downloadPackage(ctx context.Context, pkg string) (string, []types.SyscallEv
 	}
 
 	if flagVersion == "" {
-		flagVersion = downloaderDetectVersion(dlDir, pkg)
+		flagVersion = acceptDetectedVersion(pkg, downloaderDetectVersion(dlDir, pkg))
 	}
 
 	return dlDir, dlEvents, nil
@@ -1072,7 +1086,7 @@ func runEBPFProbe(ctx context.Context, sb *sandbox.Sandbox, _ string) (*scanResu
 	installOut, installErr := sb.InstallPackage(ctx)
 	if installErr != nil {
 		_ = ep.Close()
-		fmt.Fprintf(os.Stderr, "[!] Install output:\n%s\n", string(installOut))
+		dumpUntrusted("Install output", installOut)
 		return nil, fmt.Errorf("install failed: %w", installErr)
 	}
 	installPhase.end()
@@ -1099,7 +1113,13 @@ func runEBPFProbe(ctx context.Context, sb *sandbox.Sandbox, _ string) (*scanResu
 			defer importWG.Done()
 			label := osNames[i%len(osNames)]
 			if out, importErr := sb.Exec(ctx, cmd); importErr != nil {
-				fmt.Fprintf(os.Stderr, "[!] Import (%s) failed (non-fatal): %v\n%s\n", label, importErr, string(out))
+				fmt.Fprintf(os.Stderr, "[!] Import (%s) failed (non-fatal): %v\n", label, importErr)
+				// dumpUntrusted, not %s: this is the package's own output,
+				// relayed from inside the sandbox, and it reaches the same
+				// stream as the verdict block. The per-OS startPhase that
+				// main had here is gone on purpose — the three imports now
+				// share the one outer phase timer above.
+				dumpUntrusted("Import output", out)
 			}
 		}(i, cmd)
 	}
@@ -1119,7 +1139,7 @@ func runEBPFProbe(ctx context.Context, sb *sandbox.Sandbox, _ string) (*scanResu
 	return &scanResult{
 		events:      events,
 		method:      ep.Method(),
-		lostSamples: ep.LostSamples,
+		lostSamples: ep.LostSamples(),
 		dropped:     ep.Dropped(),
 	}, nil
 }
@@ -1163,7 +1183,7 @@ func runContainerStraceProbe(ctx context.Context, sb *sandbox.Sandbox, _ string)
 	}
 	installOut, err := cp.StartAndInstall(ctx, sb.ContainerID(), installCmd)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[!] Install output:\n%s\n", string(installOut))
+		dumpUntrusted("Install output", installOut)
 
 		return nil, fmt.Errorf("install failed: %w", err)
 	}
@@ -1202,7 +1222,7 @@ func installAndCollect(ctx context.Context, sb *sandbox.Sandbox, _ string, p pro
 
 	installOut, err := sb.InstallPackage(ctx)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[!] Install output:\n%s\n", string(installOut))
+		dumpUntrusted("Install output", installOut)
 
 		return nil, fmt.Errorf("install failed: %w", err)
 	}
@@ -1326,4 +1346,51 @@ func findDockerfile() string {
 	}
 
 	return "Dockerfile.sandbox"
+}
+
+// dumpUntrusted prints a labeled block of output that originated inside
+// the sandbox — pip/npm stdout, a package's stderr, the non-strace tail of
+// a failed install — to the same stderr stream that carries kojuto's own
+// verdict block.
+//
+// The content is attacker-controlled by construction, so it goes through
+// safeout.WriteStream rather than %s. A package that emitted raw ANSI here
+// could otherwise move the cursor up and overwrite the "SUSPICIOUS" line
+// kojuto prints seconds later, or clear the screen outright — making the
+// scanner's own diagnostics the last step of the evasion. report.WriteJSON
+// has escaped these bytes on the JSON path since it was written; this
+// closes the same hole on the human-facing path.
+func dumpUntrusted(label string, body []byte) {
+	if len(body) == 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[!] %s:\n", label)
+	if _, err := safeout.WriteStream(os.Stderr, body); err != nil {
+		fmt.Fprintf(os.Stderr, "    (output suppressed: %v)\n", err)
+		return
+	}
+	fmt.Fprintln(os.Stderr)
+}
+
+// acceptDetectedVersion returns v when it is a well-formed version string
+// and "" otherwise.
+//
+// DetectVersion derives its result from a downloaded filename. In --local
+// mode that filename is chosen by whoever supplied the sample, so it can
+// carry any byte the filesystem allows — including the ANSI escapes that
+// would otherwise reach the terminal through the verdict block, which
+// renders "name@version" verbatim. The package name is already validated at
+// the boundary; this closes the version half of the same input. Registry
+// downloads are constrained by the index and will not trip it, so running
+// both paths through one guard costs nothing.
+func acceptDetectedVersion(pkg, v string) string {
+	if v == "" {
+		return ""
+	}
+	if err := downloaderValidate(pkg, v); err != nil {
+		fmt.Fprintf(os.Stderr, "  %s ignoring malformed detected version %q\n",
+			styleYellowBold("!"), safeout.String(v))
+		return ""
+	}
+	return v
 }
