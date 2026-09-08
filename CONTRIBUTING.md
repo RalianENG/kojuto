@@ -86,6 +86,11 @@ docs: update README with new flag documentation
 ## Code Style
 
 - Run `golangci-lint run ./...` — CI enforces zero warnings
+- On macOS or Windows, also run `GOOS=linux golangci-lint run ./...`. The eBPF
+  probe and the host-level strace fallback (`internal/probe/probe.go`,
+  `detect.go`, `fallback.go`, `pidns_linux.go`) sit behind `//go:build linux`,
+  so a native run does not analyze them **at all** — it reports a clean tree
+  while CI, which lints on Linux, fails on findings you never saw
 - Keep functions under 100 lines (enforced by `funlen` linter)
 - Prefer `errors.New` over `fmt.Errorf` for static error strings
 - Use `context.TODO()` instead of `nil` context
