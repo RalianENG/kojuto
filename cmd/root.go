@@ -522,7 +522,11 @@ func runBatchScreening(deps []depfile.Dep, ecosystem string) (string, error) {
 // A non-fatal error from any single OS-identity import is logged and its
 // (possibly partial) event stream is still merged — same behavior as the
 // prior sequential loop, just wall-clock ~3x faster on typical scans.
-func runImportsParallel(ctx context.Context, containerID string, importCmds [][]string, osNames []string) ([]types.SyscallEvent, uint64) {
+// The results are named because the two of them — a slice and a bare
+// counter — are indistinguishable at a call site otherwise, which is
+// what gocritic's unnamedResult check is pointing at. Returns stay
+// explicit rather than naked.
+func runImportsParallel(ctx context.Context, containerID string, importCmds [][]string, osNames []string) (events []types.SyscallEvent, dropped uint64) {
 	type slot struct {
 		events  []types.SyscallEvent
 		dropped uint64
@@ -545,8 +549,6 @@ func runImportsParallel(ctx context.Context, containerID string, importCmds [][]
 	}
 	wg.Wait()
 
-	var events []types.SyscallEvent
-	var dropped uint64
 	for i, r := range results {
 		if r.err != nil {
 			label := osNames[i%len(osNames)]
