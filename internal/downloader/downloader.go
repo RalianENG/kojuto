@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/RalianENG/kojuto/internal/probe"
+	"github.com/RalianENG/kojuto/internal/safeout"
 	"github.com/RalianENG/kojuto/internal/sandbox"
 	"github.com/RalianENG/kojuto/internal/types"
 )
@@ -151,7 +152,7 @@ func DownloadAll(ctx context.Context, targets []string, destDir string) ([]types
 	args := append([]string{"pip"}, pypiDownloadArgs()...)
 	args = append(args, targets...)
 	out, events, err := runInSandbox(ctx, destDir, args)
-	os.Stderr.Write(out)
+	echoSandboxOutput(out)
 	if err != nil {
 		return events, fmt.Errorf("pip download failed: %w", err)
 	}
@@ -167,7 +168,7 @@ func downloadPyPI(ctx context.Context, pkg, version, destDir string) (string, []
 	args := append([]string{"pip"}, pypiDownloadArgs()...)
 	args = append(args, target)
 	out, events, err := runInSandbox(ctx, destDir, args)
-	os.Stderr.Write(out)
+	echoSandboxOutput(out)
 	if err != nil {
 		return "", events, fmt.Errorf("pip download failed: %w", err)
 	}
@@ -204,7 +205,7 @@ func DownloadAllNpm(ctx context.Context, deps map[string]string, destDir string)
 		return nil, err
 	}
 	out, events, err := runInSandbox(ctx, destDir, []string{"npm", "install", "--ignore-scripts"})
-	os.Stderr.Write(out)
+	echoSandboxOutput(out)
 	if err != nil {
 		return events, fmt.Errorf("npm install (batch staging) failed: %w", err)
 	}
@@ -228,7 +229,7 @@ func downloadNpm(ctx context.Context, pkg, version, destDir string) (string, []t
 	}
 
 	out, events, err := runInSandbox(ctx, destDir, []string{"npm", "install", "--ignore-scripts"})
-	os.Stderr.Write(out)
+	echoSandboxOutput(out)
 	if err != nil {
 		return "", events, fmt.Errorf("npm install (sandbox staging) failed: %w", err)
 	}
@@ -336,4 +337,15 @@ func DetectNpmVersion(destDir string) string {
 	}
 
 	return parsed.Version
+}
+
+// echoSandboxOutput relays pip/npm output from inside the sandbox to the
+// user's terminal with terminal-steering control bytes rendered inert.
+//
+// The write error is discarded on purpose: stderr is a best-effort
+// narration channel here, and there is nothing useful to do when it is
+// closed or full — the scan's real result travels through the report and
+// the exit code.
+func echoSandboxOutput(b []byte) {
+	_, _ = safeout.WriteStream(os.Stderr, b)
 }
