@@ -80,14 +80,31 @@ linters:
     gocyclo:
       min-complexity: 20
     gosec:
+      # The severity gate, not the rule list, was doing the filtering here:
+      # at `severity: high` every Medium rule is dropped before exclusions are
+      # consulted, which left most of the old blanket exclude list as dead
+      # configuration. Running at Medium turns the file-permission rules back
+      # on — the class that matters most for a tool whose staging directories
+      # are bind-mounted into containers, where a stray world-writable mode
+      # lets any local account inject a package into a scan in progress.
+      # The Medium findings that remain are deliberate and are excluded
+      # per-path under `exclusions.rules`, with the reason recorded there.
       excludes:
+        # G204 (subprocess launched with variable) is inherent: kojuto exists
+        # to run docker/pip/npm with arguments derived from user input. Every
+        # such site builds an argv slice — no shell is involved — and package
+        # names are validated at the boundary by downloader.ValidatePackage.
         - G204
+        # G304 (file inclusion via variable): reading the path the user named
+        # on the command line (--config, --local, -f) is the feature.
         - G304
-        - G301
-        - G306
+        # G115 (integer conversion overflow): PID and port conversions between
+        # the kernel ABI uint32/uint16 and Go ints.
         - G115
+        # G104 (unhandled errors): errcheck covers this with better
+        # configuration, including the deliberate-discard exemptions.
         - G104
-      severity: high
+      severity: medium
       confidence: medium
     govet:
       enable-all: true
@@ -158,6 +175,22 @@ linters:
           - gocritic
           - wrapcheck
         path: _test\.go
+      - linters:
+          - gosec
+        # Test fixtures write throwaway files with conventional modes.
+        path: _test\.go
+      - linters:
+          - gosec
+        # G301/G306: these specific writes MUST be readable, and the staging
+        # directory traversable, by the sandbox container’s dev user, which runs
+        # as UID 1000 and is not the host UID — the seccomp profile, the
+        # /.dockerenv mask, the staging package.json, and the copied tarball.
+        # Each site carries a comment explaining the mode it picks. Scoped to
+        # these files rather than excluded globally, so an unintended
+        # world-readable or world-writable write in any NEW location still
+        # fails the build.
+        text: "G30(1|6)"
+        path: (cmd/root\.go|internal/downloader/downloader\.go|internal/sandbox/sandbox(_download)?\.go)
       - linters:
           - errcheck
           - unused
