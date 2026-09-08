@@ -6,8 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -23,34 +23,17 @@ const (
 	testReqFile     = "requirements.txt"
 )
 
-// TestHelperProcess is used by fakeExecCommand to mock external commands.
-func TestHelperProcess(_ *testing.T) {
-	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
-		return
+// fakeInstallLocalNpm stands in for downloader.InstallLocalNpm, which in
+// production drives a real DownloadSandbox. It creates the node_modules
+// directory the caller expects so prepareLocalNpm can be exercised without
+// Docker. The subprocess-based fakeExecCommand helper it replaced existed
+// only to mock the host-side `npm install` that prepareLocalNpm used to
+// run; that call now happens inside the download sandbox instead.
+func fakeInstallLocalNpm(_ context.Context, stagingDir string) ([]types.SyscallEvent, error) {
+	if err := os.MkdirAll(filepath.Join(stagingDir, "node_modules"), 0o755); err != nil {
+		return nil, err
 	}
-	// npm install --ignore-scripts → create node_modules dir if dir is set
-	args := os.Args
-	for i, arg := range args {
-		if arg == "--" {
-			args = args[i+1:]
-			break
-		}
-	}
-	if len(args) >= 1 && args[0] == "npm" {
-		// Create node_modules in cwd for npm install mock
-		if dir := os.Getenv("GO_HELPER_DIR"); dir != "" {
-			os.MkdirAll(filepath.Join(dir, "node_modules"), 0o755)
-		}
-	}
-	os.Exit(0)
-}
-
-func fakeExecCommand(ctx context.Context, name string, args ...string) *exec.Cmd {
-	cs := []string{"-test.run=TestHelperProcess", "--", name}
-	cs = append(cs, args...)
-	cmd := exec.CommandContext(ctx, os.Args[0], cs...)
-	cmd.Env = []string{"GO_WANT_HELPER_PROCESS=1"}
-	return cmd
+	return nil, nil
 }
 
 // saveAndRestoreFlags saves all global flags and restores them after the test.
@@ -87,7 +70,7 @@ func saveAndRestoreDeps(t *testing.T) {
 	origSandboxNew := sandboxNew
 	origSandboxEnsure := sandboxEnsureImage
 	origDepfile := depfileParse
-	origExec := execCommandCmd
+	origInstallLocalNpm := downloaderInstallLocalNpm
 	t.Cleanup(func() {
 		downloaderDownload = origDownload
 		downloaderValidate = origValidate
@@ -95,7 +78,7 @@ func saveAndRestoreDeps(t *testing.T) {
 		sandboxNew = origSandboxNew
 		sandboxEnsureImage = origSandboxEnsure
 		depfileParse = origDepfile
-		execCommandCmd = origExec
+		downloaderInstallLocalNpm = origInstallLocalNpm
 	})
 }
 
@@ -430,7 +413,7 @@ func TestRunLocalScan_NpmAutoDetect(t *testing.T) {
 	flagTimeout = 5 * time.Second
 
 	downloaderDetectVersion = func(_, _ string) string { return testVersion }
-	execCommandCmd = fakeExecCommand
+	downloaderInstallLocalNpm = fakeInstallLocalNpm
 
 	// prepareLocalNpm will fail because no real tgz.
 	err := runLocalScan(nil)
@@ -484,7 +467,10 @@ func TestPrepareLocalNpm_NoTgz(t *testing.T) {
 	// No .tgz file in directory.
 	os.WriteFile(filepath.Join(dir, "readme.md"), []byte("hello"), 0o644)
 
-	_, err := prepareLocalNpm(dir, "pkg")
+	st, err := prepareLocalNpm(context.Background(), dir, "pkg")
+	if st.root != "" {
+		defer os.RemoveAll(st.root)
+	}
 	if err == nil {
 		t.Fatal("expected error for no .tgz")
 	}
@@ -494,7 +480,10 @@ func TestPrepareLocalNpm_NoTgz(t *testing.T) {
 }
 
 func TestPrepareLocalNpm_BadDir(t *testing.T) {
-	_, err := prepareLocalNpm("/nonexistent/dir", "pkg")
+	st, err := prepareLocalNpm(context.Background(), "/nonexistent/dir", "pkg")
+	if st.root != "" {
+		defer os.RemoveAll(st.root)
+	}
 	if err == nil {
 		t.Fatal("expected error for nonexistent dir")
 	}
@@ -507,16 +496,16 @@ func TestPrepareLocalNpm_Success(t *testing.T) {
 	tgzPath := filepath.Join(dir, "mypkg-1.0.0.tgz")
 	os.WriteFile(tgzPath, []byte("fake"), 0o644)
 
-	execCommandCmd = fakeExecCommand
+	downloaderInstallLocalNpm = fakeInstallLocalNpm
 
-	stagingDir, err := prepareLocalNpm(dir, "mypkg")
+	st, err := prepareLocalNpm(context.Background(), dir, "mypkg")
 	if err != nil {
 		t.Fatalf("prepareLocalNpm failed: %v", err)
 	}
-	defer os.RemoveAll(stagingDir)
+	defer os.RemoveAll(st.root)
 
 	// Verify package.json was created in staging dir.
-	pkgJSON, readErr := os.ReadFile(filepath.Join(stagingDir, "package.json"))
+	pkgJSON, readErr := os.ReadFile(filepath.Join(st.dir, "package.json"))
 	if readErr != nil {
 		t.Fatalf("reading staging package.json: %v", readErr)
 	}
@@ -528,6 +517,59 @@ func TestPrepareLocalNpm_Success(t *testing.T) {
 
 	if parsed["name"] != "kojuto-local-staging" {
 		t.Errorf("name = %v, want kojuto-local-staging", parsed["name"])
+	}
+
+	// The dependency spec must be relative. The staging dir is bind-mounted
+	// at /out inside the download sandbox, so the absolute host path the
+	// previous host-side implementation emitted would not resolve there.
+	deps, ok := parsed["dependencies"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("dependencies missing or wrong shape: %#v", parsed["dependencies"])
+	}
+	if got := deps["mypkg"]; got != "file:./mypkg-1.0.0.tgz" {
+		t.Errorf("dependency spec = %v, want file:./mypkg-1.0.0.tgz", got)
+	}
+
+	// The tarball must be copied into the staging dir for that relative
+	// spec to resolve inside the container.
+	if _, statErr := os.Stat(filepath.Join(st.dir, "mypkg-1.0.0.tgz")); statErr != nil {
+		t.Errorf("tarball not staged into mount dir: %v", statErr)
+	}
+}
+
+// TestPrepareLocalNpm_StagingParentIsPrivate pins the containment invariant
+// behind the staging layout. DownloadSandbox relaxes the directory it
+// bind-mounts to 0o777 (the container runs as UID 1000, not the host UID),
+// so the staging dir must sit below a parent no other account can traverse.
+// The previous implementation chmod'd the top-level MkdirTemp directory
+// itself, leaving a world-writable directory in the system temp directory
+// where any local user could drop an extra tarball into the scan.
+func TestPrepareLocalNpm_StagingParentIsPrivate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not meaningful on Windows")
+	}
+	saveAndRestoreDeps(t)
+
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "mypkg-1.0.0.tgz"), []byte("fake"), 0o644)
+	downloaderInstallLocalNpm = fakeInstallLocalNpm
+
+	st, err := prepareLocalNpm(context.Background(), dir, "mypkg")
+	if err != nil {
+		t.Fatalf("prepareLocalNpm failed: %v", err)
+	}
+	defer os.RemoveAll(st.root)
+
+	if filepath.Dir(st.dir) != st.root {
+		t.Fatalf("staging dir %q is not directly below root %q", st.dir, st.root)
+	}
+
+	info, statErr := os.Stat(st.root)
+	if statErr != nil {
+		t.Fatalf("stat staging root: %v", statErr)
+	}
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		t.Errorf("staging root perms = %#o, want no group/other access", perm)
 	}
 }
 
