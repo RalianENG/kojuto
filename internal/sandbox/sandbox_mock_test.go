@@ -169,14 +169,19 @@ func TestContainerArgs(t *testing.T) {
 		"--read-only",
 		"--cap-drop=ALL",
 		"--cap-add=SYS_PTRACE", // needsPtrace=true
+		// strace runs as root and drops the tracee to dev (`strace -u`).
+		"--cap-add=SETUID",
+		"--cap-add=SETGID",
 		SandboxImage,
 		"sleep",
 		// Package-manager caches must be pinned outside /home/ so the
 		// persistence backstop can stay strict (any /home/ write is
 		// illegitimate). See containerArgs cache-redirect block.
-		"--tmpfs=/var/cache/kojuto:",
-		"--env=NPM_CONFIG_CACHE=/var/cache/kojuto/npm",
-		"--env=PIP_CACHE_DIR=/var/cache/kojuto/pip",
+		"--tmpfs=" + sb.scaffold().cacheDir + ":",
+		"--env=NPM_CONFIG_CACHE=" + sb.scaffold().cacheDir + "/npm",
+		"--env=PIP_CACHE_DIR=" + sb.scaffold().cacheDir + "/pip",
+		// The Node audit hook is loaded from the scaffold dir.
+		"--env=NODE_OPTIONS=--require " + sb.scaffold().requireHook,
 		// Identifies the container as kojuto-managed so
 		// CleanupStaleSandboxContainers can sweep orphans without
 		// disturbing unrelated Docker workloads.
@@ -188,7 +193,7 @@ func TestContainerArgs(t *testing.T) {
 		// kojuto's probe scripts and resolver live on their own
 		// root-owned tmpfs, outside every path the audit hook counts as
 		// user code.
-		"--tmpfs=" + probeScriptDir + ":",
+		"--tmpfs=" + sb.scaffold().dir + ":",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("containerArgs missing %q in:\n%s", want, joined)
@@ -225,6 +230,16 @@ func TestContainerArgs_NoPtrace(t *testing.T) {
 	joined := strings.Join(args, " ")
 	if strings.Contains(joined, "SYS_PTRACE") {
 		t.Error("SYS_PTRACE should not be present when needsPtrace=false")
+	}
+	if strings.Contains(joined, "SETUID") || strings.Contains(joined, "SETGID") {
+		t.Error("SETUID/SETGID should not be present when needsPtrace=false")
+	}
+	// Setup still needs CHOWN/FOWNER in eBPF / host-strace mode: without
+	// them root cannot chown the honeypots to dev and the scan aborts.
+	for _, want := range []string{"--cap-add=CHOWN", "--cap-add=FOWNER"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("%s missing when needsPtrace=false; sandbox setup would fail", want)
+		}
 	}
 
 	if sb.seccompDir != "" {

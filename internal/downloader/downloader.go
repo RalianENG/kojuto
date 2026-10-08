@@ -177,13 +177,21 @@ func downloadPyPI(ctx context.Context, pkg, version, destDir string) (string, []
 	return dir, events, err
 }
 
+// stagingProjectName names the staging manifest. The staging directory
+// ends up mounted inside the sandbox, so the name is visible to the scanned
+// package; "app" is what countless real projects are called, so testing for
+// it singles out nothing. Exported for the --local npm staging in cmd.
+const StagingProjectName = stagingProjectName
+
+const stagingProjectName = "app"
+
 // writeStagingPackageJSON writes a minimal staging package.json into destDir
 // with the given dependency set. destDir is bind-mounted into the download
 // sandbox, so npm install inside the container picks this up as the project
 // manifest.
 func writeStagingPackageJSON(destDir string, deps map[string]string) error {
 	pkgData := map[string]interface{}{
-		"name":         "kojuto-staging",
+		"name":         stagingProjectName,
 		"private":      true,
 		"dependencies": deps,
 	}

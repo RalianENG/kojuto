@@ -75,7 +75,7 @@ func TestParseState_CreatedPathCeilingFlagsOverflow(t *testing.T) {
 // emitted is seeded rather than driven up with 250k real lines: the guard is
 // what is under test, not the size of the constant.
 func TestContainerStrace_EventCapStopsRetaining(t *testing.T) {
-	c := NewContainerStrace()
+	c := NewContainerStrace(types.ScanMarkers{})
 	c.emitted = MaxProbeEvents
 
 	drained := make(chan int)
@@ -106,7 +106,7 @@ func TestContainerStrace_EventCapStopsRetaining(t *testing.T) {
 // TestContainerStrace_UnderCapStillDelivers guards against the cap check
 // swallowing normal traffic.
 func TestContainerStrace_UnderCapStillDelivers(t *testing.T) {
-	c := NewContainerStrace()
+	c := NewContainerStrace(types.ScanMarkers{})
 
 	drained := make(chan []types.SyscallEvent)
 	go func() {

@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -88,7 +89,7 @@ func TestInstallCommand_PyPI(t *testing.T) {
 }
 
 func TestInstallCommand_Npm(t *testing.T) {
-	// npm install stages its script to /var/cache/kojuto/install.sh via
+	// npm install stages its script into the scan's cache dir via
 	// dockerWriteFile, so execCommand needs to be intercepted. The script
 	// itself is exercised directly via TestNpmLifecycleScript_*.
 	var stagedScript string
@@ -109,8 +110,8 @@ func TestInstallCommand_Npm(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InstallCommand: %v", err)
 	}
-	if len(cmd) != 2 || cmd[0] != "sh" || cmd[1] != installScriptPath {
-		t.Fatalf("InstallCommand = %v, want [sh %s] (file-based to avoid sh -c FP)", cmd, installScriptPath)
+	if len(cmd) != 2 || cmd[0] != "sh" || cmd[1] != sb.scaffold().installScript {
+		t.Fatalf("InstallCommand = %v, want [sh %s] (file-based to avoid sh -c FP)", cmd, sb.scaffold().installScript)
 	}
 
 	// Script content is exercised directly: lifecycle hooks must fire.
@@ -254,7 +255,10 @@ func TestFaketimeEnv(t *testing.T) {
 	hasPreload := false
 	hasFaketime := false
 	for _, e := range env {
-		if strings.HasPrefix(e, "FAKETIME=+") && strings.HasSuffix(e, "d") {
+		// "+<days>d x<speed>": the offset fires date-gated payloads, the
+		// rate shortens sleep-gated ones (libfaketime scales waits only
+		// when a rate is set).
+		if strings.HasPrefix(e, "FAKETIME=+") && strings.HasSuffix(e, fmt.Sprintf("d x%d", faketimeSpeed)) {
 			hasFaketime = true
 		}
 		if strings.HasPrefix(e, "LD_PRELOAD") {
@@ -266,7 +270,7 @@ func TestFaketimeEnv(t *testing.T) {
 		t.Error("expected LD_PRELOAD in faketimeEnv")
 	}
 	if !hasFaketime {
-		t.Error("expected FAKETIME=+Nd in faketimeEnv")
+		t.Error("expected FAKETIME=+Nd x<speed> in faketimeEnv")
 	}
 }
 
@@ -339,8 +343,8 @@ func TestSetLocalMode_InstallCommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InstallCommand: %v", err)
 	}
-	if len(cmd) != 2 || cmd[0] != "sh" || cmd[1] != installScriptPath {
-		t.Fatalf("InstallCommand = %v, want [sh %s]", cmd, installScriptPath)
+	if len(cmd) != 2 || cmd[0] != "sh" || cmd[1] != sb.scaffold().installScript {
+		t.Fatalf("InstallCommand = %v, want [sh %s]", cmd, sb.scaffold().installScript)
 	}
 }
 
@@ -368,8 +372,8 @@ func TestInstallAllCommand_PyPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InstallAllCommand: %v", err)
 	}
-	if len(cmd) != 2 || cmd[0] != "sh" || cmd[1] != installScriptPath {
-		t.Fatalf("InstallAllCommand = %v, want [sh %s] (script-based to bypass pip resolver)", cmd, installScriptPath)
+	if len(cmd) != 2 || cmd[0] != "sh" || cmd[1] != sb.scaffold().installScript {
+		t.Fatalf("InstallAllCommand = %v, want [sh %s] (script-based to bypass pip resolver)", cmd, sb.scaffold().installScript)
 	}
 	if dockerCalls == 0 {
 		t.Error("stageInstallScript did not invoke docker to write the script")
@@ -391,8 +395,8 @@ func TestInstallAllCommand_Npm(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InstallAllCommand: %v", err)
 	}
-	if len(cmd) != 2 || cmd[0] != "sh" || cmd[1] != installScriptPath {
-		t.Fatalf("InstallAllCommand = %v, want [sh %s]", cmd, installScriptPath)
+	if len(cmd) != 2 || cmd[0] != "sh" || cmd[1] != sb.scaffold().installScript {
+		t.Fatalf("InstallAllCommand = %v, want [sh %s]", cmd, sb.scaffold().installScript)
 	}
 
 	// Script content is exercised directly.
@@ -1009,14 +1013,14 @@ func TestStartPaused_RollbackOnPrepareFailure(t *testing.T) {
 // instrumenting itself. sitecustomize.py's _USER_PREFIXES marks the paths
 // whose frames count as "the scanned package or other user-controllable
 // code"; a compile/exec from such a frame is wired to the analyzer with the
-// "+" marker, which deliberately bypasses the path-based benign filter that
-// already lists "_kojuto_probe_". While the probe scripts lived in /tmp/ that
+// "+" marker, which deliberately bypasses the path-based benign filter (the
+// one that exempts the scaffold directory). While the probe scripts lived in /tmp/ that
 // bypass applied to kojuto's own scripts: a 100-package PyPI measurement
 // found 30,788 of 46,031 dynamic_code_execution events came from the probes
 // themselves, burying real payload execs under kojuto's noise.
 //
 // The test reads the prefix list out of the hook source rather than
-// duplicating it, so adding a prefix that swallows probeScriptDir fails here
+// duplicating it, so adding a prefix that swallows the scaffold dir fails here
 // instead of silently restoring the noise.
 func TestProbeScriptDirIsOutsideAuditUserPrefixes(t *testing.T) {
 	src, err := os.ReadFile(filepath.Join("hooks", "sitecustomize.py"))
@@ -1040,20 +1044,22 @@ func TestProbeScriptDirIsOutsideAuditUserPrefixes(t *testing.T) {
 		t.Fatal("no _USER_PREFIXES literal found in sitecustomize.py — did the hook change shape?")
 	}
 
+	names := newScaffoldNames()
+
 	for _, p := range prefixes {
-		if strings.HasPrefix(probeScriptPrefix, p) {
+		if strings.HasPrefix(names.probe("linux.py"), p) {
 			t.Errorf("probe scripts stage under %q, which sitecustomize.py treats as user code — "+
 				"their compile/exec events will bypass the benign filter", p)
 		}
-		if strings.HasPrefix(resolverScriptPath, p) {
-			t.Errorf("resolver stages under %q, which sitecustomize.py treats as user code", p)
+		if strings.HasPrefix(names.resolver, p) || strings.HasPrefix(names.requireHook, p) {
+			t.Errorf("resolver or require hook stages under %q, which sitecustomize.py treats as user code", p)
 		}
 	}
 
 	// The runtime-appended prefixes are all site-packages paths for the
 	// scanned distributions; staying out of that tree matters just as much.
-	if strings.Contains(probeScriptDir, "site-packages") {
-		t.Errorf("probeScriptDir = %q must not live in site-packages", probeScriptDir)
+	if strings.Contains(names.dir, "site-packages") {
+		t.Errorf("scaffold dir = %q must not live in site-packages", names.dir)
 	}
 }
 
@@ -1078,18 +1084,18 @@ func TestStartSyntheticResolver_StagesAndWaits(t *testing.T) {
 		t.Fatalf("expected stage + launch + readiness check, got %d calls: %q", len(calls), calls)
 	}
 	staged := strings.Join(calls[0], " ")
-	if !strings.Contains(staged, "cat > '"+resolverScriptPath+"'") {
-		t.Errorf("resolver not staged at %s: %q", resolverScriptPath, staged)
+	if !strings.Contains(staged, "cat > '"+sb.scaffold().resolver+"'") {
+		t.Errorf("resolver not staged at %s: %q", sb.scaffold().resolver, staged)
 	}
 	launch := strings.Join(calls[1], " ")
-	for _, want := range []string{"-d", "--user=root", python3Bin + " '" + resolverScriptPath + "'"} {
+	for _, want := range []string{"-d", "--user=root", python3Bin + " '" + sb.scaffold().resolver + "' '" + sb.scaffold().resolverReady + "'"} {
 		if !strings.Contains(launch, want) {
 			t.Errorf("launch command missing %q: %q", want, launch)
 		}
 	}
 	ready := strings.Join(calls[2], " ")
-	if !strings.Contains(ready, "test -f "+resolverReadyPath) {
-		t.Errorf("readiness check missing %s: %q", resolverReadyPath, ready)
+	if !strings.Contains(ready, "test -f "+sb.scaffold().resolverReady) {
+		t.Errorf("readiness check missing %s: %q", sb.scaffold().resolverReady, ready)
 	}
 }
 

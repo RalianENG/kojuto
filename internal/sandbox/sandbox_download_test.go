@@ -38,9 +38,9 @@ func TestDownloadSandbox_CreateArgs(t *testing.T) {
 		// the download exits non-zero. Mirrors the analysis sandbox.
 		"--cap-add=SYS_PTRACE",
 		"--pids-limit=256",
-		"--tmpfs=/var/cache/kojuto:",
-		"--env=NPM_CONFIG_CACHE=/var/cache/kojuto/npm",
-		"--env=PIP_CACHE_DIR=/var/cache/kojuto/pip",
+		"--tmpfs=" + d.cacheDir + ":",
+		"--env=NPM_CONFIG_CACHE=" + d.cacheDir + "/npm",
+		"--env=PIP_CACHE_DIR=" + d.cacheDir + "/pip",
 		"/host/staging:" + DownloadOutMountPath,
 		SandboxImage,
 		"sleep",

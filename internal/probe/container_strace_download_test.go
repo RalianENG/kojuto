@@ -65,16 +65,16 @@ func TestBuildCommand_DownloadWorkdir(t *testing.T) {
 // TestBuildCommand_NoWorkdirByDefault — the install/import probes leave the
 // working directory at the container default; no --workdir is injected.
 func TestBuildCommand_NoWorkdirByDefault(t *testing.T) {
-	cs := NewContainerStrace()
+	cs := NewContainerStrace(types.ScanMarkers{})
 	cmd := cs.buildCommand(context.Background(), "abc123", []string{"pip", "install", "requests"})
 	for _, a := range cmd.Args {
 		if strings.HasPrefix(a, "--workdir") {
 			t.Errorf("unexpected --workdir in install/import probe args: %v", cmd.Args)
 		}
 	}
-	// exec is immediately followed by the container ID.
-	if cmd.Args[2] != "abc123" {
-		t.Errorf("args[2] = %q, want the container ID %q", cmd.Args[2], "abc123")
+	// exec is followed only by the root/HOME options, then the container ID.
+	if cmd.Args[4] != "abc123" {
+		t.Errorf("args[4] = %q, want the container ID %q", cmd.Args[4], "abc123")
 	}
 }
 
@@ -114,7 +114,7 @@ func TestParseStraceOutput_DownloadStampsPhase(t *testing.T) {
 func TestParseStraceOutput_InstallLeavesPhaseUnset(t *testing.T) {
 	line := `[pid 100] connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("1.2.3.4")}, 16) = 0`
 
-	cs := NewContainerStrace()
+	cs := NewContainerStrace(types.ScanMarkers{})
 	reader := io.NopCloser(strings.NewReader(line))
 	parseDone := make(chan struct{})
 	go cs.parseStraceOutput(reader, parseDone)

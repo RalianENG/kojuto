@@ -59,7 +59,7 @@ An OSS tool that detects suspicious syscalls during package installation and imp
 | Python | PEP 578 `sys.addaudithook()` via `sitecustomize.py` | `compile`, `exec`, `import`, `ctypes.dlopen` | `exec(base64.b64decode(...))`, obfuscated payload execution |
 | Node.js | `--require` preload via `NODE_OPTIONS` | `eval`, `Function`, `vm.runInNewContext`, `vm.runInThisContext`, `vm.Script` | `eval(Buffer.from(...,'base64'))`, `new Function('return process.env.SECRET')` |
 
-Audit hook output is multiplexed with strace output on stderr using a `KOJUTO:` prefix. The parser filters standard library internals (pip, npm, setuptools, frozen modules, dataclass codegen) via filename and snippet heuristics to minimize false positives.
+Audit hook output is multiplexed with strace output on stderr behind a wire prefix that is random per scan (12 uppercase letters and a colon), so no constant identifies these lines; the parser is handed the scan's prefix and ignores any other. The parser filters standard library internals (pip, npm, setuptools, frozen modules, dataclass codegen) via filename and snippet heuristics to minimize false positives.
 
 ### execve Analysis Logic
 
@@ -161,21 +161,23 @@ CLI (cobra)
 ### Import Phase Reality Check
 
 - Python resolves distribution → module name via `importlib.metadata.top_level.txt`, then a file-walk of the installed RECORD, then the canonical name — so packages whose install name differs from their import name (`pillow` → `PIL`, `pyyaml` → `yaml`, `opencv-python` → `cv2`, `python-dateutil` → `dateutil`, `beautifulsoup4` → `bs4`) are actually imported. Node.js tries `require()` first and falls back to dynamic `import()` on `ERR_REQUIRE_ESM`.
-- Each attempt emits `KOJUTO:import_attempt:<dist>:<module>:<result>` to stderr so the analyzer can distinguish "no observable behavior" from "clean behavior".
+- Each attempt emits `<prefix>import_attempt:<dist>:<module>:<result>` to stderr (the same per-scan prefix) so the analyzer can distinguish "no observable behavior" from "clean behavior".
 - Verdict rule: if attempts > 0 and successes == 0 AND no HIGH-severity event was independently observed, the verdict is `inconclusive` — kojuto refuses to claim "clean" on a package whose install-phase or import-phase code never actually ran. HIGH-severity findings (network exfil, credential access, library hijack, binary hijack, dropper, backdoor) still flip the verdict to `suspicious` even when every import failed, so an install-time attack that crashes before import completes is not masked.
 
 ### Time-Shifted Import (libfaketime)
 
-- Import probes run with `LD_PRELOAD=libfaketime.so` and `FAKETIME=+Nd` where N is randomized between 30 and 180
+- Import probes run with `LD_PRELOAD=libfaketime.so` and `FAKETIME=+Nd x100` where N is randomized between 30 and 180
 - Triggers date-gated payloads (e.g. `if datetime.now() > datetime(2026, 5, 1): attack()`)
+- Shortens sleep-gated payloads: libfaketime scales `sleep`/`nanosleep`/`select`/`poll`/`epoll` waits only when a rate (`x<N>`) is set — an offset alone leaves every wait at its real length. At `x100`, Python `time.sleep`/`threading.Event.wait`/`select` and Node `setTimeout`/`Atomics.wait` asked for 10 s all return within 0.2 s, so `sleep(300)` before a payload costs ~3 s rather than outlasting `--timeout`
 - Intercepts `gettimeofday`/`clock_gettime` at libc level — covers Python `datetime.now()`, Node `Date.now()`
 - Install phase uses real time to avoid breaking pip/npm
 
 ### Honeypot Environment Simulation
 
-- Fake credential files planted in container: `~/.ssh/id_rsa`, `~/.aws/credentials`, `~/.git-credentials`, `~/.netrc`, `~/.config/gh/hosts.yml`
-- CI/cloud environment variables injected: `CI=true`, `GITHUB_ACTIONS=true`, `AWS_ACCESS_KEY_ID`, `GITHUB_TOKEN`, `NPM_TOKEN`
-- All tokens and secret values randomly generated per scan via `crypto/rand` to prevent static fingerprinting by malware aware of kojuto source
+- Fake credential files planted in container: `~/.ssh/id_rsa` + `id_rsa.pub`, `~/.aws/credentials`, `~/.git-credentials`, `~/.netrc`, `~/.config/gh/hosts.yml`, alongside the distribution's skeleton dotfiles (`.bashrc`, `.profile`, ...). Files are backdated to random points in the past two years (directories take their newest entry's time), and the home directory is `dev`-owned `0750` like an ordinary account
+- Every value passes the format checks a validator would apply: AWS access key IDs are `AKIA` + 16 base32 characters, secrets are 40 base64 characters, GitHub (`ghp_`, `ghs_`) and npm (`npm_`) tokens carry a valid CRC32 checksum in their last six characters, and the SSH key is a genuine RSA-2048 pair (PKCS#1 private key + matching `ssh-rsa` public key) that is never authorized anywhere
+- CI environment: one provider, consistently — a GitHub Actions job on a self-hosted runner (`CI`, `GITHUB_ACTIONS`, `GITHUB_REPOSITORY`, `GITHUB_RUN_ID`, `GITHUB_SHA`, `GITHUB_TOKEN` as a `ghs_` installation token, `RUNNER_ENVIRONMENT=self-hosted`, ...). Self-hosted is the persona that agrees with the mirrored host: its `RUNNER_NAME` is the host's hostname and `GITHUB_WORKSPACE` the mounted project path. Earlier revisions set GitHub Actions and GitLab CI variables at once, a combination no real job has. Cloud and registry credentials (`AWS_ACCESS_KEY_ID`, `NPM_TOKEN`) are set as well
+- All tokens, keys and run identifiers randomly generated per scan via `crypto/rand` to prevent static fingerprinting by malware aware of kojuto source
 - Triggers credential-harvesting logic that checks for file/env presence before exfiltrating
 
 ---
@@ -201,7 +203,7 @@ CLI (cobra)
 | Hostname | Mirrors the host's actual hostname |
 | Username | Host's actual username reflected in mount path |
 | CPU / Memory | Host's actual values mirrored (with caps) |
-| `/.dockerenv` | Removed on startup |
+| `/.dockerenv` | Masked by bind-mounting an empty regular file over it (the read-only rootfs rules out deleting it). The path still exists, so an existence check still sees it |
 | `/etc/resolv.conf` | Injected via `--dns=127.0.0.53` — systemd-resolved's stub address, so the file reads like an ordinary Ubuntu host. kojuto's synthetic resolver (`internal/sandbox/hooks/resolver.py`) listens there and answers every A query from 203.0.113.0/24 (RFC 5737 TEST-NET-3, never routable). Resolution succeeding is what makes the follow-up `connect()` observable; the connect still returns `ENETUNREACH` under `--network=none`, so no packet leaves the host |
 | Network | `--network=none` returns `ENETUNREACH` on `connect()`; combine with `--runtime runsc` to mask remaining `/proc/1/cgroup` and `/proc/self/mountinfo` signals |
 | Mount path | `/home/<host-user>/projects` (resembles host layout) |
