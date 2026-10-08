@@ -63,7 +63,7 @@ func TestRandHex(t *testing.T) {
 
 func TestFakeAWSKeyID(t *testing.T) {
 	// AKIA + 16 base32 characters (A-Z, 2-7): anything else is a key no
-	// AWS account was ever issued, and trivially recognisable as fake.
+	// AWS account was ever issued, and trivially recognizable as fake.
 	re := regexp.MustCompile(`^AKIA[A-Z2-7]{16}$`)
 	for range 50 {
 		if key := fakeAWSKeyID(); !re.MatchString(key) {
