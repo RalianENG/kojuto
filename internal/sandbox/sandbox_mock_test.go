@@ -234,6 +234,13 @@ func TestContainerArgs_NoPtrace(t *testing.T) {
 	if strings.Contains(joined, "SETUID") || strings.Contains(joined, "SETGID") {
 		t.Error("SETUID/SETGID should not be present when needsPtrace=false")
 	}
+	// Setup still needs CHOWN/FOWNER in eBPF / host-strace mode: without
+	// them root cannot chown the honeypots to dev and the scan aborts.
+	for _, want := range []string{"--cap-add=CHOWN", "--cap-add=FOWNER"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("%s missing when needsPtrace=false; sandbox setup would fail", want)
+		}
+	}
 
 	if sb.seccompDir != "" {
 		os.RemoveAll(sb.seccompDir)
