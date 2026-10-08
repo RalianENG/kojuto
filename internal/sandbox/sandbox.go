@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	_ "embed"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"math/big"
@@ -274,7 +273,11 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 		// kojuto stages but cannot add or replace files here. See
 		// probeScriptDir for why the location matters.
 		"--tmpfs="+probeScriptDir+":nosuid,mode=0755,size=8m",
-		"--tmpfs=/home/dev:nosuid,mode=1777,size=32m",
+		// dev owns its home, as on an ordinary account. It starts
+		// world-writable only because root holds no DAC override here and
+		// has to plant the honeypots first; plantHoneypotFiles closes it to
+		// 0750 once they are in place.
+		"--tmpfs=/home/dev:nosuid,mode=1777,uid=1000,gid=1000,size=32m",
 		// Dedicated cache tmpfs outside HOME. npm and pip are pinned here via
 		// NPM_CONFIG_CACHE / PIP_CACHE_DIR so their legitimate writes (logs,
 		// _cacache, wheel cache) never land under /home/ and never trip the
@@ -354,7 +357,7 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 	// Honeypot environment variables: simulate a CI/developer machine to
 	// trigger environment-gated malware (e.g. "if CI: exfiltrate()").
 	// Fake tokens provoke credential-harvesting code paths.
-	for _, env := range honeypotEnvVars() {
+	for _, env := range honeypotEnvVars(hostUser, hostHostname, s.mountPoint) {
 		args = append(args, "--env="+env)
 	}
 
@@ -732,159 +735,6 @@ func (s *Sandbox) restoreLocalBin(ctx context.Context) error {
 		}
 	}
 
-	return nil
-}
-
-// base62Chars is the character set used by real AWS/GitHub/npm tokens.
-// Using hex-only characters makes honeypot tokens statistically detectable
-// (hex has 16 chars, base62 has 62 — entropy per character differs).
-const base62Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-
-// randBase62 returns n random base62 characters, matching the character
-// distribution of real cloud tokens and API keys.
-func randBase62(n int) string {
-	b := make([]byte, n)
-	for i := range b {
-		idx, err := rand.Int(rand.Reader, big.NewInt(int64(len(base62Chars))))
-		if err != nil {
-			b[i] = base62Chars[0]
-			continue
-		}
-		b[i] = base62Chars[idx.Int64()]
-	}
-	return string(b)
-}
-
-// randHex returns n random hex characters (still used for non-token values).
-func randHex(n int) string {
-	b := make([]byte, (n+1)/2)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)[:n]
-}
-
-// fakeAWSKeyID generates a realistic AWS access key ID.
-// Real format: AKIA + 16 base62 chars (not hex-only).
-func fakeAWSKeyID() string {
-	return "AKIA" + randBase62(16)
-}
-
-// fakeAWSSecret generates a realistic AWS secret access key.
-// Real format: 40 base64-like chars (mixed case + digits + /+).
-func fakeAWSSecret() string {
-	return randBase62(40)
-}
-
-// fakeGitHubToken generates a realistic GitHub PAT.
-// Real format: ghp_ + 36 base62 chars.
-func fakeGitHubToken() string {
-	return "ghp_" + randBase62(36)
-}
-
-// fakeNpmToken generates a realistic npm token.
-// Real format: npm_ + 36 base62 chars.
-func fakeNpmToken() string {
-	return "npm_" + randBase62(36)
-}
-
-// honeypotEnvVars returns environment variables that simulate a CI/developer
-// machine. Malware often gates execution on these signals (e.g. "if CI=true,
-// exfiltrate tokens"). Tokens are randomly generated per scan so that
-// static fingerprinting of known honeypot values is not possible.
-func honeypotEnvVars() []string {
-	return []string{
-		// CI / automation signals.
-		"CI=true",
-		"GITHUB_ACTIONS=true",
-		"GITLAB_CI=true",
-		"BUILD_ID=" + randHex(8),
-		// Fake cloud credentials (random per scan).
-		"AWS_ACCESS_KEY_ID=" + fakeAWSKeyID(),
-		"AWS_SECRET_ACCESS_KEY=" + fakeAWSSecret(),
-		"AWS_DEFAULT_REGION=us-east-1",
-		// Fake developer tokens (random per scan).
-		"GITHUB_TOKEN=" + fakeGitHubToken(),
-		"NPM_TOKEN=" + fakeNpmToken(),
-	}
-}
-
-// plantHoneypotFiles writes realistic-looking but fake credential files into
-// the container. All secret values are randomly generated per scan to prevent
-// static fingerprinting by malware that knows kojuto's source code.
-// When malware reads these via openat, the access is detected by the
-// sensitive-path monitor. If it then tries to exfiltrate the contents,
-// the connect/sendto monitor catches the network activity.
-//
-// Failure here is fatal: a partially-planted set of honeypots leaves the
-// detection contract ("if you read .ssh/id_rsa, you tripped the monitor")
-// unenforceable for the missing files.
-func (s *Sandbox) plantHoneypotFiles(ctx context.Context) error {
-	home := "/home/dev"
-
-	// Generate random credentials for this scan.
-	awsKey := fakeAWSKeyID()
-	awsSecret := fakeAWSSecret()
-	ghToken := fakeGitHubToken()
-	sshKeyBody := randHex(64)
-
-	steps := []func() error{
-		// SSH key pair.
-		func() error { return s.dockerExecRoot(ctx, "mkdir", "-p", home+"/.ssh") },
-		func() error {
-			return s.dockerWriteFile(ctx, home+"/.ssh/id_rsa",
-				"-----BEGIN OPENSSH PRIVATE KEY-----\n"+
-					"b3BlbnNzaC1rZXktdjEAAAAAFAAAAAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5\n"+
-					"AAAAI"+sshKeyBody+"\n"+
-					"-----END OPENSSH PRIVATE KEY-----\n")
-		},
-		func() error { return s.dockerExecRoot(ctx, "chmod", "600", home+"/.ssh/id_rsa") },
-
-		// AWS credentials.
-		func() error { return s.dockerExecRoot(ctx, "mkdir", "-p", home+"/.aws") },
-		func() error {
-			return s.dockerWriteFile(ctx, home+"/.aws/credentials",
-				"[default]\n"+
-					"aws_access_key_id = "+awsKey+"\n"+
-					"aws_secret_access_key = "+awsSecret+"\n")
-		},
-
-		// Git credentials.
-		func() error {
-			return s.dockerWriteFile(ctx, home+"/.git-credentials",
-				"https://dev:"+ghToken+"@github.com\n")
-		},
-		func() error { return s.dockerExecRoot(ctx, "chmod", "600", home+"/.git-credentials") },
-
-		// Netrc.
-		func() error {
-			return s.dockerWriteFile(ctx, home+"/.netrc",
-				"machine github.com\n"+
-					"login dev\n"+
-					"password "+ghToken+"\n")
-		},
-		func() error { return s.dockerExecRoot(ctx, "chmod", "600", home+"/.netrc") },
-
-		// GitHub CLI config.
-		func() error { return s.dockerExecRoot(ctx, "mkdir", "-p", home+"/.config/gh") },
-		func() error {
-			return s.dockerWriteFile(ctx, home+"/.config/gh/hosts.yml",
-				"github.com:\n"+
-					"    oauth_token: "+ghToken+"\n"+
-					"    user: dev\n"+
-					"    git_protocol: https\n")
-		},
-
-		// Fix ownership so the container user (dev) owns the files.
-		func() error {
-			return s.dockerExecRoot(ctx, "chown", "-R", "1000:1000", home+"/.ssh", home+"/.aws",
-				home+"/.git-credentials", home+"/.netrc", home+"/.config")
-		},
-	}
-
-	for _, step := range steps {
-		if err := step(); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
