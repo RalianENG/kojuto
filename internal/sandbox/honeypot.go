@@ -14,6 +14,7 @@ import (
 	"math/big"
 	"path"
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -316,13 +317,20 @@ func (s *Sandbox) plantHoneypotFiles(ctx context.Context) error {
 
 // ageHoneypotFiles backdates the planted files to random points in the
 // past two years, then gives each directory the timestamp of its newest
-// entry, as the filesystem would have. Ages come from the real host clock:
+// entry, as the filesystem would have. A key pair is written in one go,
+// so "<key>.pub" takes the same time as "<key>": a public key older than
+// its private half is a pair no ssh-keygen run produced. Ages come from the real host clock:
 // this runs before any faketime-wrapped process.
 func (s *Sandbox) ageHoneypotFiles(ctx context.Context, home string, files []honeypotFile) error {
 	now := time.Now().Unix()
 	newest := map[string]int64{}
+	stamped := map[string]int64{}
 	for _, f := range files {
-		ts := now - randIntRange(30, 720)*86400 - randIntRange(0, 86399)
+		ts, paired := stamped[strings.TrimSuffix(f.path, ".pub")]
+		if !paired || !strings.HasSuffix(f.path, ".pub") {
+			ts = now - randIntRange(30, 720)*86400 - randIntRange(0, 86399)
+		}
+		stamped[f.path] = ts
 		if err := s.dockerExecRoot(ctx, "touch", "-d", fmt.Sprintf("@%d", ts), f.path); err != nil {
 			return err
 		}
