@@ -292,9 +292,13 @@ func (s *Sandbox) plantHoneypotFiles(ctx context.Context) error {
 		)
 	}
 	steps = append(steps,
+		// Backdate before handing the files to dev. Root holds no DAC
+		// override here, so once ~/.ssh is dev-owned 0700 root can no
+		// longer reach inside it. chown only touches ctime, so the
+		// backdated mtimes survive the handover.
+		func() error { return s.ageHoneypotFiles(ctx, home, files) },
 		// Fix ownership so the container user (dev) owns the files.
 		func() error { return s.dockerExecRoot(ctx, "chown", "-R", "1000:1000", home) },
-		func() error { return s.ageHoneypotFiles(ctx, home, files) },
 		// Close the home directory last. The tmpfs is mounted 1777 so root
 		// — which holds CHOWN/FOWNER but no DAC override in this sandbox —
 		// can plant into it; 0750 is what an ordinary account's home
