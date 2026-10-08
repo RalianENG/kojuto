@@ -319,8 +319,15 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 	)
 
 	if s.needsPtrace {
-		// Re-add SYS_PTRACE for strace, CHOWN+FOWNER for tmpfs file setup.
-		args = append(args, "--cap-add=SYS_PTRACE", "--cap-add=CHOWN", "--cap-add=FOWNER")
+		// Re-add SYS_PTRACE for strace, CHOWN+FOWNER for tmpfs file setup,
+		// and SETUID+SETGID so strace can run as root and drop only the
+		// traced command to dev (`strace -u dev`, see
+		// probe.NewContainerStrace) — a tracer running as the package's
+		// own UID can be killed by it. These land in the bounding set
+		// only; dev's processes hold no capabilities, and
+		// no-new-privileges stops them acquiring any.
+		args = append(args, "--cap-add=SYS_PTRACE", "--cap-add=CHOWN", "--cap-add=FOWNER",
+			"--cap-add=SETUID", "--cap-add=SETGID")
 	}
 
 	// Audit hook: load kojuto-require.js before any user code in Node.js.
@@ -1399,8 +1406,18 @@ func (s *Sandbox) WriteProbeScripts(ctx context.Context) error {
 	return nil
 }
 
+// faketimeSpeed is the libfaketime rate multiplier ("x<N>" in FAKETIME).
+// libfaketime only shortens sleep/nanosleep/poll/select/epoll waits when a
+// rate is set; an offset alone ("+Nd") leaves every wait at its real
+// length. Measured in the sandbox image at x100: Python time.sleep,
+// threading.Event.wait and select, and Node setTimeout and Atomics.wait,
+// each asked for 10 s, all returned within 0.2 s. A payload that sleeps
+// 300 s before acting therefore fires in ~3 s, well inside --timeout.
+const faketimeSpeed = 100
+
 // faketimeEnv returns environment variable prefix that activates libfaketime.
-// The clock is advanced by a random offset between 30 and 180 days so that:
+// The clock is advanced by a random offset between 30 and 180 days and runs
+// faketimeSpeed times faster than real time, so that:
 // - Absolute date checks (e.g. "if date > May 1st: attack()") trigger immediately
 // - Relative sleeps (e.g. sleep(300)) complete in ~3 seconds
 // - The random offset prevents malware from hardcoding a bypass for a fixed shift
@@ -1412,7 +1429,7 @@ func faketimeEnv() []string {
 	days := faketimeShiftDays()
 	return []string{
 		"LD_PRELOAD=/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1",
-		fmt.Sprintf("FAKETIME=+%dd", days),
+		fmt.Sprintf("FAKETIME=+%dd x%d", days, faketimeSpeed),
 		"FAKETIME_NO_CACHE=1",
 		"FAKETIME_TIMESTAMP_FILE=",
 	}

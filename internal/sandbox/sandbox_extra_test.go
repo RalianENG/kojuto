@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -254,7 +255,10 @@ func TestFaketimeEnv(t *testing.T) {
 	hasPreload := false
 	hasFaketime := false
 	for _, e := range env {
-		if strings.HasPrefix(e, "FAKETIME=+") && strings.HasSuffix(e, "d") {
+		// "+<days>d x<speed>": the offset fires date-gated payloads, the
+		// rate shortens sleep-gated ones (libfaketime scales waits only
+		// when a rate is set).
+		if strings.HasPrefix(e, "FAKETIME=+") && strings.HasSuffix(e, fmt.Sprintf("d x%d", faketimeSpeed)) {
 			hasFaketime = true
 		}
 		if strings.HasPrefix(e, "LD_PRELOAD") {
@@ -266,7 +270,7 @@ func TestFaketimeEnv(t *testing.T) {
 		t.Error("expected LD_PRELOAD in faketimeEnv")
 	}
 	if !hasFaketime {
-		t.Error("expected FAKETIME=+Nd in faketimeEnv")
+		t.Error("expected FAKETIME=+Nd x<speed> in faketimeEnv")
 	}
 }
 
