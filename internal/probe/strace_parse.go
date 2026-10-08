@@ -281,7 +281,17 @@ var (
 	// new child (V8 worker threads never execve, so without this the
 	// PID-attribution lookup misses them).
 	straceCloneRe = regexp.MustCompile(
-		`\b(clone3?|vfork)\([^)]*\)\s*=\s*(\d+)\b`,
+		`\b(clone3?|vfork|fork)\([^)]*\)\s*=\s*(\d+)\b`,
+	)
+
+	// <... vfork resumed>) = 12345
+	// strace splits a call that another tracee interrupts into an
+	// "<unfinished ...>" line and a later "resumed" line, and the child
+	// PID is only on the resumed one. vfork is always split this way: the
+	// parent is suspended until the child execs, so the child's lines are
+	// printed in between. Without this, no vfork child had a known parent.
+	straceCloneResumedRe = regexp.MustCompile(
+		`<\.{3} (clone3?|vfork|fork) resumed>.*\)\s*=\s*(\d+)\b`,
 	)
 
 	// unlink("/tmp/.ld-linux-x86-64.py") = 0.
@@ -914,6 +924,9 @@ var execveFailedRe = regexp.MustCompile(`=\s*-1\s+E[A-Z]+`)
 // worker threads that never call execve themselves.
 func parseClone(line string) (types.SyscallEvent, bool) {
 	matches := straceCloneRe.FindStringSubmatch(line)
+	if matches == nil {
+		matches = straceCloneResumedRe.FindStringSubmatch(line)
+	}
 	if matches == nil {
 		return types.SyscallEvent{}, false
 	}

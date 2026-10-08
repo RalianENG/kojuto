@@ -66,6 +66,11 @@ type FlowState struct {
 	// sandbox detection. See types.CategoryEnvProbe.
 	EnvProbeBaseline map[string]bool
 
+	// PackageManagerSpawns holds the indexes of install-phase execve events
+	// that are the package manager starting one of its own helpers. See
+	// collectPackageManagerSpawns.
+	PackageManagerSpawns map[int]bool
+
 	// dnsQueries is an append-only list of DNS observations seen so
 	// far during the Analyze() iteration. Populated incrementally via
 	// RecordDNSQuery so that a lookup for "queries by PID before now"
@@ -370,9 +375,10 @@ func charClassFingerprint(s string) uint8 {
 // map allocations.
 func newFlowState(events []types.SyscallEvent) *FlowState {
 	return &FlowState{
-		PIDComm:          collectPIDComm(events),
-		ExecutedPaths:    collectExecutedPaths(events),
-		EnvProbeBaseline: collectEnvProbeBaseline(events),
+		PIDComm:              collectPIDComm(events),
+		ExecutedPaths:        collectExecutedPaths(events),
+		EnvProbeBaseline:     collectEnvProbeBaseline(events),
+		PackageManagerSpawns: collectPackageManagerSpawns(events),
 	}
 }
 
@@ -410,4 +416,81 @@ func isInSuspiciousDir(filePath string) bool {
 		strings.HasPrefix(filePath, "/dev/shm/") ||
 		strings.HasPrefix(filePath, "/var/tmp/") ||
 		strings.HasPrefix(filePath, "/run/")
+}
+
+// packageManagerDepth is where the package manager's own children sit in the
+// install-phase process tree: depth 0 is the install script kojuto stages
+// and launches, depth 1 the commands that script runs (pip, npm), depth 2
+// the helpers those commands start.
+const packageManagerDepth = 2
+
+// collectPackageManagerSpawns marks the install-phase execve events in which
+// a process at packageManagerDepth runs its FIRST program — the package
+// manager starting a helper of its own choosing. pip runs every legacy
+// setup.py through `python -c "exec(compile(...))"` (its setuptools shim),
+// and the inline-exec rule condemned that as code injection: every
+// setup.py-only sdist scanned suspicious on pip's behavior alone.
+//
+// The exemption is structural, not a string match. The shim's text is
+// public, so excusing lines that contain it would let any payload carry
+// it; what a package cannot fake is the position of the exec in the
+// process tree:
+//
+//   - Depth 0 and 1 are kojuto's install script and the commands it runs.
+//     No package code executes in them.
+//   - A depth-2 process's first exec replaces the image it inherited from
+//     the package manager with one the package manager chose. The
+//     package's code (setup.py, a lifecycle script) only starts running
+//     inside that helper.
+//   - Anything the package itself starts is therefore either deeper in the
+//     tree or a later exec in the same process — e.g. setup.py calling
+//     os.execv(sys.executable, ["python", "-c", payload]) is that PID's
+//     second exec — and gets no exemption.
+//
+// Only install-phase events are used. The download phase runs in another
+// container, so its PIDs live in a different namespace, and the import
+// phase's root is the probe script the package's code runs inside, so the
+// depth argument does not hold there. Lineage comes from clone, clone3,
+// vfork and fork events; a parent not seen as anyone's child is a root.
+func collectPackageManagerSpawns(events []types.SyscallEvent) map[int]bool {
+	parent := make(map[uint32]uint32)
+	for i := range events {
+		e := &events[i]
+		if e.Phase != types.PhaseInstall || e.Syscall != types.EventClone || e.ChildPID == 0 {
+			continue
+		}
+		if _, seen := parent[e.ChildPID]; !seen {
+			parent[e.ChildPID] = e.PID
+		}
+	}
+	depth := func(pid uint32) int {
+		d := 0
+		for range 64 { // bounded: a malformed trace must not loop forever
+			p, ok := parent[pid]
+			if !ok {
+				return d
+			}
+			pid = p
+			d++
+		}
+		return -1
+	}
+
+	var marked map[int]bool
+	execed := make(map[uint32]bool)
+	for i := range events {
+		e := &events[i]
+		if e.Phase != types.PhaseInstall || e.Syscall != types.EventExecve || e.PID == 0 {
+			continue
+		}
+		first := !execed[e.PID]
+		execed[e.PID] = true
+		if first && depth(e.PID) == packageManagerDepth {
+			if marked == nil {
+				marked = make(map[int]bool)
+			}
+			marked[i] = true
+		}
+	}
+	return marked
 }

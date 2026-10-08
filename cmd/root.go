@@ -480,7 +480,7 @@ func runBatchScreening(deps []depfile.Dep, ecosystem string) (string, error) {
 
 	// Install all packages at once with strace.
 	installPhase := startPhase("install", fmt.Sprintf("%d packages", len(pkgNames)))
-	cp := probe.NewContainerStrace(sb.Markers())
+	cp := probe.NewContainerStraceForInstall(sb.Markers())
 	installCmd, installCmdErr := sb.InstallAllCommand(ctx, pkgNames)
 	if installCmdErr != nil {
 		return "", fmt.Errorf("staging install command: %w", installCmdErr)
@@ -1252,7 +1252,7 @@ func runStraceProbe(ctx context.Context, sb *sandbox.Sandbox, pkg string) (*scan
 
 func runContainerStraceProbe(ctx context.Context, sb *sandbox.Sandbox, _ string) (*scanResult, error) {
 	// Phase 1: Install with strace monitoring.
-	cp := probe.NewContainerStrace(sb.Markers())
+	cp := probe.NewContainerStraceForInstall(sb.Markers())
 	installPhase := startPhase("install", "")
 
 	installCmd, err := sb.InstallCommand(ctx)
@@ -1271,7 +1271,9 @@ func runContainerStraceProbe(ctx context.Context, sb *sandbox.Sandbox, _ string)
 		// Keep what install recorded; there is nothing to import. See
 		// failedInstall for how outputReport treats it.
 		dumpInstallDiagnostics(installOut, cp.DiagnosticStderr())
-		return &scanResult{
+		// The install error travels in scanResult.installErr; outputReport
+		// decides what it yields (failedInstall).
+		return &scanResult{ //nolint:nilerr // see comment above
 			events:     events,
 			method:     cp.Method(),
 			dropped:    dropped,
