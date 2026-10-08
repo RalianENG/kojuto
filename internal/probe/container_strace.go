@@ -103,7 +103,7 @@ var straceTerminalExitRe = regexp.MustCompile(`^\+\+\+ (?:exited with \d+|killed
 // Running strace itself as that user — the previous arrangement — let
 // the package it was watching SIGKILL it: same UID, and kill(2) is not
 // in the traced syscall set, so the kill went unrecorded and the tracee
-// kept running untraced. A root tracer cannot be signalled by an
+// kept running untraced. A root tracer cannot be signaled by an
 // unprivileged process. The sandbox grants SETUID/SETGID alongside
 // SYS_PTRACE for the drop; no-new-privileges keeps them out of reach of
 // the package.
