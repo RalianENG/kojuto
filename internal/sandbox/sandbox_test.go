@@ -1,6 +1,12 @@
 package sandbox
 
 import (
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/pem"
+	"hash/crc32"
+	"math/big"
 	"os"
 	"regexp"
 	"strings"
@@ -54,74 +60,141 @@ func TestRandHex(t *testing.T) {
 }
 
 func TestFakeAWSKeyID(t *testing.T) {
-	key := fakeAWSKeyID()
-	if !strings.HasPrefix(key, "AKIA") {
-		t.Errorf("AWS key ID should start with AKIA, got %s", key)
+	// AKIA + 16 base32 characters (A-Z, 2-7): anything else is a key no
+	// AWS account was ever issued, and trivially recognisable as fake.
+	re := regexp.MustCompile(`^AKIA[A-Z2-7]{16}$`)
+	for range 50 {
+		if key := fakeAWSKeyID(); !re.MatchString(key) {
+			t.Fatalf("AWS key ID %q does not match %s", key, re)
+		}
 	}
-	if len(key) != 20 {
-		t.Errorf("AWS key ID should be 20 chars, got %d: %s", len(key), key)
-	}
-
-	// Should be different each call.
 	if fakeAWSKeyID() == fakeAWSKeyID() {
 		t.Error("fakeAWSKeyID produced identical values")
 	}
 }
 
 func TestFakeAWSSecret(t *testing.T) {
-	secret := fakeAWSSecret()
-	if len(secret) != 40 {
-		t.Errorf("AWS secret should be 40 chars, got %d: %s", len(secret), secret)
+	re := regexp.MustCompile(`^[A-Za-z0-9+/]{40}$`)
+	if secret := fakeAWSSecret(); !re.MatchString(secret) {
+		t.Errorf("AWS secret %q does not match %s", secret, re)
 	}
 }
 
-func TestFakeGitHubToken(t *testing.T) {
-	token := fakeGitHubToken()
-	if !strings.HasPrefix(token, "ghp_") {
-		t.Errorf("GitHub token should start with ghp_, got %s", token)
+// verifyTokenChecksum recomputes a checksummed token's last six
+// characters from its 30-character random part.
+func verifyTokenChecksum(t *testing.T, token, prefix string) {
+	t.Helper()
+	if !strings.HasPrefix(token, prefix) || len(token) != len(prefix)+36 {
+		t.Fatalf("token %q: want %s + 36 chars", token, prefix)
 	}
-	if len(token) != 40 {
-		t.Errorf("GitHub token should be 40 chars (ghp_ + 36), got %d: %s", len(token), token)
+	body, sum := token[len(prefix):len(prefix)+30], token[len(prefix)+30:]
+	if want := tokenChecksum(crc32.ChecksumIEEE([]byte(body))); sum != want {
+		t.Errorf("token %q: checksum %q, want %q", token, sum, want)
 	}
 }
 
-func TestFakeNpmToken(t *testing.T) {
-	token := fakeNpmToken()
-	if !strings.HasPrefix(token, "npm_") {
-		t.Errorf("npm token should start with npm_, got %s", token)
+func TestCheckedTokens(t *testing.T) {
+	for range 20 {
+		verifyTokenChecksum(t, fakeGitHubToken(), "ghp_")
+		verifyTokenChecksum(t, fakeGitHubActionsToken(), "ghs_")
+		verifyTokenChecksum(t, fakeNpmToken(), "npm_")
 	}
-	if len(token) != 40 {
-		t.Errorf("npm token should be 40 chars (npm_ + 36), got %d: %s", len(token), token)
+}
+
+func TestTokenChecksumEncoding(t *testing.T) {
+	cases := map[uint32]string{
+		0:          "000000",
+		61:         "00000z",
+		62:         "000010",
+		0xFFFFFFFF: "4gfFC3", // 4294967295 in base62, digits < upper < lower
+	}
+	for v, want := range cases {
+		if got := tokenChecksum(v); got != want {
+			t.Errorf("tokenChecksum(%d) = %q, want %q", v, got, want)
+		}
+	}
+}
+
+func TestFakeSSHKeyPair(t *testing.T) {
+	priv, pub, err := fakeSSHKeyPair("alice@laptop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode([]byte(priv))
+	if block == nil || block.Type != "RSA PRIVATE KEY" {
+		t.Fatalf("private key is not an RSA PEM block: %q", priv)
+	}
+	key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+	if err != nil {
+		t.Fatalf("private key does not parse: %v", err)
+	}
+
+	fields := strings.Fields(pub)
+	if len(fields) != 3 || fields[0] != "ssh-rsa" || fields[2] != "alice@laptop" {
+		t.Fatalf("public key line = %q", pub)
+	}
+	blob, err := base64.StdEncoding.DecodeString(fields[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The public blob must carry the private key's own modulus.
+	var parts [][]byte
+	for len(blob) >= 4 {
+		n := binary.BigEndian.Uint32(blob)
+		parts = append(parts, blob[4:4+n])
+		blob = blob[4+n:]
+	}
+	if len(parts) != 3 || string(parts[0]) != "ssh-rsa" {
+		t.Fatalf("public blob has %d fields", len(parts))
+	}
+	if new(big.Int).SetBytes(parts[2]).Cmp(key.N) != 0 {
+		t.Error("public key modulus does not match the private key")
 	}
 }
 
 func TestHoneypotEnvVars(t *testing.T) {
-	vars := honeypotEnvVars()
-
-	// Check CI signals are present.
-	found := map[string]bool{}
+	vars := honeypotEnvVars("alice", "alice-laptop", "/home/alice/projects")
+	env := map[string]string{}
 	for _, v := range vars {
-		parts := strings.SplitN(v, "=", 2)
-		found[parts[0]] = true
+		k, val, _ := strings.Cut(v, "=")
+		env[k] = val
 	}
 
-	required := []string{"CI", "GITHUB_ACTIONS", "GITLAB_CI", "AWS_ACCESS_KEY_ID",
-		"AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "NPM_TOKEN"}
-	for _, key := range required {
-		if !found[key] {
-			t.Errorf("missing required env var: %s", key)
+	// One CI provider, consistently: a self-hosted GitHub Actions runner
+	// whose identity matches the mirrored host.
+	for k, want := range map[string]string{
+		"CI":                      "true",
+		"GITHUB_ACTIONS":          "true",
+		"RUNNER_ENVIRONMENT":      "self-hosted",
+		"RUNNER_NAME":             "alice-laptop",
+		"GITHUB_REPOSITORY":       "alice/projects",
+		"GITHUB_REPOSITORY_OWNER": "alice",
+		"GITHUB_WORKSPACE":        "/home/alice/projects",
+	} {
+		if env[k] != want {
+			t.Errorf("%s = %q, want %q", k, env[k], want)
 		}
 	}
-
-	// Two calls should produce different token values.
-	vars2 := honeypotEnvVars()
-	for i, v := range vars {
-		parts := strings.SplitN(v, "=", 2)
-		if parts[0] == "CI" || parts[0] == "GITHUB_ACTIONS" || parts[0] == "GITLAB_CI" || parts[0] == "AWS_DEFAULT_REGION" {
-			continue // static values
+	for _, other := range []string{"GITLAB_CI", "BUILD_ID", "JENKINS_URL", "CIRCLECI", "TRAVIS"} {
+		if _, ok := env[other]; ok {
+			t.Errorf("%s set alongside GitHub Actions: contradictory CI identity", other)
 		}
-		if v == vars2[i] {
-			t.Errorf("expected different value for %s across calls", parts[0])
+	}
+	verifyTokenChecksum(t, env["GITHUB_TOKEN"], "ghs_")
+	verifyTokenChecksum(t, env["NPM_TOKEN"], "npm_")
+	if !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(env["GITHUB_SHA"]) {
+		t.Errorf("GITHUB_SHA = %q", env["GITHUB_SHA"])
+	}
+
+	// Secrets and run identifiers are random per scan.
+	env2 := map[string]string{}
+	for _, v := range honeypotEnvVars("alice", "alice-laptop", "/home/alice/projects") {
+		k, val, _ := strings.Cut(v, "=")
+		env2[k] = val
+	}
+	for _, k := range []string{"GITHUB_TOKEN", "GITHUB_SHA", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "NPM_TOKEN"} {
+		if env[k] == env2[k] {
+			t.Errorf("%s identical across scans", k)
 		}
 	}
 }

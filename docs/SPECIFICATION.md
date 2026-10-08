@@ -173,9 +173,10 @@ CLI (cobra)
 
 ### Honeypot Environment Simulation
 
-- Fake credential files planted in container: `~/.ssh/id_rsa`, `~/.aws/credentials`, `~/.git-credentials`, `~/.netrc`, `~/.config/gh/hosts.yml`
-- CI/cloud environment variables injected: `CI=true`, `GITHUB_ACTIONS=true`, `AWS_ACCESS_KEY_ID`, `GITHUB_TOKEN`, `NPM_TOKEN`
-- All tokens and secret values randomly generated per scan via `crypto/rand` to prevent static fingerprinting by malware aware of kojuto source
+- Fake credential files planted in container: `~/.ssh/id_rsa` + `id_rsa.pub`, `~/.aws/credentials`, `~/.git-credentials`, `~/.netrc`, `~/.config/gh/hosts.yml`, alongside the distribution's skeleton dotfiles (`.bashrc`, `.profile`, ...). Files are backdated to random points in the past two years (directories take their newest entry's time), and the home directory is `dev`-owned `0750` like an ordinary account
+- Every value passes the format checks a validator would apply: AWS access key IDs are `AKIA` + 16 base32 characters, secrets are 40 base64 characters, GitHub (`ghp_`, `ghs_`) and npm (`npm_`) tokens carry a valid CRC32 checksum in their last six characters, and the SSH key is a genuine RSA-2048 pair (PKCS#1 private key + matching `ssh-rsa` public key) that is never authorized anywhere
+- CI environment: one provider, consistently — a GitHub Actions job on a self-hosted runner (`CI`, `GITHUB_ACTIONS`, `GITHUB_REPOSITORY`, `GITHUB_RUN_ID`, `GITHUB_SHA`, `GITHUB_TOKEN` as a `ghs_` installation token, `RUNNER_ENVIRONMENT=self-hosted`, ...). Self-hosted is the persona that agrees with the mirrored host: its `RUNNER_NAME` is the host's hostname and `GITHUB_WORKSPACE` the mounted project path. Earlier revisions set GitHub Actions and GitLab CI variables at once, a combination no real job has. Cloud and registry credentials (`AWS_ACCESS_KEY_ID`, `NPM_TOKEN`) are set as well
+- All tokens, keys and run identifiers randomly generated per scan via `crypto/rand` to prevent static fingerprinting by malware aware of kojuto source
 - Triggers credential-harvesting logic that checks for file/env presence before exfiltrating
 
 ---
@@ -201,7 +202,7 @@ CLI (cobra)
 | Hostname | Mirrors the host's actual hostname |
 | Username | Host's actual username reflected in mount path |
 | CPU / Memory | Host's actual values mirrored (with caps) |
-| `/.dockerenv` | Removed on startup |
+| `/.dockerenv` | Masked by bind-mounting an empty regular file over it (the read-only rootfs rules out deleting it). The path still exists, so an existence check still sees it |
 | `/etc/resolv.conf` | Injected via `--dns=127.0.0.53` — systemd-resolved's stub address, so the file reads like an ordinary Ubuntu host. kojuto's synthetic resolver (`internal/sandbox/hooks/resolver.py`) listens there and answers every A query from 203.0.113.0/24 (RFC 5737 TEST-NET-3, never routable). Resolution succeeding is what makes the follow-up `connect()` observable; the connect still returns `ENETUNREACH` under `--network=none`, so no packet leaves the host |
 | Network | `--network=none` returns `ENETUNREACH` on `connect()`; combine with `--runtime runsc` to mask remaining `/proc/1/cgroup` and `/proc/self/mountinfo` signals |
 | Mount path | `/home/<host-user>/projects` (resembles host layout) |
