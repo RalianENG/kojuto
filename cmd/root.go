@@ -236,6 +236,10 @@ type scanResult struct {
 	events      []types.SyscallEvent
 	lostSamples uint64
 	dropped     uint64
+	// installErr is set when the install command failed. events still holds
+	// what was recorded up to the failure; outputReport decides whether that
+	// is enough for a verdict. See failedInstall.
+	installErr error
 }
 
 func runScan(_ *cobra.Command, args []string) error {
@@ -1149,9 +1153,21 @@ func runEBPFProbe(ctx context.Context, sb *sandbox.Sandbox, _ string) (*scanResu
 	installPhase := startPhase("install", "")
 	installOut, installErr := sb.InstallPackage(ctx)
 	if installErr != nil {
-		_ = ep.Close()
 		dumpUntrusted("Install output", installOut)
-		return nil, fmt.Errorf("install failed: %w", installErr)
+		// Keep what install recorded; see failedInstall.
+		time.Sleep(eventDrainDelay)
+		_ = ep.Close()
+		var events []types.SyscallEvent
+		for evt := range ep.Events() {
+			events = append(events, evt)
+		}
+		return &scanResult{
+			events:      events,
+			method:      ep.Method(),
+			lostSamples: ep.LostSamples(),
+			dropped:     ep.Dropped(),
+			installErr:  installErr,
+		}, nil
 	}
 	installPhase.end()
 
@@ -1224,15 +1240,13 @@ func runStraceProbe(ctx context.Context, sb *sandbox.Sandbox, pkg string) (*scan
 		return nil, fmt.Errorf("unpausing container: %w", unpauseErr)
 	}
 
-	events, err := installAndCollect(ctx, sb, pkg, sp)
-	if err != nil {
-		return nil, err
-	}
+	events, installErr := installAndCollect(ctx, sb, pkg, sp)
 
 	return &scanResult{
-		events:  events,
-		method:  sp.Method(),
-		dropped: sp.Dropped(),
+		events:     events,
+		method:     sp.Method(),
+		dropped:    sp.Dropped(),
+		installErr: installErr,
 	}, nil
 }
 
@@ -1245,19 +1259,26 @@ func runContainerStraceProbe(ctx context.Context, sb *sandbox.Sandbox, _ string)
 	if err != nil {
 		return nil, fmt.Errorf("staging install command: %w", err)
 	}
-	installOut, err := cp.StartAndInstall(ctx, sb.ContainerID(), installCmd)
-	if err != nil {
-		dumpUntrusted("Install output", installOut)
-
-		return nil, fmt.Errorf("install failed: %w", err)
-	}
-	installPhase.end()
+	installOut, installErr := cp.StartAndInstall(ctx, sb.ContainerID(), installCmd)
 
 	var events []types.SyscallEvent
 	for evt := range cp.Events() {
 		events = append(events, evt)
 	}
 	dropped := cp.Dropped()
+
+	if installErr != nil {
+		// Keep what install recorded; there is nothing to import. See
+		// failedInstall for how outputReport treats it.
+		dumpInstallDiagnostics(installOut, cp.DiagnosticStderr())
+		return &scanResult{
+			events:     events,
+			method:     cp.Method(),
+			dropped:    dropped,
+			installErr: installErr,
+		}, nil
+	}
+	installPhase.end()
 
 	// Phase 2: Import under each simulated OS to defeat platform-gated payloads.
 	// Write probe scripts to /tmp first (outside strace), then execute them.
@@ -1281,25 +1302,41 @@ func runContainerStraceProbe(ctx context.Context, sb *sandbox.Sandbox, _ string)
 	}, nil
 }
 
-func installAndCollect(ctx context.Context, sb *sandbox.Sandbox, _ string, p probe.Probe) ([]types.SyscallEvent, error) {
+// installAndCollect runs the install and drains the probe. A failed install
+// still returns the events recorded up to the failure, alongside the
+// install error (see failedInstall).
+func installAndCollect(ctx context.Context, sb *sandbox.Sandbox, _ string, p probe.Probe) (events []types.SyscallEvent, installErr error) {
 	phaseInfo("install", "running pip/npm in sandbox")
 
-	installOut, err := sb.InstallPackage(ctx)
-	if err != nil {
+	installOut, installErr := sb.InstallPackage(ctx)
+	if installErr != nil {
 		dumpUntrusted("Install output", installOut)
-
-		return nil, fmt.Errorf("install failed: %w", err)
 	}
 
 	time.Sleep(eventDrainDelay)
 	_ = p.Close()
 
-	var events []types.SyscallEvent
 	for evt := range p.Events() {
 		events = append(events, evt)
 	}
 
-	return events, nil
+	return events, installErr
+}
+
+// failedInstall decides what a failed install yields. If the behavior
+// recorded before the failure is suspicious on its own, that verdict
+// stands and is reported: a setup.py that exfiltrates and then exits
+// non-zero — deliberately or because its next import is missing — used to
+// end as "install failed" with every recorded event discarded, which made
+// `sys.exit(1)` after the payload a one-line way to avoid a verdict.
+// Anything short of suspicious stays the install error it always was: the
+// import phase never ran, so nothing here can be called clean.
+func failedInstall(verdict string, installErr error) error {
+	if verdict != types.VerdictSuspicious {
+		return fmt.Errorf("install failed: %w", installErr)
+	}
+	fmt.Fprintf(os.Stderr, "[!] Install failed (%v) after the behavior below was recorded; the import phase did not run.\n", installErr)
+	return nil
 }
 
 func outputReport(pkg string, result *scanResult) error {
@@ -1311,9 +1348,17 @@ func outputReport(pkg string, result *scanResult) error {
 	if result.lostSamples > 0 || result.dropped > 0 {
 		verdict = types.VerdictInconclusive
 	}
+	if result.installErr != nil {
+		if err := failedInstall(verdict, result.installErr); err != nil {
+			return err
+		}
+	}
 
 	summary := analyzer.GenerateSummary(verdict, filtered)
 	r := report.Generate(pkg, flagVersion, flagEcosystem, verdict, result.method, filtered, result.lostSamples, result.dropped, summary)
+	if result.installErr != nil {
+		r.InstallError = result.installErr.Error()
+	}
 	renderVerdictBlock(os.Stderr, verdict, pkg, flagVersion, len(filtered), summary, result.lostSamples, result.dropped)
 
 	w, err := openOutput()
