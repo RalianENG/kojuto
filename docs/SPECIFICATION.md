@@ -166,8 +166,9 @@ CLI (cobra)
 
 ### Time-Shifted Import (libfaketime)
 
-- Import probes run with `LD_PRELOAD=libfaketime.so` and `FAKETIME=+Nd` where N is randomized between 30 and 180
+- Import probes run with `LD_PRELOAD=libfaketime.so` and `FAKETIME=+Nd x100` where N is randomized between 30 and 180
 - Triggers date-gated payloads (e.g. `if datetime.now() > datetime(2026, 5, 1): attack()`)
+- Shortens sleep-gated payloads: libfaketime scales `sleep`/`nanosleep`/`select`/`poll`/`epoll` waits only when a rate (`x<N>`) is set — an offset alone leaves every wait at its real length. At `x100`, Python `time.sleep`/`threading.Event.wait`/`select` and Node `setTimeout`/`Atomics.wait` asked for 10 s all return within 0.2 s, so `sleep(300)` before a payload costs ~3 s rather than outlasting `--timeout`
 - Intercepts `gettimeofday`/`clock_gettime` at libc level — covers Python `datetime.now()`, Node `Date.now()`
 - Install phase uses real time to avoid breaking pip/npm
 

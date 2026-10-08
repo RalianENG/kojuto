@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
 
 	"github.com/RalianENG/kojuto/internal/types"
 )
@@ -63,6 +64,14 @@ type ContainerStrace struct {
 	// download probe sets it so `npm install` finds the staging
 	// package.json; install/import probes leave it empty.
 	workdir string
+	// tracedUser, when non-empty, makes strace run as root and drop only
+	// the traced command to this user (`strace -u`). See NewContainerStrace.
+	tracedUser string
+	// traceComplete records whether strace's final line was the
+	// unprefixed "+++ exited with N +++" / "+++ killed by SIG +++" it
+	// prints when its last tracee terminates. Absent, strace stopped
+	// before the traced tree did. See StartAndInstall.
+	traceComplete bool
 	// diagnosticStderrTail keeps the last N bytes of stderr lines that
 	// were NOT parsed as strace events (pip/npm error tracebacks, warnings,
 	// SSL errors). Surfaced by DiagnosticStderr() so error paths can print
@@ -70,11 +79,33 @@ type ContainerStrace struct {
 	diagnosticStderrTail []byte
 }
 
-// NewContainerStrace creates a new in-container strace probe.
+// analysisUser is the unprivileged account the scanned package runs as
+// in the install/import sandbox (USER in Dockerfile.sandbox).
+const analysisUser = "dev"
+
+// straceTerminalExitRe matches the line strace prints when its LAST
+// tracee terminates. With -f, strace prefixes a line with "[pid N]" only
+// while more than one process is being traced, so the final exit line —
+// printed when the tracee count drops from one to zero — is always
+// unprefixed, whether the tree exited or was killed by a signal.
+var straceTerminalExitRe = regexp.MustCompile(`^\+\+\+ (?:exited with \d+|killed by SIG[A-Z0-9]+(?: \(core dumped\))?) \+\+\+$`)
+
+// NewContainerStrace creates a new in-container strace probe for the
+// install and import phases.
+//
+// strace runs as root and drops only the traced command to analysisUser.
+// Running strace itself as that user — the previous arrangement — let
+// the package it was watching SIGKILL it: same UID, and kill(2) is not
+// in the traced syscall set, so the kill went unrecorded and the tracee
+// kept running untraced. A root tracer cannot be signaled by an
+// unprivileged process. The sandbox grants SETUID/SETGID alongside
+// SYS_PTRACE for the drop; no-new-privileges keeps them out of reach of
+// the package.
 func NewContainerStrace() *ContainerStrace {
 	return &ContainerStrace{
-		events: make(chan types.SyscallEvent, 8192),
-		done:   make(chan struct{}),
+		events:     make(chan types.SyscallEvent, 8192),
+		done:       make(chan struct{}),
+		tracedUser: analysisUser,
 	}
 }
 
@@ -83,10 +114,16 @@ func NewContainerStrace() *ContainerStrace {
 // emitted event is stamped with types.PhaseDownload so the analyzer applies
 // the download-phase profile (network egress is expected; staging-dir
 // execve is an unpacking-time exploit).
+//
+// The download probe keeps strace on the container's default user: no
+// package code runs during download (--ignore-scripts / --only-binary),
+// so nothing in the traced tree is positioned to signal the tracer, and
+// the download sandbox does not carry the SETUID/SETGID the drop needs.
 func NewContainerStraceForDownload(workdir string) *ContainerStrace {
 	c := NewContainerStrace()
 	c.phase = types.PhaseDownload
 	c.workdir = workdir
+	c.tracedUser = ""
 	return c
 }
 
@@ -131,11 +168,30 @@ func (c *ContainerStrace) StartAndInstall(ctx context.Context, containerID strin
 	<-straceDone
 	close(c.events)
 
+	c.flagIncompleteTrace()
+
 	if cmdErr != nil {
 		return pipOut, fmt.Errorf("pip install in container failed: %w", cmdErr)
 	}
 
 	return pipOut, nil
+}
+
+// flagIncompleteTrace turns a trace that never reached strace's terminal
+// exit line into a dropped event, which the caller maps to inconclusive.
+// Without that line strace stopped before the traced tree did, and
+// everything after that point went unrecorded. The import phase treats a
+// failed command as non-fatal and merges whatever events arrived, so a
+// tracer that died mid-import used to produce a verdict — clean, if the
+// payload had not run yet — from a partial trace.
+func (c *ContainerStrace) flagIncompleteTrace() {
+	if c.traceComplete {
+		return
+	}
+	c.dropped++
+	fmt.Fprintln(os.Stderr,
+		"warning: strace stopped before the traced command finished — the trace is "+
+			"incomplete and the verdict will be inconclusive")
 }
 
 func (c *ContainerStrace) buildCommand(ctx context.Context, containerID string, installCmd []string) *exec.Cmd {
@@ -145,6 +201,13 @@ func (c *ContainerStrace) buildCommand(ctx context.Context, containerID string, 
 		// the working directory, so the traced command must run inside
 		// the bind-mounted staging dir.
 		args = append(args, "--workdir="+c.workdir)
+	}
+	if c.tracedUser != "" {
+		// HOME is pinned because `docker exec --user=root` would
+		// otherwise hand the tracee root's HOME, and a package that
+		// writes under it would land outside the /home/ persistence
+		// backstop.
+		args = append(args, "--user=root", "--env=HOME=/home/"+c.tracedUser)
 	}
 	args = append(args,
 		containerID,
@@ -171,8 +234,11 @@ func (c *ContainerStrace) buildCommand(ctx context.Context, containerID string, 
 		// suspiciousExecDirs rule was ready to catch it.
 		"-e", "trace=connect,sendto,sendmsg,sendmmsg,bind,listen,accept,accept4,execve,execveat,clone,clone3,openat,rename,renameat,renameat2,sendfile,ptrace,mmap,mprotect,unlink,unlinkat",
 		"-e", "signal=none",
-		"--",
 	)
+	if c.tracedUser != "" {
+		args = append(args, "-u", c.tracedUser)
+	}
+	args = append(args, "--")
 	args = append(args, installCmd...)
 
 	return exec.CommandContext(ctx, "docker", args...)
@@ -188,7 +254,17 @@ func (c *ContainerStrace) parseStraceOutput(stderr io.ReadCloser, done chan<- st
 	const diagnosticCap = 8 * 1024
 	for scanner.Scan() {
 		line := scanner.Text()
+		if straceTerminalExitRe.MatchString(line) {
+			c.traceComplete = true
+			continue
+		}
 		evt, ok := parseStraceLine(line, state)
+		if ok {
+			// A trace event after a terminal exit line means that line
+			// was not strace's last word — most plausibly a tracee
+			// writing a look-alike to the shared stderr.
+			c.traceComplete = false
+		}
 		if !ok {
 			// Non-strace stderr line — most commonly pip/npm warnings
 			// and error tracebacks. Keep the last diagnosticCap bytes so
