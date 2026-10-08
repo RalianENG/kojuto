@@ -148,6 +148,17 @@ var (
 		`sendto\((\d+),\s*"((?:\\.|[^"\\])*)",\s*\d+,\s*[^,]+,\s*NULL`,
 	)
 
+	// Connected-socket sendmsg/sendmmsg: msg_name is NULL because the
+	// socket already carries its destination. This is what glibc's
+	// resolver actually emits on this image — getaddrinfo connects the
+	// UDP socket, then ships the A and AAAA questions in ONE sendmmsg —
+	// so without this pattern every ordinary hostname lookup was
+	// invisible to the parser and no dns_lookup, exfil-service or
+	// tunneling rule could ever see the queried name.
+	straceSendmsgConnectedRe = regexp.MustCompile(
+		`sendm(m?)sg\(\d+,.*msg_name=NULL`,
+	)
+
 	// sendmsg(3, {msg_name={sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("1.2.3.4")}, ...}, 0).
 	straceSendmsgRe = regexp.MustCompile(
 		`sendmsg\(\d+,.*\{sa_family=AF_INET6?,\s*sin6?_port=htons\((\d+)\),\s*sin6?_addr=inet6?_addr\("([^"]+)"\)`,
@@ -383,6 +394,13 @@ func parseStraceLine(line string, state *ParseState) (types.SyscallEvent, bool) 
 	}
 
 	if evt, ok := parseSendWithDNS(line, straceSendmmsgRe, types.EventSendmmsg, extractDNSQueryFromMsg); ok {
+		return evt, true
+	}
+
+	// Connected-socket sendmsg/sendmmsg: msg_name=NULL, destination on
+	// the socket. glibc's resolver takes this path for every
+	// getaddrinfo, so it is the branch that carries real hostnames.
+	if evt, ok := parseConnectedSendmsgDNS(line); ok {
 		return evt, true
 	}
 
@@ -1060,7 +1078,49 @@ func parseConnectedSendtoDNS(line string) (types.SyscallEvent, bool) {
 		Timestamp: time.Now().UTC(),
 		PID:       extractPID(line),
 		Syscall:   types.EventSendto,
-		DstAddr:   "127.0.0.11", // Docker embedded DNS (connected socket, addr not in strace)
+		DstAddr:   types.SandboxResolverAddr, // connected socket: no sockaddr on the send line
+		DstPort:   53,
+		DNSQuery:  domain,
+	}, true
+}
+
+// parseConnectedSendmsgDNS handles sendmsg/sendmmsg on connected sockets
+// (msg_name=NULL). It is the sendmsg-family twin of
+// parseConnectedSendtoDNS and the one that matters in practice: glibc's
+// getaddrinfo connects its UDP socket to the nameserver and then sends
+// the A and AAAA questions together via sendmmsg, so the addressed
+// regexes never match and the query name would otherwise never reach
+// the analyzer.
+//
+// Only the first msg_iov buffer is decoded. For the glibc pair that is
+// the A question; the AAAA question that rides along in the same call
+// carries the identical name, so nothing is lost.
+//
+// The destination is not on the line (that is what "connected" means),
+// so it is attributed to the sandbox's own resolver — the only
+// nameserver reachable from the install/import sandbox, which runs
+// with --network=none.
+func parseConnectedSendmsgDNS(line string) (types.SyscallEvent, bool) {
+	matches := straceSendmsgConnectedRe.FindStringSubmatch(line)
+	if matches == nil {
+		return types.SyscallEvent{}, false
+	}
+
+	domain := extractDNSQueryFromMsg(line)
+	if domain == "" {
+		return types.SyscallEvent{}, false
+	}
+
+	syscall := types.EventSendmsg
+	if matches[1] == "m" {
+		syscall = types.EventSendmmsg
+	}
+
+	return types.SyscallEvent{
+		Timestamp: time.Now().UTC(),
+		PID:       extractPID(line),
+		Syscall:   syscall,
+		DstAddr:   types.SandboxResolverAddr,
 		DstPort:   53,
 		DNSQuery:  domain,
 	}, true

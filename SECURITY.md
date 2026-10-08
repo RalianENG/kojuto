@@ -68,7 +68,7 @@ kojuto is a security tool that intentionally runs untrusted code in an isolated 
 - Host hostname, username, CPU count, and memory are mirrored into the container
 - `/.dockerenv` is masked at container creation time by bind-mounting an empty regular file from the host over it (`--read-only` rootfs makes post-start `rm` impossible, so masking is the only mechanism)
 - Package mount path mirrors host directory layout
-- `/etc/resolv.conf` is populated via `--dns=198.51.100.1` (RFC 5737 TEST-NET-2, guaranteed unreachable) so the file is non-empty even under `--network=none` — prevents the empty-resolv-conf signal that would reveal isolation. `connect()` returns `ENETUNREACH`; combine with `--runtime runsc` to mask remaining `/proc/1/cgroup` and `/proc/self/mountinfo` signals
+- `/etc/resolv.conf` is populated via `--dns=127.0.0.53` — systemd-resolved's stub address, so the file reads like an ordinary Ubuntu host instead of showing the empty-resolv-conf signal that reveals isolation. kojuto's synthetic resolver listens there under `--network=none` and answers every A query from 203.0.113.0/24 (RFC 5737 TEST-NET-3, never routable, never allocated): resolution succeeds, the package proceeds to its `connect()`, and that connect — the signal a HOSTNAME-based C2 chain would otherwise never produce — is recorded while still returning `ENETUNREACH`, so no packet leaves the host. Combine with `--runtime runsc` to mask remaining `/proc/1/cgroup` and `/proc/self/mountinfo` signals
 
 ### Known Limitations
 

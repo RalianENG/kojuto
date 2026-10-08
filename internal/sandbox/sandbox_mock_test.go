@@ -181,6 +181,14 @@ func TestContainerArgs(t *testing.T) {
 		// CleanupStaleSandboxContainers can sweep orphans without
 		// disturbing unrelated Docker workloads.
 		"--label=" + SandboxContainerLabel + "=true",
+		// DNS must point at kojuto's own in-sandbox resolver: without a
+		// resolvable answer there is no follow-up connect, and
+		// hostname-based exfiltration reports clean.
+		"--dns=" + syntheticResolverAddr,
+		// kojuto's probe scripts and resolver live on their own
+		// root-owned tmpfs, outside every path the audit hook counts as
+		// user code.
+		"--tmpfs=" + probeScriptDir + ":",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("containerArgs missing %q in:\n%s", want, joined)

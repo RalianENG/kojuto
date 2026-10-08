@@ -921,7 +921,7 @@ func TestIsBenignAuditEvent_NodeEventsNeverBenign(t *testing.T) {
 
 func TestIsBenignAuditEvent_KojutoProbeScript(t *testing.T) {
 	// kojuto's own probe scripts should be filtered.
-	if !isBenignAuditEvent("exec", "/tmp/_kojuto_probe_win32.py", "<code object>") {
+	if !isBenignAuditEvent("exec", "/opt/kojuto/probe/_kojuto_probe_win32.py", "<code object>") {
 		t.Error("kojuto probe script should be benign")
 	}
 }

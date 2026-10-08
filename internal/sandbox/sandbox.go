@@ -26,6 +26,9 @@ var execCommand = exec.CommandContext
 //go:embed seccomp.json
 var seccompProfile []byte
 
+//go:embed hooks/resolver.py
+var resolverScript string
+
 // SandboxImage is the Docker image used for the sandbox container.
 const SandboxImage = "kojuto-sandbox:latest"
 
@@ -38,6 +41,51 @@ const SandboxContainerLabel = "kojuto.scan"
 
 // SandboxPythonVersion must match the Python version in Dockerfile.sandbox.
 const SandboxPythonVersion = "3.12"
+
+// probeScriptDir is the in-container directory kojuto stages its OWN
+// scripts in - the OS-simulation import probes and the synthetic DNS
+// resolver. containerArgs mounts it as a dedicated tmpfs with
+// mode=0755, so it stays root-owned: the scanned package runs as the
+// unprivileged dev user and can read and execute these scripts but
+// cannot create files here.
+//
+// The location is load-bearing, not cosmetic. The probes used to live
+// in /tmp/, which sitecustomize.py lists in _USER_PREFIXES because
+// malware drops payloads there. That made kojuto's own probe scripts
+// count as user code: every compile/exec they performed reached the
+// analyzer carrying the "+" user-origin marker, which deliberately
+// bypasses the path-based benign filter - even though that filter
+// already lists "_kojuto_probe_". A 100-package PyPI measurement
+// found 30,788 of 46,031 dynamic_code_execution events (67%) were
+// kojuto's own probes, burying real payload execs in kojuto's noise.
+// Staging outside every user prefix fixes it at the source, and a
+// root-owned directory means a package cannot buy the same
+// suppression by planting a file with a kojuto-looking name.
+const probeScriptDir = "/opt/kojuto/probe"
+
+const (
+	// probeScriptPrefix is the full path prefix of every staged probe
+	// script; the suffix encodes the simulated OS (and, for batch
+	// scans, the "all_" multi-package form).
+	probeScriptPrefix = probeScriptDir + "/_kojuto_probe_"
+
+	// resolverScriptPath / resolverReadyPath are the staged synthetic
+	// DNS resolver and the marker it writes once its socket is bound.
+	resolverScriptPath = probeScriptDir + "/resolver.py"
+	resolverReadyPath  = probeScriptDir + "/.resolver-ready"
+
+	// syntheticResolverAddr is where that resolver listens, and the
+	// value handed to --dns. Shared with the strace parser, which
+	// attributes connected-socket DNS sends to it.
+	syntheticResolverAddr = types.SandboxResolverAddr
+
+	// resolverReadyAttempts / resolverReadyInterval bound the wait for
+	// the resolver to bind. Measured startup takes a single poll; the
+	// budget is generous because a scan that proceeds without the
+	// resolver silently reinstates the hostname-exfil false negative.
+	resolverReadyAttempts = 20
+	resolverReadyInterval = 150 * time.Millisecond
+)
 
 // Runtime selects the container runtime.
 const (
@@ -187,11 +235,17 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 		// Running/paused containers from concurrent kojuto invocations are
 		// filtered out at cleanup time so live scans are not disturbed.
 		"--label="+SandboxContainerLabel+"=true",
-		// Fake DNS: RFC 5737 TEST-NET-2 address, guaranteed unreachable.
-		// Prevents fingerprinting via empty /etc/resolv.conf while ensuring
-		// DNS resolution attempts generate a connect:53 event in strace
-		// (connect returns ENETUNREACH — no packets leave the host).
-		"--dns=198.51.100.1",
+		// DNS points at kojuto's own synthetic resolver on the loopback
+		// stub address (see startSyntheticResolver). The previous value
+		// was an unreachable RFC 5737 address, which meant resolution
+		// could never complete - and therefore that the follow-up
+		// connect to the resolved IP, which the analyzer treats as the
+		// actual C2 signal, could never fire. Hostname-based
+		// exfiltration scanned clean as a result. Answering locally
+		// from a documentation range keeps containment identical (there
+		// is still no route out of --network=none) while producing the
+		// connect event the analyzer needs.
+		"--dns="+syntheticResolverAddr,
 		"--security-opt=no-new-privileges",
 		"--read-only",
 		"--cap-drop=ALL",
@@ -214,6 +268,12 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 		// files; backed by host RAM, actual usage is a few MB.
 		"--tmpfs=/usr/local/include:nosuid,mode=1777,size=200m",
 		"--tmpfs=/run:nosuid,size=1m",
+		// kojuto's own probe scripts and synthetic resolver. mode=0755
+		// (not 1777 like the other tmpfs mounts) leaves the directory
+		// root-owned, so the scanned package can read and execute what
+		// kojuto stages but cannot add or replace files here. See
+		// probeScriptDir for why the location matters.
+		"--tmpfs="+probeScriptDir+":nosuid,mode=0755,size=8m",
 		"--tmpfs=/home/dev:nosuid,mode=1777,size=32m",
 		// Dedicated cache tmpfs outside HOME. npm and pip are pinned here via
 		// NPM_CONFIG_CACHE / PIP_CACHE_DIR so their legitimate writes (logs,
@@ -583,7 +643,62 @@ func (s *Sandbox) prepareSandboxState(ctx context.Context) error {
 	if err := s.plantHoneypotFiles(ctx); err != nil {
 		return fmt.Errorf("planting honeypot files: %w", err)
 	}
+	if err := s.startSyntheticResolver(ctx); err != nil {
+		return fmt.Errorf("starting synthetic resolver: %w", err)
+	}
 	return nil
+}
+
+// startSyntheticResolver stages hooks/resolver.py into probeScriptDir
+// and launches it as a detached root process, then blocks until the
+// resolver reports its socket bound.
+//
+// Why the sandbox needs a resolver at all: install and import run
+// under --network=none, so a lookup against a real nameserver can
+// never succeed. The analyzer classifies an isolated connect to :53 as
+// LOW on the reasoning that the real C2 signal is the follow-up
+// connect to the resolved IP - but with no answer there is no
+// follow-up connect, so a package exfiltrating to a HOSTNAME produced
+// two LOW events and a clean verdict, while the same package using an
+// IP literal was caught. Answering every A query from RFC 5737
+// TEST-NET-3 makes the caller proceed to its connect(), which strace
+// records and the analyzer condemns; nothing routes out of the
+// sandbox, so containment is unchanged.
+//
+// Failure is fatal by design. If the resolver is not listening, the
+// package's DNS packets go to a loopback address that isBenignNetwork
+// filters, so the scan would lose even the LOW breadcrumb it has
+// today - a silent detection regression is exactly what this code
+// exists to prevent.
+func (s *Sandbox) startSyntheticResolver(ctx context.Context) error {
+	if err := s.dockerWriteFile(ctx, resolverScriptPath, resolverScript); err != nil {
+		return fmt.Errorf("staging resolver script: %w", err)
+	}
+
+	// Detached (-d) so the resolver outlives this exec session; the
+	// process is reparented to the container init and dies with the
+	// container. Run as root so the scanned package - which runs as
+	// dev - cannot signal or replace the resolver mid-scan.
+	cmd := execCommand(ctx, "docker", "exec", "-d", "--user=root", s.containerID,
+		"sh", "-c", "exec python3 "+shQuote(resolverScriptPath))
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("launching resolver: %w", err)
+	}
+
+	for range resolverReadyAttempts {
+		if err := s.dockerExecRoot(ctx, "test", "-f", resolverReadyPath); err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for synthetic resolver: %w", ctx.Err())
+		case <-time.After(resolverReadyInterval):
+		}
+	}
+	return fmt.Errorf("resolver did not bind %s:53 within %v",
+		syntheticResolverAddr, time.Duration(resolverReadyAttempts)*resolverReadyInterval)
 }
 
 // restoreTmpfsOverlays copies backed-up contents into tmpfs-mounted directories
@@ -1037,7 +1152,7 @@ func (s *Sandbox) WriteProbeScriptsMulti(ctx context.Context, pkgs []string) err
 					"%s",
 				p, nodeImportSource,
 			)
-			filename := "/tmp/_kojuto_probe_all_" + p + ".js"
+			filename := probeScriptPrefix + "all_" + p + ".js"
 			if err := s.dockerWriteFile(ctx, filename, script); err != nil {
 				return err
 			}
@@ -1077,7 +1192,7 @@ func (s *Sandbox) WriteProbeScriptsMulti(ctx context.Context, pkgs []string) err
 			p.system, p.system, p.sysplatform, p.osname,
 			p.sep, p.pathsep, p.linesep, importProbeSource,
 		)
-		filename := "/tmp/_kojuto_probe_all_" + p.sysplatform + ".py"
+		filename := probeScriptPrefix + "all_" + p.sysplatform + ".py"
 		if err := s.dockerWriteFile(ctx, filename, script); err != nil {
 			return err
 		}
@@ -1090,15 +1205,15 @@ func (s *Sandbox) ImportCommandsMulti(pkgs []string) [][]string {
 	_ = pkgs // package list is already baked into the script files
 	if s.ecosystem == types.EcosystemNpm {
 		return [][]string{
-			wrapWithFaketime([]string{"node", "/tmp/_kojuto_probe_all_linux.js"}),
-			wrapWithFaketime([]string{"node", "/tmp/_kojuto_probe_all_win32.js"}),
-			wrapWithFaketime([]string{"node", "/tmp/_kojuto_probe_all_darwin.js"}),
+			wrapWithFaketime([]string{"node", probeScriptPrefix + "all_linux.js"}),
+			wrapWithFaketime([]string{"node", probeScriptPrefix + "all_win32.js"}),
+			wrapWithFaketime([]string{"node", probeScriptPrefix + "all_darwin.js"}),
 		}
 	}
 	return [][]string{
-		wrapWithFaketime([]string{"python3", "/tmp/_kojuto_probe_all_linux.py"}),
-		wrapWithFaketime([]string{"python3", "/tmp/_kojuto_probe_all_win32.py"}),
-		wrapWithFaketime([]string{"python3", "/tmp/_kojuto_probe_all_darwin.py"}),
+		wrapWithFaketime([]string{"python3", probeScriptPrefix + "all_linux.py"}),
+		wrapWithFaketime([]string{"python3", probeScriptPrefix + "all_win32.py"}),
+		wrapWithFaketime([]string{"python3", probeScriptPrefix + "all_darwin.py"}),
 	}
 }
 
@@ -1261,7 +1376,7 @@ func (s *Sandbox) WriteProbeScripts(ctx context.Context) error {
 			p.system, p.system, p.sysplatform, p.osname,
 			p.sep, p.pathsep, p.linesep, importProbeSource,
 		)
-		filename := "/tmp/_kojuto_probe_" + p.sysplatform + ".py"
+		filename := probeScriptPrefix + p.sysplatform + ".py"
 		if err := s.dockerWriteFile(ctx, filename, script); err != nil {
 			return err
 		}
@@ -1276,7 +1391,7 @@ func (s *Sandbox) WriteProbeScripts(ctx context.Context) error {
 				"%s",
 			p, nodeImportSource,
 		)
-		filename := "/tmp/_kojuto_probe_" + p + ".js"
+		filename := probeScriptPrefix + p + ".js"
 		if err := s.dockerWriteFile(ctx, filename, script); err != nil {
 			return err
 		}
@@ -1326,9 +1441,9 @@ func wrapWithFaketime(cmd []string) []string {
 // Commands are wrapped with libfaketime to trigger date-gated payloads.
 func (s *Sandbox) pythonImportCommands() [][]string {
 	return [][]string{
-		wrapWithFaketime([]string{"python3", "/tmp/_kojuto_probe_linux.py"}),
-		wrapWithFaketime([]string{"python3", "/tmp/_kojuto_probe_win32.py"}),
-		wrapWithFaketime([]string{"python3", "/tmp/_kojuto_probe_darwin.py"}),
+		wrapWithFaketime([]string{"python3", probeScriptPrefix + "linux.py"}),
+		wrapWithFaketime([]string{"python3", probeScriptPrefix + "win32.py"}),
+		wrapWithFaketime([]string{"python3", probeScriptPrefix + "darwin.py"}),
 	}
 }
 
@@ -1337,9 +1452,9 @@ func (s *Sandbox) pythonImportCommands() [][]string {
 // Commands are wrapped with libfaketime to trigger date-gated payloads.
 func (s *Sandbox) nodeImportCommands() [][]string {
 	return [][]string{
-		wrapWithFaketime([]string{"node", "/tmp/_kojuto_probe_linux.js"}),
-		wrapWithFaketime([]string{"node", "/tmp/_kojuto_probe_win32.js"}),
-		wrapWithFaketime([]string{"node", "/tmp/_kojuto_probe_darwin.js"}),
+		wrapWithFaketime([]string{"node", probeScriptPrefix + "linux.js"}),
+		wrapWithFaketime([]string{"node", probeScriptPrefix + "win32.js"}),
+		wrapWithFaketime([]string{"node", probeScriptPrefix + "darwin.js"}),
 	}
 }
 

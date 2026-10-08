@@ -213,11 +213,17 @@ func deduplicateEvasionByPath(events []types.SyscallEvent) []types.SyscallEvent 
 	seen := make(map[string]bool)
 	out := events[:0]
 	for i := range events {
-		if events[i].Category == types.CategoryEvasion && events[i].FilePath != "" {
-			if seen[events[i].FilePath] {
+		cat := events[i].Category
+		// CategoryEnvProbe is deduped on the same rationale and in its
+		// own key space: node re-reads /proc/self/maps on every process
+		// start, so a single npm scan otherwise carries the same LOW
+		// breadcrumb three or four times.
+		if (cat == types.CategoryEvasion || cat == types.CategoryEnvProbe) && events[i].FilePath != "" {
+			key := cat + "\x00" + events[i].FilePath
+			if seen[key] {
 				continue
 			}
-			seen[events[i].FilePath] = true
+			seen[key] = true
 		}
 		out = append(out, events[i])
 	}
@@ -576,6 +582,8 @@ func categoryShortDesc(c string) string {
 		return "structural DGA: many uniform-morphology subdomains under one 2LD"
 	case types.CategoryDownloadEgress:
 		return "registry/CDN connect during download (forensic, info)"
+	case types.CategoryEnvProbe:
+		return "package-manager environment read, not attributable to the package (info)"
 	}
 	return c
 }
@@ -659,6 +667,8 @@ func buildDescription(_ []types.SyscallEvent, categories []string) string {
 			parts = append(parts, "file deletion in temporary directory (anti-forensics/payload self-cleanup)")
 		case types.CategoryDownloadEgress:
 			parts = append(parts, "outbound connection during dependency download (registry/CDN fetch, recorded for forensics)")
+		case types.CategoryEnvProbe:
+			parts = append(parts, "environment read attributable to the package manager's own startup (recorded for forensics)")
 		}
 	}
 	return strings.Join(parts, "; ") + "."
@@ -708,6 +718,26 @@ func classify(evt *types.SyscallEvent, state *FlowState) {
 		classifyExecve(evt)
 
 	case types.EventOpenat:
+		// A sandbox-detection path the package manager itself read
+		// earlier in this scan is baseline noise, not evasion. The
+		// baseline comes from the download phase, where --ignore-scripts
+		// / --only-binary mean no package code runs, so it measures the
+		// tooling rather than trusting a list. npm scans need this:
+		// node reads /proc/self/maps and /proc/self/cgroup at startup
+		// during download AND again when the install phase drives the
+		// lifecycle hooks, and charging that second pair as MEDIUM
+		// evasion is what put 94 of 96 popular npm packages over the
+		// verdict threshold. Paths outside the baseline — status,
+		// mountinfo, /sys/class/net — still classify as evasion.
+		if state != nil && state.EnvProbeBaseline[evt.FilePath] {
+			evt.Category = types.CategoryEnvProbe
+			evt.Reason = "Environment read of " + evt.FilePath +
+				" — the package manager read this same path during the download phase, " +
+				"where no package code executes, so the read is baseline runtime " +
+				"profiling rather than attributable sandbox detection. Recorded for " +
+				"forensic visibility."
+			return
+		}
 		classifyOpenat(evt)
 
 	case types.EventRename:
@@ -827,6 +857,32 @@ func classifyDownloadEvent(evt *types.SyscallEvent, state *FlowState) bool {
 		// report event. Mirrors isBenign's EventClone handling.
 		return false
 
+	case types.EventOpenat:
+		// Environment / sandbox-detection reads belong to the download
+		// tooling here, not to the target: --ignore-scripts (npm) and
+		// --only-binary (pip) mean no package code runs during download,
+		// and node reads /proc/self/maps plus /proc/self/cgroup on every
+		// startup. Charging those two reads to the package as MEDIUM
+		// evasion put 94 of 96 popular npm packages over the "2+ MEDIUM"
+		// verdict threshold on nothing but npm's own behavior. Recorded
+		// LOW instead; the same read during install or import still
+		// classifies as MEDIUM CategoryEvasion, because there package
+		// code IS running and the read is attributable to it.
+		if isSandboxDetectionPath(evt.FilePath) {
+			evt.Category = types.CategoryEnvProbe
+			evt.Reason = "Environment probe during dependency download: " + evt.FilePath +
+				" — `pip download` / `npm install --ignore-scripts` execute no package " +
+				"code, so this read is the package manager profiling its own runtime. " +
+				"Recorded for forensic visibility; the identical read during install or " +
+				"import is classified as sandbox-detection evasion."
+			return true
+		}
+		if isBenign(evt) {
+			return false
+		}
+		classify(evt, state)
+		return true
+
 	default:
 		// File writes escaping the staging dir, rename-onto-system-binary,
 		// RWX memory, bind/listen, unlink, dynamic exec — identical meaning
@@ -883,6 +939,17 @@ func classifyConnect(evt *types.SyscallEvent, state *FlowState) {
 			if hosts := state.DNSHostnamesForPID(evt.PID); len(hosts) > 0 {
 				evt.Reason += " Preceded by DNS query for: " + strings.Join(hosts, ", ") +
 					" (same PID) — outbound connect is the harm-firing step in the DNS→connect C2 chain."
+			}
+			// The destination may be an address kojuto's own in-sandbox
+			// resolver minted for a name this scan observed. Saying so
+			// keeps the report honest (no packet reached that address,
+			// and it belongs to no one) and names the target the package
+			// actually meant to reach — which PID-based attribution
+			// misses whenever the lookup ran on another thread.
+			if host := state.DNSHostnameForSyntheticAddr(evt.DstAddr); host != "" {
+				evt.Reason += " " + evt.DstAddr + " is the synthetic address kojuto's sandbox resolver " +
+					"returned for " + host + ", so the package's real destination is that hostname; " +
+					"the sandbox has no route, so no packets left the host."
 			}
 		}
 	}
@@ -1454,6 +1521,22 @@ func isBenignNetwork(evt *types.SyscallEvent) bool {
 		if matchExfilService(evt.DNSQuery) != "" || isDNSTunnel(evt.DNSQuery) {
 			return false
 		}
+	}
+
+	// A query to the sandbox's own resolver is not ordinary loopback
+	// traffic. It is the only nameserver reachable under --network=none,
+	// nothing in a legitimate install or import resolves a name at all
+	// (measured: zero DNS events across 100 popular PyPI and 96 popular
+	// npm packages), and the resolver answering successfully means a
+	// payload can now inspect the answer, conclude it is being analyzed
+	// and bail BEFORE the connect that would condemn it. Letting the
+	// query fall through to the loopback filter would leave that scan
+	// with zero events; keeping it as a LOW dns_lookup preserves the
+	// "this package tried to resolve evil.com during import" breadcrumb
+	// that the pre-resolver sandbox produced by accident, because its
+	// unreachable nameserver was a non-loopback address.
+	if evt.DstPort == 53 && evt.DstAddr == types.SandboxResolverAddr {
+		return false
 	}
 
 	ip := net.ParseIP(evt.DstAddr)

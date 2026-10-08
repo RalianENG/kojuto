@@ -76,7 +76,7 @@ Two complementary detection strategies:
 1. **Sensitive path matching** (any access mode): ~60 path patterns including SSH/GPG keys, cloud credentials (AWS/Azure/GCP/OCI/Aliyun), crypto wallets (Bitcoin/Ethereum/Solana/Monero/Electrum/Exodus/Atomic), browser data (Chrome/Firefox/Brave/Opera/Vivaldi/Edge + extension Local Storage/IndexedDB), shell startup files, desktop keyrings, application tokens, and sandbox-detection paths (`/proc/self/maps`, `/proc/self/cgroup`, `/proc/self/status`, `/proc/self/mountinfo`, `/sys/class/net`). The captured filename is C-unescaped, dirfd-resolved (for `openat(<fd>, "<relative>", ...)` where a prior `open`/`openat` recorded the base — per-PID scoping matches kernel fd tables), and `path.Clean`-normalized (POSIX slashes; `/etc/./shadow`, `/etc//shadow`, `/etc/foo/../shadow`, `/tmp/../etc/shadow` all collapse to `/etc/shadow` before matching) so cosmetic and escape-form bypasses cannot slip past the substring check.
 2. **Home directory write detection** (whitelist-based): ANY write (`O_WRONLY`/`O_RDWR`/`O_CREAT`) to `/home/` or `/root/` is flagged — pip/npm only write to site-packages, `/usr/local/bin`, `/tmp`, and `/install`. This catches systemd persistence, LaunchAgent injection, and unknown attack paths without maintaining a blacklist
 3. **System binary write detection**: writes to known system binaries (`python3`, `node`, `pip`, `sh`, etc.) in `/usr/local/bin/` or `/usr/bin/` are classified as `binary_hijacking` — prevents benignPaths bypass where an attacker overwrites a trusted binary on a writable tmpfs mount
-4. **Sandbox detection classification**: reads to `/proc/self/maps`, `/proc/self/cgroup`, `/proc/self/status`, `/proc/self/mountinfo`, `/proc/<pid>/comm`, and `/sys/class/net` are classified as `evasion` (not `credential_access`) to indicate environment probing. Multiple reads of the same path (glibc/V8/Python `runpy` all read `/proc/self/maps` on every process launch) are deduplicated by path at the analyzer layer so the verdict rule (2+ MEDIUM events to flip) measures DISTINCT sandbox-detection paths touched, not raw read repetitions — a package that reads only `/proc/self/maps` stays clean (1 evasion event) but is preserved as a forensic breadcrumb; a package that reads maps + cgroup + status is flagged as an evasion cluster (3 distinct events). Path-less evasion events like `ptrace(TRACEME)` stack with sandbox probes as an independent modality and are never deduped against them.
+4. **Sandbox detection classification**: reads to `/proc/self/maps`, `/proc/self/cgroup`, `/proc/self/status`, `/proc/self/mountinfo`, `/proc/<pid>/comm`, and `/sys/class/net` are classified as `evasion` (not `credential_access`) to indicate environment probing. Multiple reads of the same path (glibc/V8/Python `runpy` all read `/proc/self/maps` on every process launch) are deduplicated by path at the analyzer layer so the verdict rule (2+ MEDIUM events to flip) measures DISTINCT sandbox-detection paths touched, not raw read repetitions — a package that reads only `/proc/self/maps` stays clean (1 evasion event) but is preserved as a forensic breadcrumb; a package that reads maps + cgroup + status is flagged as an evasion cluster (3 distinct events). Path-less evasion events like `ptrace(TRACEME)` stack with sandbox probes as an independent modality and are never deduped against them. Reads attributable to the package manager rather than to the package are classified `env_probe` (LOW) instead: any such read during the download phase, where `--ignore-scripts` / `--only-binary` mean no package code executes, plus later reads of a path that phase already touched. The download phase is therefore a per-scan, measured baseline rather than a hardcoded exemption list — nothing the package ships runs while it is collected, so an attacker cannot widen it. Without this, node's two startup reads (`/proc/self/maps` + `/proc/self/cgroup`) landed on the 2+ MEDIUM threshold exactly and reported 94 of 96 popular npm packages as suspicious. Paths outside the baseline — `/proc/self/status` (TracerPid), `/proc/self/mountinfo`, `/sys/class/net` — remain `evasion`.
 
 - `.npmrc` and `.pypirc` are excluded (npm/pip read these during normal operation)
 - Events include `open_flags` (e.g. `O_RDONLY`) to indicate read/write intent
@@ -91,6 +91,8 @@ Two complementary detection strategies:
 ### DNS Tunneling Detection
 
 - Extracts DNS query domain from `sendto` payload when destination port is 53
+- Also extracts from connected sockets, where the destination is on the socket and absent from the syscall line: `sendto(fd, buf, len, flags, NULL, 0)` and the `msg_name=NULL` form of `sendmsg`/`sendmmsg`. glibc's `getaddrinfo` takes the latter path (it ships the A and AAAA questions in one `sendmmsg`), so this is the branch every ordinary hostname lookup goes through
+- Queries resolve: kojuto's in-sandbox resolver answers from 203.0.113.0/24, so a package that resolves a hostname proceeds to `connect()` and is classified `c2_communication` (HIGH) like any other outbound connection. The name → address mapping is deterministic, so the analyzer recomputes it to name the hostname behind a synthetic destination in the report
 - Parses DNS wire format (RFC 1035) to reconstruct the queried domain name
 - Events include `dns_query` field with the extracted domain
 - Heuristics for tunneling detection:
@@ -110,7 +112,7 @@ CLI (cobra)
   ├─ Downloader       Package download (pip / npm)
   │
   ├─ Sandbox          Docker container isolation
-  │   ├─ --network=none (zero network connectivity, no embedded DNS resolver)
+  │   ├─ --network=none (zero egress; DNS answered by a loopback-only resolver)
   │   ├─ Read-only rootfs + targeted tmpfs mounts
   │   ├─ cap-drop=ALL + custom seccomp profile
   │   ├─ no-new-privileges
@@ -184,7 +186,7 @@ CLI (cobra)
 
 | Setting | Value | Purpose |
 |---|---|---|
-| Network | `--network=none` | Zero network connectivity (no bridge, no embedded DNS resolver attack surface) |
+| Network | `--network=none` | Zero egress (no bridge, no Docker embedded DNS attack surface). Name resolution is answered by kojuto's own loopback resolver so hostname-based C2 still produces an observable `connect()` — see below |
 | Filesystem | `--read-only` + tmpfs | Restrict writes |
 | Capabilities | `--cap-drop=ALL` | Minimize privileges |
 | seccomp | Custom profile (always applied) | Block `mount`, `unshare`, `setns`, `bpf`, `io_uring_setup`/`io_uring_enter`/`io_uring_register`, `prctl(PR_SET_NAME)`, etc. `memfd_create` is intentionally allowed — the `execveat(fd, "", ..., AT_EMPTY_PATH)` fileless-loader pattern is caught downstream (see below), so blocking it silently would remove evidence rather than provide it. |
@@ -200,7 +202,7 @@ CLI (cobra)
 | Username | Host's actual username reflected in mount path |
 | CPU / Memory | Host's actual values mirrored (with caps) |
 | `/.dockerenv` | Removed on startup |
-| `/etc/resolv.conf` | Injected via `--dns=198.51.100.1` (RFC 5737 TEST-NET-2, guaranteed unreachable) so the file is non-empty without revealing isolation |
+| `/etc/resolv.conf` | Injected via `--dns=127.0.0.53` — systemd-resolved's stub address, so the file reads like an ordinary Ubuntu host. kojuto's synthetic resolver (`internal/sandbox/hooks/resolver.py`) listens there and answers every A query from 203.0.113.0/24 (RFC 5737 TEST-NET-3, never routable). Resolution succeeding is what makes the follow-up `connect()` observable; the connect still returns `ENETUNREACH` under `--network=none`, so no packet leaves the host |
 | Network | `--network=none` returns `ENETUNREACH` on `connect()`; combine with `--runtime runsc` to mask remaining `/proc/1/cgroup` and `/proc/self/mountinfo` signals |
 | Mount path | `/home/<host-user>/projects` (resembles host layout) |
 

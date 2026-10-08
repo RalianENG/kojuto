@@ -131,6 +131,36 @@ const (
 	// resolver work; until then containment (the download sandbox) is
 	// what bounds the blast radius of a malicious connect.
 	CategoryDownloadEgress = "download_egress"
+	// CategoryEnvProbe records a read of an environment /
+	// sandbox-detection path (/proc/self/maps, /proc/self/cgroup, ...)
+	// that is attributable to the package manager rather than to the
+	// scanned package. Two shapes land here, both LOW:
+	//
+	//   - Any such read during the download phase. That phase runs
+	//     `pip download` / `npm install --ignore-scripts`, so none of
+	//     the package's own code executes and every read is the
+	//     download tooling profiling its own runtime.
+	//   - The same path read again later in the scan. The download
+	//     phase doubles as a per-scan BASELINE of what the tooling
+	//     touches on its own; a path already in that baseline is not
+	//     fresh evidence when node re-reads it while the install phase
+	//     drives npm lifecycle hooks.
+	//
+	// Without this, node's two startup reads (/proc/self/maps and
+	// /proc/self/cgroup) landed on the "2+ MEDIUM → suspicious"
+	// threshold exactly, and 94 of 96 popular npm packages were
+	// reported suspicious on nothing but npm's own behavior.
+	//
+	// The cost is explicit and bounded: a package probing precisely the
+	// paths its own package manager probes gets LOW for those paths.
+	// Every path outside the measured baseline stays MEDIUM
+	// CategoryEvasion — /proc/self/status (the TracerPid read that
+	// reveals strace), /proc/self/mountinfo, /sys/class/net — which is
+	// where a real sandbox-detection sweep goes. The baseline is
+	// measured per scan, never a hardcoded path list, so it cannot be
+	// widened by an attacker: nothing the package ships runs during the
+	// phase that produces it.
+	CategoryEnvProbe = "env_probe"
 )
 
 // Category severity tiers drive verdict assignment in analyzer.Analyze.
@@ -168,6 +198,7 @@ var CategorySeverity = map[string]string{
 	CategoryUnknownBinary:    SeverityLow,
 	CategoryDNSLookup:        SeverityLow,
 	CategoryDownloadEgress:   SeverityLow,
+	CategoryEnvProbe:         SeverityLow,
 }
 
 // Scan phases. Stamped onto SyscallEvent.Phase so the analyzer can apply
@@ -179,6 +210,18 @@ const (
 	PhaseImport   = "import"
 	PhaseDownload = "download"
 )
+
+// SandboxResolverAddr is the address of the synthetic DNS resolver the
+// install/import sandbox runs on its loopback interface. It is the value
+// passed to docker's --dns, the address hooks/resolver.py binds, and the
+// peer the strace parser attributes a connected-socket DNS query to (the
+// kernel does not repeat the destination on a connected socket, so the
+// send line carries no sockaddr to read it from).
+//
+// 127.0.0.53 is systemd-resolved's stub address: /etc/resolv.conf inside
+// the sandbox reads like an ordinary Ubuntu host rather than announcing
+// an analysis environment.
+const SandboxResolverAddr = "127.0.0.53"
 
 // StaticFinding represents a suspicious pattern found by static analysis.
 type StaticFinding struct {
