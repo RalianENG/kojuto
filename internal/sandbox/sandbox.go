@@ -28,6 +28,16 @@ var seccompProfile []byte
 //go:embed hooks/resolver.py
 var resolverScript string
 
+// The audit hooks are templates: stageAuditHooks substitutes this scan's
+// wire prefix (and, for Python, the audited package list) before writing
+// them into the sandbox.
+var (
+	//go:embed hooks/sitecustomize.py
+	sitecustomizeTemplate string
+	//go:embed hooks/kojuto-require.js
+	requireHookTemplate string
+)
+
 // SandboxImage is the Docker image used for the sandbox container.
 const SandboxImage = "kojuto-sandbox:latest"
 
@@ -41,38 +51,10 @@ const SandboxContainerLabel = "kojuto.scan"
 // SandboxPythonVersion must match the Python version in Dockerfile.sandbox.
 const SandboxPythonVersion = "3.12"
 
-// probeScriptDir is the in-container directory kojuto stages its OWN
-// scripts in - the OS-simulation import probes and the synthetic DNS
-// resolver. containerArgs mounts it as a dedicated tmpfs with
-// mode=0755, so it stays root-owned: the scanned package runs as the
-// unprivileged dev user and can read and execute these scripts but
-// cannot create files here.
-//
-// The location is load-bearing, not cosmetic. The probes used to live
-// in /tmp/, which sitecustomize.py lists in _USER_PREFIXES because
-// malware drops payloads there. That made kojuto's own probe scripts
-// count as user code: every compile/exec they performed reached the
-// analyzer carrying the "+" user-origin marker, which deliberately
-// bypasses the path-based benign filter - even though that filter
-// already lists "_kojuto_probe_". A 100-package PyPI measurement
-// found 30,788 of 46,031 dynamic_code_execution events (67%) were
-// kojuto's own probes, burying real payload execs in kojuto's noise.
-// Staging outside every user prefix fixes it at the source, and a
-// root-owned directory means a package cannot buy the same
-// suppression by planting a file with a kojuto-looking name.
-const probeScriptDir = "/opt/kojuto/probe"
+// The scaffold directory, cache directory and every file kojuto stages
+// in the sandbox are named per scan; see scaffoldNames in scaffold.go.
 
 const (
-	// probeScriptPrefix is the full path prefix of every staged probe
-	// script; the suffix encodes the simulated OS (and, for batch
-	// scans, the "all_" multi-package form).
-	probeScriptPrefix = probeScriptDir + "/_kojuto_probe_"
-
-	// resolverScriptPath / resolverReadyPath are the staged synthetic
-	// DNS resolver and the marker it writes once its socket is bound.
-	resolverScriptPath = probeScriptDir + "/resolver.py"
-	resolverReadyPath  = probeScriptDir + "/.resolver-ready"
-
 	// syntheticResolverAddr is where that resolver listens, and the
 	// value handed to --dns. Shared with the strace parser, which
 	// attributes connected-socket DNS sends to it.
@@ -111,6 +93,8 @@ type Sandbox struct {
 	// seccompDir so it is cleaned up by the same Cleanup path.
 	dockerenvMask string
 	scanPkgs      []string
+	// names are this scan's random scaffold names; see scaffold().
+	names *scaffoldNames
 }
 
 // SetLocalMode enables local package installation mode (sdist support).
@@ -167,7 +151,10 @@ func resolveRuntime() string {
 // analysis Sandbox and the DownloadSandbox so both run under the same
 // restrictive seccomp profile.
 func writeSeccompFile() (opt, dir string, err error) {
-	dir, err = os.MkdirTemp("", "kojuto-seccomp-*")
+	// Unnamed on purpose: the dockerenv mask in this dir is bind-mounted into
+	// the sandbox, and a bind mount's source path is readable from inside
+	// the container in /proc/self/mountinfo.
+	dir, err = os.MkdirTemp("", "")
 	if err != nil {
 		return "", "", fmt.Errorf("creating seccomp temp dir: %w", err)
 	}
@@ -271,8 +258,8 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 		// (not 1777 like the other tmpfs mounts) leaves the directory
 		// root-owned, so the scanned package can read and execute what
 		// kojuto stages but cannot add or replace files here. See
-		// probeScriptDir for why the location matters.
-		"--tmpfs="+probeScriptDir+":nosuid,mode=0755,size=8m",
+		// scaffoldNames.dir for why the location matters.
+		"--tmpfs="+s.scaffold().dir+":nosuid,mode=0755,size=8m",
 		// dev owns its home, as on an ordinary account. It starts
 		// world-writable only because root holds no DAC override here and
 		// has to plant the honeypots first; plantHoneypotFiles closes it to
@@ -284,7 +271,7 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 		// persistence backstop. Keeps the "no /home/ writes" structural
 		// guarantee strict without path-based allowlists, which would let
 		// malicious packages smuggle artifacts under a benign-looking prefix.
-		"--tmpfs=/var/cache/kojuto:nosuid,mode=1777,size=200m",
+		"--tmpfs="+s.scaffold().cacheDir+":nosuid,mode=1777,size=200m",
 		"--memory="+mem,
 		"--cpus="+cpus,
 		"--pids-limit=256",
@@ -333,33 +320,22 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 			"--cap-add=SETUID", "--cap-add=SETGID")
 	}
 
-	// Audit hook: load kojuto-require.js before any user code in Node.js.
-	// This intercepts eval/Function/vm dynamic code execution.
+	// Audit hook: load the Node require hook (staged by stageAuditHooks)
+	// before any user code. This intercepts eval/Function/vm dynamic code
+	// execution.
 	//
 	// NPM_CONFIG_CACHE / PIP_CACHE_DIR pin package-manager caches to the
-	// dedicated /var/cache/kojuto tmpfs. Without these, npm writes
+	// dedicated cache tmpfs. Without these, npm writes
 	// /home/dev/.npm/_logs and pip writes /home/dev/.cache/pip — both
 	// correctly flagged as persistence by the /home/ structural backstop
 	// in the analyzer. Redirecting at the sandbox layer is preferable to
 	// relaxing the detection rule: the rule stays strict, while
 	// legitimate cache I/O goes to a path the analyzer never inspects.
 	args = append(args,
-		"--env=NODE_OPTIONS=--require /opt/kojuto/kojuto-require.js",
-		"--env=NPM_CONFIG_CACHE=/var/cache/kojuto/npm",
-		"--env=PIP_CACHE_DIR=/var/cache/kojuto/pip",
+		"--env=NODE_OPTIONS=--require "+s.scaffold().requireHook,
+		"--env=NPM_CONFIG_CACHE="+s.scaffold().cacheDir+"/npm",
+		"--env=PIP_CACHE_DIR="+s.scaffold().cacheDir+"/pip",
 	)
-
-	// Tell sitecustomize.py which packages are being audited so its
-	// frame-walking logic can flag dynamic exec originating in those
-	// packages while suppressing internal exec calls from compat
-	// libraries (six, future, attrs) loaded as dependencies.
-	pkgs := s.scanPkgs
-	if len(pkgs) == 0 && s.pkg != "" {
-		pkgs = []string{s.pkg}
-	}
-	if len(pkgs) > 0 {
-		args = append(args, "--env=KOJUTO_SCAN_PKGS="+strings.Join(pkgs, ","))
-	}
 
 	// Honeypot environment variables: simulate a CI/developer machine to
 	// trigger environment-gated malware (e.g. "if CI: exfiltrate()").
@@ -650,6 +626,9 @@ func (s *Sandbox) prepareSandboxState(ctx context.Context) error {
 	if err := s.restoreLocalBin(ctx); err != nil {
 		return fmt.Errorf("restoring sandbox tmpfs overlays: %w", err)
 	}
+	if err := s.stageAuditHooks(ctx); err != nil {
+		return fmt.Errorf("staging audit hooks: %w", err)
+	}
 	if err := s.plantHoneypotFiles(ctx); err != nil {
 		return fmt.Errorf("planting honeypot files: %w", err)
 	}
@@ -659,7 +638,7 @@ func (s *Sandbox) prepareSandboxState(ctx context.Context) error {
 	return nil
 }
 
-// startSyntheticResolver stages hooks/resolver.py into probeScriptDir
+// startSyntheticResolver stages hooks/resolver.py into the scaffold dir
 // and launches it as a detached root process, then blocks until the
 // resolver reports its socket bound.
 //
@@ -681,7 +660,7 @@ func (s *Sandbox) prepareSandboxState(ctx context.Context) error {
 // today - a silent detection regression is exactly what this code
 // exists to prevent.
 func (s *Sandbox) startSyntheticResolver(ctx context.Context) error {
-	if err := s.dockerWriteFile(ctx, resolverScriptPath, resolverScript); err != nil {
+	if err := s.dockerWriteFile(ctx, s.scaffold().resolver, resolverScript); err != nil {
 		return fmt.Errorf("staging resolver script: %w", err)
 	}
 
@@ -690,7 +669,7 @@ func (s *Sandbox) startSyntheticResolver(ctx context.Context) error {
 	// container. Run as root so the scanned package - which runs as
 	// dev - cannot signal or replace the resolver mid-scan.
 	cmd := execCommand(ctx, "docker", "exec", "-d", "--user=root", s.containerID,
-		"sh", "-c", "exec python3 "+shQuote(resolverScriptPath))
+		"sh", "-c", "exec python3 "+shQuote(s.scaffold().resolver)+" "+shQuote(s.scaffold().resolverReady))
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	if err := cmd.Run(); err != nil {
@@ -698,7 +677,7 @@ func (s *Sandbox) startSyntheticResolver(ctx context.Context) error {
 	}
 
 	for range resolverReadyAttempts {
-		if err := s.dockerExecRoot(ctx, "test", "-f", resolverReadyPath); err == nil {
+		if err := s.dockerExecRoot(ctx, "test", "-f", s.scaffold().resolverReady); err == nil {
 			return nil
 		}
 		select {
@@ -804,11 +783,11 @@ func (s *Sandbox) InstallPackage(ctx context.Context) ([]byte, error) {
 	return s.Exec(ctx, cmd)
 }
 
-// installScriptPath is the in-container location where the probe stages
-// its install script before strace attaches. Sits on the dedicated
-// /var/cache/kojuto tmpfs configured in containerArgs.
+// The install script is staged at scaffoldNames.installScript before
+// strace attaches. It sits on the dedicated cache tmpfs configured in
+// containerArgs.
 //
-// The probe is invoked as `sh <installScriptPath>` rather than the
+// The probe is invoked as `sh <install script>` rather than the
 // previous `sh -c <inline script>`. The shape difference matters: the
 // analyzer's classifyExecve treats `sh -c ...` as a positive attack
 // signature when the contents fail isShellCmdBenign, which produces a
@@ -821,18 +800,16 @@ func (s *Sandbox) InstallPackage(ctx context.Context) ([]byte, error) {
 // Attackers cannot mimic this shape: the cmdline of a shell spawned
 // from a package's preinstall hook is determined by npm/yarn/pnpm
 // (`sh -c <package script>`), not by the package itself.
-const installScriptPath = "/var/cache/kojuto/install.sh"
-
-// stageInstallScript writes content to installScriptPath inside the
+// stageInstallScript writes content to the install script path inside the
 // running container. Used by InstallCommand/InstallAllCommand to stage
 // the probe script before strace attaches. The write happens via a
 // separate docker exec session, so the syscalls it produces are not
 // observed by the install-phase strace.
 func (s *Sandbox) stageInstallScript(ctx context.Context, content string) ([]string, error) {
-	if err := s.dockerWriteFile(ctx, installScriptPath, content); err != nil {
+	if err := s.dockerWriteFile(ctx, s.scaffold().installScript, content); err != nil {
 		return nil, fmt.Errorf("stage install script: %w", err)
 	}
-	return []string{"sh", installScriptPath}, nil
+	return []string{"sh", s.scaffold().installScript}, nil
 }
 
 // InstallCommand returns the install command for the ecosystem. For
@@ -840,7 +817,7 @@ func (s *Sandbox) stageInstallScript(ctx context.Context, content string) ([]str
 // local-mode pip glob expansion), this method writes the install
 // script to the container's tmpfs first and returns a file-path-based
 // command so the outer probe shell does not trigger the analyzer's
-// `sh -c` attack-signature branch. See installScriptPath for the
+// `sh -c` attack-signature branch. See stageInstallScript for the
 // design rationale.
 func (s *Sandbox) InstallCommand(ctx context.Context) ([]string, error) {
 	if s.ecosystem == types.EcosystemNpm {
@@ -1001,7 +978,7 @@ func shQuote(s string) string {
 // hiding platform-gated payloads — that is itself a false-clean vector.
 func (s *Sandbox) WriteProbeScriptsMulti(ctx context.Context, pkgs []string) error {
 	if s.ecosystem == types.EcosystemNpm {
-		nodeImportSource := nodeImportProbeSource(pkgs)
+		nodeImportSource := nodeImportProbeSource(pkgs, s.scaffold().auditPrefix)
 		for _, p := range []string{"linux", "win32", "darwin"} {
 			script := fmt.Sprintf(
 				"module.paths.unshift('/install/node_modules');\n"+
@@ -1009,7 +986,7 @@ func (s *Sandbox) WriteProbeScriptsMulti(ctx context.Context, pkgs []string) err
 					"%s",
 				p, nodeImportSource,
 			)
-			filename := probeScriptPrefix + "all_" + p + ".js"
+			filename := s.scaffold().probe("all_" + p + ".js")
 			if err := s.dockerWriteFile(ctx, filename, script); err != nil {
 				return err
 			}
@@ -1030,7 +1007,7 @@ func (s *Sandbox) WriteProbeScriptsMulti(ctx context.Context, pkgs []string) err
 		{"Windows", "win32", "nt", "\\\\", ";", "\\r\\n"},
 		{"Darwin", "darwin", "posix", "/", ":", "\\n"},
 	}
-	importProbeSource := pythonImportProbeSource(pkgs)
+	importProbeSource := pythonImportProbeSource(pkgs, s.scaffold().auditPrefix)
 	for _, p := range pyPlatforms {
 		script := fmt.Sprintf(
 			"import platform,sys,os,collections\n"+
@@ -1049,7 +1026,7 @@ func (s *Sandbox) WriteProbeScriptsMulti(ctx context.Context, pkgs []string) err
 			p.system, p.system, p.sysplatform, p.osname,
 			p.sep, p.pathsep, p.linesep, importProbeSource,
 		)
-		filename := probeScriptPrefix + "all_" + p.sysplatform + ".py"
+		filename := s.scaffold().probe("all_" + p.sysplatform + ".py")
 		if err := s.dockerWriteFile(ctx, filename, script); err != nil {
 			return err
 		}
@@ -1062,15 +1039,15 @@ func (s *Sandbox) ImportCommandsMulti(pkgs []string) [][]string {
 	_ = pkgs // package list is already baked into the script files
 	if s.ecosystem == types.EcosystemNpm {
 		return [][]string{
-			wrapWithFaketime([]string{"node", probeScriptPrefix + "all_linux.js"}),
-			wrapWithFaketime([]string{"node", probeScriptPrefix + "all_win32.js"}),
-			wrapWithFaketime([]string{"node", probeScriptPrefix + "all_darwin.js"}),
+			wrapWithFaketime([]string{"node", s.scaffold().probe("all_linux.js")}),
+			wrapWithFaketime([]string{"node", s.scaffold().probe("all_win32.js")}),
+			wrapWithFaketime([]string{"node", s.scaffold().probe("all_darwin.js")}),
 		}
 	}
 	return [][]string{
-		wrapWithFaketime([]string{"python3", probeScriptPrefix + "all_linux.py"}),
-		wrapWithFaketime([]string{"python3", probeScriptPrefix + "all_win32.py"}),
-		wrapWithFaketime([]string{"python3", probeScriptPrefix + "all_darwin.py"}),
+		wrapWithFaketime([]string{"python3", s.scaffold().probe("all_linux.py")}),
+		wrapWithFaketime([]string{"python3", s.scaffold().probe("all_win32.py")}),
+		wrapWithFaketime([]string{"python3", s.scaffold().probe("all_darwin.py")}),
 	}
 }
 
@@ -1092,7 +1069,7 @@ func (s *Sandbox) ImportCommands() [][]string {
 
 // pythonImportProbeSource emits a Python snippet that resolves each dist
 // name in `dists` to the actual top-level module name(s) at runtime and
-// attempts to import each. Every attempt writes a KOJUTO:import_attempt:
+// attempts to import each. Every attempt writes a <prefix>import_attempt:
 // line to stderr so the analyzer can observe (a) that the import phase
 // actually ran and (b) whether any import succeeded. Historically the
 // probe used a naive `pkg.replace("-", "_")` and swallowed ImportError,
@@ -1108,23 +1085,23 @@ func (s *Sandbox) ImportCommands() [][]string {
 // dist-name so packages without top_level.txt still import the obvious
 // way. importlib.metadata is stdlib since Python 3.8; the sandbox
 // image ships Python 3.12 so no compatibility shim is needed.
-func pythonImportProbeSource(dists []string) string {
+func pythonImportProbeSource(dists []string, prefix string) string {
 	distList := make([]string, len(dists))
 	for i, d := range dists {
 		distList[i] = `'` + strings.ReplaceAll(d, "'", `\'`) + `'`
 	}
-	return `_KJ_DISTS=[` + strings.Join(distList, ",") + `]
-import sys as _kj_sys
+	return `_DISTS=[` + strings.Join(distList, ",") + `]
+import sys as _sys
 try:
- from importlib import metadata as _kj_md
+ from importlib import metadata as _md
 except Exception:
- _kj_md=None
-def _kj_resolve(dist):
+ _md=None
+def _resolve(dist):
  canon=dist.lower().replace('-','_')
- if _kj_md is None:
+ if _md is None:
   return [canon]
  try:
-  files=_kj_md.files(dist) or []
+  files=_md.files(dist) or []
  except Exception:
   return [canon]
  for f in files:
@@ -1147,14 +1124,14 @@ def _kj_resolve(dist):
   elif p.endswith('/__init__.py') and p.count('/')==1:
    top.add(p.split('/')[0])
  return sorted(top) if top else [canon]
-for _kj_d in _KJ_DISTS:
- for _kj_n in _kj_resolve(_kj_d):
+for _d in _DISTS:
+ for _n in _resolve(_d):
   try:
-   __import__(_kj_n)
-   _kj_sys.stderr.write('KOJUTO:import_attempt:'+_kj_d+':'+_kj_n+':ok\n')
+   __import__(_n)
+   _sys.stderr.write('` + prefix + `import_attempt:'+_d+':'+_n+':ok\n')
   except BaseException as _e:
-   _kj_sys.stderr.write('KOJUTO:import_attempt:'+_kj_d+':'+_kj_n+':fail:'+type(_e).__name__+'\n')
-_kj_sys.stderr.flush()
+   _sys.stderr.write('` + prefix + `import_attempt:'+_d+':'+_n+':fail:'+type(_e).__name__+'\n')
+_sys.stderr.flush()
 `
 }
 
@@ -1162,15 +1139,15 @@ _kj_sys.stderr.flush()
 // pythonImportProbeSource: try to require() each package; on
 // ERR_REQUIRE_ESM (or module-not-found via CJS on ESM-only packages),
 // fall back to dynamic import(). Every attempt emits a
-// KOJUTO:import_attempt: line so the analyzer can observe reality.
-func nodeImportProbeSource(pkgs []string) string {
+// <prefix>import_attempt: line so the analyzer can observe reality.
+func nodeImportProbeSource(pkgs []string, prefix string) string {
 	pkgList := make([]string, len(pkgs))
 	for i, p := range pkgs {
 		pkgList[i] = `'` + strings.ReplaceAll(p, "'", `\'`) + `'`
 	}
-	return `const _KJ_PKGS=[` + strings.Join(pkgList, ",") + `];
+	return `const _PKGS=[` + strings.Join(pkgList, ",") + `];
 (async()=>{
- for(const p of _KJ_PKGS){
+ for(const p of _PKGS){
   let ok=false, err='';
   try{require(p); ok=true;}
   catch(e){
@@ -1179,7 +1156,7 @@ func nodeImportProbeSource(pkgs []string) string {
     try{await import(p); ok=true; err='';}catch(e2){err=e2&&e2.code?e2.code:(e2&&e2.name?e2.name:'Error');}
    }
   }
-  process.stderr.write('KOJUTO:import_attempt:'+p+':'+p+':'+(ok?'ok':('fail:'+err))+'\n');
+  process.stderr.write('` + prefix + `import_attempt:'+p+':'+p+':'+(ok?'ok':('fail:'+err))+'\n');
  }
 })();
 `
@@ -1189,7 +1166,7 @@ func nodeImportProbeSource(pkgs []string) string {
 // /tmp directory. Must be called before ImportCommands. Returns an error if any
 // script fails to land — see WriteProbeScriptsMulti for the rationale.
 func (s *Sandbox) WriteProbeScripts(ctx context.Context) error {
-	importProbeSource := pythonImportProbeSource([]string{s.pkg})
+	importProbeSource := pythonImportProbeSource([]string{s.pkg}, s.scaffold().auditPrefix)
 
 	// Each simulated OS must be consistent across ALL platform detection APIs.
 	// Malware checks platform.system() vs platform.uname().system, os.sep vs
@@ -1233,13 +1210,13 @@ func (s *Sandbox) WriteProbeScripts(ctx context.Context) error {
 			p.system, p.system, p.sysplatform, p.osname,
 			p.sep, p.pathsep, p.linesep, importProbeSource,
 		)
-		filename := probeScriptPrefix + p.sysplatform + ".py"
+		filename := s.scaffold().probe(p.sysplatform + ".py")
 		if err := s.dockerWriteFile(ctx, filename, script); err != nil {
 			return err
 		}
 	}
 
-	nodeImportSource := nodeImportProbeSource([]string{s.pkg})
+	nodeImportSource := nodeImportProbeSource([]string{s.pkg}, s.scaffold().auditPrefix)
 	jsPlatforms := []string{"linux", "win32", "darwin"}
 	for _, p := range jsPlatforms {
 		script := fmt.Sprintf(
@@ -1248,7 +1225,7 @@ func (s *Sandbox) WriteProbeScripts(ctx context.Context) error {
 				"%s",
 			p, nodeImportSource,
 		)
-		filename := probeScriptPrefix + p + ".js"
+		filename := s.scaffold().probe(p + ".js")
 		if err := s.dockerWriteFile(ctx, filename, script); err != nil {
 			return err
 		}
@@ -1308,9 +1285,9 @@ func wrapWithFaketime(cmd []string) []string {
 // Commands are wrapped with libfaketime to trigger date-gated payloads.
 func (s *Sandbox) pythonImportCommands() [][]string {
 	return [][]string{
-		wrapWithFaketime([]string{"python3", probeScriptPrefix + "linux.py"}),
-		wrapWithFaketime([]string{"python3", probeScriptPrefix + "win32.py"}),
-		wrapWithFaketime([]string{"python3", probeScriptPrefix + "darwin.py"}),
+		wrapWithFaketime([]string{"python3", s.scaffold().probe("linux.py")}),
+		wrapWithFaketime([]string{"python3", s.scaffold().probe("win32.py")}),
+		wrapWithFaketime([]string{"python3", s.scaffold().probe("darwin.py")}),
 	}
 }
 
@@ -1319,9 +1296,9 @@ func (s *Sandbox) pythonImportCommands() [][]string {
 // Commands are wrapped with libfaketime to trigger date-gated payloads.
 func (s *Sandbox) nodeImportCommands() [][]string {
 	return [][]string{
-		wrapWithFaketime([]string{"node", probeScriptPrefix + "linux.js"}),
-		wrapWithFaketime([]string{"node", probeScriptPrefix + "win32.js"}),
-		wrapWithFaketime([]string{"node", probeScriptPrefix + "darwin.js"}),
+		wrapWithFaketime([]string{"node", s.scaffold().probe("linux.js")}),
+		wrapWithFaketime([]string{"node", s.scaffold().probe("win32.js")}),
+		wrapWithFaketime([]string{"node", s.scaffold().probe("darwin.js")}),
 	}
 }
 

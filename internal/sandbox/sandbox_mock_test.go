@@ -177,9 +177,11 @@ func TestContainerArgs(t *testing.T) {
 		// Package-manager caches must be pinned outside /home/ so the
 		// persistence backstop can stay strict (any /home/ write is
 		// illegitimate). See containerArgs cache-redirect block.
-		"--tmpfs=/var/cache/kojuto:",
-		"--env=NPM_CONFIG_CACHE=/var/cache/kojuto/npm",
-		"--env=PIP_CACHE_DIR=/var/cache/kojuto/pip",
+		"--tmpfs=" + sb.scaffold().cacheDir + ":",
+		"--env=NPM_CONFIG_CACHE=" + sb.scaffold().cacheDir + "/npm",
+		"--env=PIP_CACHE_DIR=" + sb.scaffold().cacheDir + "/pip",
+		// The Node audit hook is loaded from the scaffold dir.
+		"--env=NODE_OPTIONS=--require " + sb.scaffold().requireHook,
 		// Identifies the container as kojuto-managed so
 		// CleanupStaleSandboxContainers can sweep orphans without
 		// disturbing unrelated Docker workloads.
@@ -191,7 +193,7 @@ func TestContainerArgs(t *testing.T) {
 		// kojuto's probe scripts and resolver live on their own
 		// root-owned tmpfs, outside every path the audit hook counts as
 		// user code.
-		"--tmpfs=" + probeScriptDir + ":",
+		"--tmpfs=" + sb.scaffold().dir + ":",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("containerArgs missing %q in:\n%s", want, joined)

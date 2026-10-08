@@ -433,7 +433,7 @@ func runBatchScreening(deps []depfile.Dep, ecosystem string) (string, error) {
 	defer cancel()
 
 	// Download all packages into one directory.
-	tmpDir, err := os.MkdirTemp("", "kojuto-batch-*")
+	tmpDir, err := os.MkdirTemp("", "") // unnamed: mounted into the sandbox, see writeSeccompFile
 	if err != nil {
 		return "", fmt.Errorf("creating temp dir: %w", err)
 	}
@@ -476,7 +476,7 @@ func runBatchScreening(deps []depfile.Dep, ecosystem string) (string, error) {
 
 	// Install all packages at once with strace.
 	installPhase := startPhase("install", fmt.Sprintf("%d packages", len(pkgNames)))
-	cp := probe.NewContainerStrace()
+	cp := probe.NewContainerStrace(sb.Markers())
 	installCmd, installCmdErr := sb.InstallAllCommand(ctx, pkgNames)
 	if installCmdErr != nil {
 		return "", fmt.Errorf("staging install command: %w", installCmdErr)
@@ -505,7 +505,7 @@ func runBatchScreening(deps []depfile.Dep, ecosystem string) (string, error) {
 	osNames := []string{"Linux", "Windows", "macOS"}
 
 	importPhase := startPhase("import", fmt.Sprintf("%d packages, %d OSes parallel", len(pkgNames), len(importCmds)))
-	importEvents, _ := runImportsParallel(ctx, sb.ContainerID(), importCmds, osNames)
+	importEvents, _ := runImportsParallel(ctx, sb.ContainerID(), sb.Markers(), importCmds, osNames)
 	events = append(events, importEvents...)
 	importPhase.end()
 	benchLog("import_drain", len(events))
@@ -543,7 +543,7 @@ func runBatchScreening(deps []depfile.Dep, ecosystem string) (string, error) {
 // counter — are indistinguishable at a call site otherwise, which is
 // what gocritic's unnamedResult check is pointing at. Returns stay
 // explicit rather than naked.
-func runImportsParallel(ctx context.Context, containerID string, importCmds [][]string, osNames []string) (events []types.SyscallEvent, dropped uint64) {
+func runImportsParallel(ctx context.Context, containerID string, markers types.ScanMarkers, importCmds [][]string, osNames []string) (events []types.SyscallEvent, dropped uint64) {
 	type slot struct {
 		events  []types.SyscallEvent
 		dropped uint64
@@ -555,7 +555,7 @@ func runImportsParallel(ctx context.Context, containerID string, importCmds [][]
 		wg.Add(1)
 		go func(i int, cmd []string) {
 			defer wg.Done()
-			ip := probe.NewContainerStrace()
+			ip := probe.NewContainerStrace(markers)
 			_, err := ip.StartAndInstall(ctx, containerID, cmd)
 			var evs []types.SyscallEvent
 			for evt := range ip.Events() {
@@ -763,7 +763,7 @@ func runLocalScan(_ []string) error {
 		pkg = detectPackageFromDir(localPath)
 	} else {
 		// Single file: copy to temp directory.
-		tmpDir, tmpErr := os.MkdirTemp("", "kojuto-local-*")
+		tmpDir, tmpErr := os.MkdirTemp("", "") // unnamed: mounted into the sandbox, see writeSeccompFile
 		if tmpErr != nil {
 			return fmt.Errorf("creating temp dir: %w", tmpErr)
 		}
@@ -948,7 +948,7 @@ type localNpmStaging struct {
 // soon-to-be world-writable directory sitting directly in the system temp
 // directory where any local user could drop a tarball into the scan.
 func prepareLocalNpm(ctx context.Context, sourceDir, pkg string) (localNpmStaging, error) {
-	root, err := os.MkdirTemp("", "kojuto-local-npm-*")
+	root, err := os.MkdirTemp("", "") // unnamed: mounted into the sandbox, see writeSeccompFile
 	if err != nil {
 		return localNpmStaging{}, fmt.Errorf("creating npm staging dir: %w", err)
 	}
@@ -971,7 +971,7 @@ func prepareLocalNpm(ctx context.Context, sourceDir, pkg string) (localNpmStagin
 	}
 
 	pkgJSON := map[string]interface{}{
-		"name":         "kojuto-local-staging",
+		"name":         downloader.StagingProjectName,
 		"private":      true,
 		"dependencies": map[string]string{pkg: "file:./" + tgzName},
 	}
@@ -1024,7 +1024,7 @@ func stageFile(src, dst string) error {
 func downloadPackage(ctx context.Context, pkg string) (string, []types.SyscallEvent, error) {
 	phaseInfo("download", fmt.Sprintf("%s (%s)", pkg, flagEcosystem))
 
-	tmpDir, err := os.MkdirTemp("", "kojuto-*")
+	tmpDir, err := os.MkdirTemp("", "") // unnamed: mounted into the sandbox, see writeSeccompFile
 	if err != nil {
 		return "", nil, fmt.Errorf("creating temp dir: %w", err)
 	}
@@ -1238,7 +1238,7 @@ func runStraceProbe(ctx context.Context, sb *sandbox.Sandbox, pkg string) (*scan
 
 func runContainerStraceProbe(ctx context.Context, sb *sandbox.Sandbox, _ string) (*scanResult, error) {
 	// Phase 1: Install with strace monitoring.
-	cp := probe.NewContainerStrace()
+	cp := probe.NewContainerStrace(sb.Markers())
 	installPhase := startPhase("install", "")
 
 	installCmd, err := sb.InstallCommand(ctx)
@@ -1269,7 +1269,7 @@ func runContainerStraceProbe(ctx context.Context, sb *sandbox.Sandbox, _ string)
 	osNames := []string{"Linux", "Windows", "macOS"}
 
 	importPhase := startPhase("import", fmt.Sprintf("%d OSes parallel", len(importCmds)))
-	importEvents, importDropped := runImportsParallel(ctx, sb.ContainerID(), importCmds, osNames)
+	importEvents, importDropped := runImportsParallel(ctx, sb.ContainerID(), sb.Markers(), importCmds, osNames)
 	events = append(events, importEvents...)
 	dropped += importDropped
 	importPhase.end()

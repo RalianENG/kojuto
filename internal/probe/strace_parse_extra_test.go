@@ -712,7 +712,7 @@ func TestParseOpenat_HomeReadNotEmitted(t *testing.T) {
 
 func TestParseAuditHook_PythonCompile(t *testing.T) {
 	line := "KOJUTO:compile:evil.py:b'import os\\nos.getcwd()'"
-	evt, ok := parseAuditHook(line)
+	evt, ok := parseAuditHook(line, testAuditState())
 	if !ok {
 		t.Fatal("expected audit hook parse to succeed")
 	}
@@ -732,7 +732,7 @@ func TestParseAuditHook_PythonCompile(t *testing.T) {
 
 func TestParseAuditHook_PythonExec(t *testing.T) {
 	line := `KOJUTO:exec:evil.py:<code object <module> at 0x7f0fc81cd020, file "evil.py", line 1>`
-	evt, ok := parseAuditHook(line)
+	evt, ok := parseAuditHook(line, testAuditState())
 	if !ok {
 		t.Fatal("expected audit hook parse to succeed")
 	}
@@ -746,7 +746,7 @@ func TestParseAuditHook_PythonExec(t *testing.T) {
 
 func TestParseAuditHook_NodeEval(t *testing.T) {
 	line := "KOJUTO:eval:process.env.GITHUB_TOKEN"
-	evt, ok := parseAuditHook(line)
+	evt, ok := parseAuditHook(line, testAuditState())
 	if !ok {
 		t.Fatal("expected Node.js eval audit hook parse to succeed")
 	}
@@ -760,7 +760,7 @@ func TestParseAuditHook_NodeEval(t *testing.T) {
 
 func TestParseAuditHook_NodeFunction(t *testing.T) {
 	line := "KOJUTO:Function:return process.env.AWS_SECRET_ACCESS_KEY"
-	evt, ok := parseAuditHook(line)
+	evt, ok := parseAuditHook(line, testAuditState())
 	if !ok {
 		t.Fatal("expected Function audit hook parse to succeed")
 	}
@@ -771,7 +771,7 @@ func TestParseAuditHook_NodeFunction(t *testing.T) {
 
 func TestParseAuditHook_NodeVm(t *testing.T) {
 	line := `KOJUTO:vm.runInNewContext:typeof process !== "undefined" && process.env.NPM_TOKEN`
-	evt, ok := parseAuditHook(line)
+	evt, ok := parseAuditHook(line, testAuditState())
 	if !ok {
 		t.Fatal("expected vm.runInNewContext audit hook parse to succeed")
 	}
@@ -831,7 +831,7 @@ func TestParseAuditHook_ImportAttempt(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			evt, ok := parseAuditHook(tc.line)
+			evt, ok := parseAuditHook(tc.line, testAuditState())
 			if ok != tc.wantOK {
 				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
 			}
@@ -861,7 +861,7 @@ func TestParseAuditHook_NotKojutoLine(t *testing.T) {
 		`some random strace output`,
 	}
 	for _, line := range lines {
-		_, ok := parseAuditHook(line)
+		_, ok := parseAuditHook(line, testAuditState())
 		if ok {
 			t.Errorf("non-KOJUTO line should not parse: %q", line)
 		}
@@ -870,41 +870,41 @@ func TestParseAuditHook_NotKojutoLine(t *testing.T) {
 
 func TestIsBenignAuditEvent_Import(t *testing.T) {
 	// All import events are benign.
-	if !isBenignAuditEvent("import", "", "os") {
+	if !isBenignAuditEvent("import", "", "os", testScaffoldDir) {
 		t.Error("import os should be benign")
 	}
-	if !isBenignAuditEvent("import", "", "malicious_package") {
+	if !isBenignAuditEvent("import", "", "malicious_package", testScaffoldDir) {
 		t.Error("all imports should be benign (caught by openat/execve)")
 	}
 }
 
 func TestIsBenignAuditEvent_StdlibCompile(t *testing.T) {
 	// compile from standard library path.
-	if !isBenignAuditEvent("compile", "/usr/local/lib/python3.12/re/__init__.py", "b'...'") {
+	if !isBenignAuditEvent("compile", "/usr/local/lib/python3.12/re/__init__.py", "b'...'", testScaffoldDir) {
 		t.Error("stdlib compile should be benign")
 	}
 	// compile from frozen module.
-	if !isBenignAuditEvent("compile", "<frozen importlib>", "b'...'") {
+	if !isBenignAuditEvent("compile", "<frozen importlib>", "b'...'", testScaffoldDir) {
 		t.Error("frozen module compile should be benign")
 	}
 }
 
 func TestIsBenignAuditEvent_DataclassCodegen(t *testing.T) {
-	if !isBenignAuditEvent("compile", "<string>", `b"def __create_fn__(__dataclass_type_name__):\n..."`) {
+	if !isBenignAuditEvent("compile", "<string>", `b"def __create_fn__(__dataclass_type_name__):\n..."`, testScaffoldDir) {
 		t.Error("dataclass codegen should be benign")
 	}
 }
 
 func TestIsBenignAuditEvent_ShortStringSnippet(t *testing.T) {
 	// Short snippets from <string> are interpreter internals.
-	if !isBenignAuditEvent("compile", "<string>", "b'int'") {
+	if !isBenignAuditEvent("compile", "<string>", "b'int'", testScaffoldDir) {
 		t.Error("short <string> snippet should be benign")
 	}
 }
 
 func TestIsBenignAuditEvent_SuspiciousExec(t *testing.T) {
 	// exec from a non-stdlib file should NOT be benign.
-	if isBenignAuditEvent("exec", "evil.py", "<code object>") {
+	if isBenignAuditEvent("exec", "evil.py", "<code object>", testScaffoldDir) {
 		t.Error("exec from evil.py should be suspicious")
 	}
 }
@@ -913,16 +913,37 @@ func TestIsBenignAuditEvent_NodeEventsNeverBenign(t *testing.T) {
 	// Node.js audit events must never be filtered.
 	nodeEvents := []string{"eval", "Function", "vm.runInNewContext", "vm.runInThisContext", "vm.Script"}
 	for _, event := range nodeEvents {
-		if isBenignAuditEvent(event, "", "short") {
+		if isBenignAuditEvent(event, "", "short", testScaffoldDir) {
 			t.Errorf("Node.js event %q should never be benign", event)
 		}
 	}
 }
 
 func TestIsBenignAuditEvent_KojutoProbeScript(t *testing.T) {
-	// kojuto's own probe scripts should be filtered.
-	if !isBenignAuditEvent("exec", "/opt/kojuto/probe/_kojuto_probe_win32.py", "<code object>") {
-		t.Error("kojuto probe script should be benign")
+	// kojuto's own probe scripts live in the scan's scaffold directory
+	// and are filtered by directory.
+	if !isBenignAuditEvent("exec", testScaffoldDir+"/k2j4h1x9.py", "<code object>", testScaffoldDir) {
+		t.Error("probe script in the scaffold dir should be benign")
+	}
+	// The scaffold path is visible to the package (NODE_OPTIONS names a
+	// file in it), so only a directory prefix exempts — the path embedded
+	// anywhere else in a filename must not.
+	for _, fn := range []string{
+		"/tmp" + testScaffoldDir + "/x.py",
+		"/tmp/x" + testScaffoldDir + ".py",
+		testScaffoldDir + "-evil/x.py",
+	} {
+		if isBenignAuditEvent("exec", fn, "<code object>", testScaffoldDir) {
+			t.Errorf("%q borrowed the scaffold exemption", fn)
+		}
+	}
+	// A user-origin frame wins even inside the scaffold dir.
+	if isBenignAuditEvent("exec", "+"+testScaffoldDir+"/x.py", "<code object>", testScaffoldDir) {
+		t.Error("user-marked event exempted by the scaffold dir")
+	}
+	// Without markers nothing is exempted by directory.
+	if isBenignAuditEvent("exec", testScaffoldDir+"/x.py", "<code object>", "") {
+		t.Error("empty scaffold dir exempted a file")
 	}
 }
 
@@ -933,12 +954,12 @@ func TestIsBenignAuditEvent_KojutoProbeScript(t *testing.T) {
 func TestIsBenignAuditEvent_UserOriginMarker(t *testing.T) {
 	// Site-packages path looks benign on its face but the "+" marker
 	// says it's the scanned package — must report.
-	if isBenignAuditEvent("exec", "+/usr/local/lib/python3.12/site-packages/evil_pkg/__init__.py", "<code object>") {
+	if isBenignAuditEvent("exec", "+/usr/local/lib/python3.12/site-packages/evil_pkg/__init__.py", "<code object>", testScaffoldDir) {
 		t.Error("user-marked site-packages exec should be suspicious")
 	}
 	// Same path without the marker is benign (compat library doing
 	// its own internal exec).
-	if !isBenignAuditEvent("exec", "/usr/local/lib/python3.12/site-packages/six.py", "<code object>") {
+	if !isBenignAuditEvent("exec", "/usr/local/lib/python3.12/site-packages/six.py", "<code object>", testScaffoldDir) {
 		t.Error("unmarked site-packages exec should be benign")
 	}
 }
@@ -947,7 +968,7 @@ func TestParseAuditHook_StripsUserOriginMarker(t *testing.T) {
 	// The "+" prefix is wire-protocol detail; FilePath in the parsed
 	// event must not retain it.
 	line := "KOJUTO:exec:+/usr/local/lib/python3.12/site-packages/evil_pkg/__init__.py:<code object>"
-	evt, ok := parseAuditHook(line)
+	evt, ok := parseAuditHook(line, testAuditState())
 	if !ok {
 		t.Fatal("expected audit hook parse to succeed")
 	}
@@ -1084,7 +1105,7 @@ func TestParseOpenat_InstalledPackageWrite(t *testing.T) {
 }
 
 func TestParseAuditHook_IntegratedWithParseStraceLine(t *testing.T) {
-	state := NewParseState()
+	state := testAuditState()
 
 	// KOJUTO: line should be parsed by parseStraceLine via parseAuditHook.
 	line := "KOJUTO:eval:require('child_process').execSync('whoami')"
@@ -1597,5 +1618,34 @@ func TestPathNormalization_TrackTmpAndUnlink(t *testing.T) {
 	}
 	if evt.FilePath != "/tmp/payload" {
 		t.Errorf("FilePath = %q, want /tmp/payload", evt.FilePath)
+	}
+}
+
+// testScaffoldDir / testAuditState stand in for a scan's random scaffold
+// markers. The audit lines in these tests keep the historical "KOJUTO:"
+// spelling as the prefix value; production prefixes are random per scan.
+const testScaffoldDir = "/opt/q7xk2m9v4p"
+
+func testAuditState() *ParseState {
+	return NewParseStateFor(types.ScanMarkers{AuditPrefix: "KOJUTO:", ScaffoldDir: testScaffoldDir})
+}
+
+// TestParseAuditHook_PrefixIsPerScan pins that only this scan's prefix is
+// recognised: another prefix — including the fixed "KOJUTO:" that older
+// builds wrote — is ordinary output, and a state without markers parses
+// no audit lines at all.
+func TestParseAuditHook_PrefixIsPerScan(t *testing.T) {
+	state := NewParseStateFor(types.ScanMarkers{AuditPrefix: "QWERTZUIOPAS:", ScaffoldDir: testScaffoldDir})
+	if _, ok := parseAuditHook("QWERTZUIOPAS:eval:1+1", state); !ok {
+		t.Error("this scan's prefix was not recognised")
+	}
+	if _, ok := parseAuditHook("KOJUTO:eval:1+1", state); ok {
+		t.Error("a different prefix was parsed as an audit event")
+	}
+	if _, ok := parseAuditHook("KOJUTO:eval:1+1", NewParseState()); ok {
+		t.Error("audit line parsed without markers")
+	}
+	if _, ok := parseAuditHook("KOJUTO:eval:1+1", nil); ok {
+		t.Error("audit line parsed with nil state")
 	}
 }

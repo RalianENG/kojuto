@@ -515,8 +515,8 @@ func TestPrepareLocalNpm_Success(t *testing.T) {
 		t.Fatalf("invalid JSON: %v", err)
 	}
 
-	if parsed["name"] != "kojuto-local-staging" {
-		t.Errorf("name = %v, want kojuto-local-staging", parsed["name"])
+	if parsed["name"] != "app" {
+		t.Errorf("name = %v, want app", parsed["name"])
 	}
 
 	// The dependency spec must be relative. The staging dir is bind-mounted

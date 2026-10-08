@@ -67,6 +67,10 @@ type ContainerStrace struct {
 	// tracedUser, when non-empty, makes strace run as root and drop only
 	// the traced command to this user (`strace -u`). See NewContainerStrace.
 	tracedUser string
+	// markers identify this scan's own scaffolding to the parser (audit
+	// wire prefix, scaffold directory). Zero for the download probe,
+	// whose sandbox stages no hooks.
+	markers types.ScanMarkers
 	// traceComplete records whether strace's final line was the
 	// unprefixed "+++ exited with N +++" / "+++ killed by SIG +++" it
 	// prints when its last tracee terminates. Absent, strace stopped
@@ -91,7 +95,9 @@ const analysisUser = "dev"
 var straceTerminalExitRe = regexp.MustCompile(`^\+\+\+ (?:exited with \d+|killed by SIG[A-Z0-9]+(?: \(core dumped\))?) \+\+\+$`)
 
 // NewContainerStrace creates a new in-container strace probe for the
-// install and import phases.
+// install and import phases. m are the sandbox's scaffold markers
+// (sandbox.Markers), which the parser needs to read the audit hooks'
+// output and to tell kojuto's own probe scripts from the package.
 //
 // strace runs as root and drops only the traced command to analysisUser.
 // Running strace itself as that user — the previous arrangement — let
@@ -101,11 +107,12 @@ var straceTerminalExitRe = regexp.MustCompile(`^\+\+\+ (?:exited with \d+|killed
 // unprivileged process. The sandbox grants SETUID/SETGID alongside
 // SYS_PTRACE for the drop; no-new-privileges keeps them out of reach of
 // the package.
-func NewContainerStrace() *ContainerStrace {
+func NewContainerStrace(m types.ScanMarkers) *ContainerStrace {
 	return &ContainerStrace{
 		events:     make(chan types.SyscallEvent, 8192),
 		done:       make(chan struct{}),
 		tracedUser: analysisUser,
+		markers:    m,
 	}
 }
 
@@ -120,7 +127,7 @@ func NewContainerStrace() *ContainerStrace {
 // so nothing in the traced tree is positioned to signal the tracer, and
 // the download sandbox does not carry the SETUID/SETGID the drop needs.
 func NewContainerStraceForDownload(workdir string) *ContainerStrace {
-	c := NewContainerStrace()
+	c := NewContainerStrace(types.ScanMarkers{})
 	c.phase = types.PhaseDownload
 	c.workdir = workdir
 	c.tracedUser = ""
@@ -247,7 +254,7 @@ func (c *ContainerStrace) buildCommand(ctx context.Context, containerID string, 
 func (c *ContainerStrace) parseStraceOutput(stderr io.ReadCloser, done chan<- struct{}) {
 	defer close(done)
 
-	state := NewParseState()
+	state := NewParseStateFor(c.markers)
 	scanner := bufio.NewScanner(stderr)
 	scanner.Buffer(make([]byte, 64*1024), straceMaxLine)
 

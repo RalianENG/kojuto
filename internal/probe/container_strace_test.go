@@ -13,14 +13,14 @@ import (
 )
 
 func TestContainerStrace_Method(t *testing.T) {
-	cs := NewContainerStrace()
+	cs := NewContainerStrace(types.ScanMarkers{})
 	if cs.Method() != "strace-container" {
 		t.Errorf("Method() = %q, want %q", cs.Method(), "strace-container")
 	}
 }
 
 func TestContainerStrace_Start_Unsupported(t *testing.T) {
-	cs := NewContainerStrace()
+	cs := NewContainerStrace(types.ScanMarkers{})
 	err := cs.Start(0)
 	if err == nil {
 		t.Fatal("expected error from Start()")
@@ -31,7 +31,7 @@ func TestContainerStrace_Start_Unsupported(t *testing.T) {
 }
 
 func TestContainerStrace_CloseIdempotent(t *testing.T) {
-	cs := NewContainerStrace()
+	cs := NewContainerStrace(types.ScanMarkers{})
 
 	// First close should succeed.
 	if err := cs.Close(); err != nil {
@@ -45,7 +45,7 @@ func TestContainerStrace_CloseIdempotent(t *testing.T) {
 }
 
 func TestContainerStrace_Events(t *testing.T) {
-	cs := NewContainerStrace()
+	cs := NewContainerStrace(types.ScanMarkers{})
 	ch := cs.Events()
 	if ch == nil {
 		t.Fatal("Events() returned nil channel")
@@ -53,7 +53,7 @@ func TestContainerStrace_Events(t *testing.T) {
 }
 
 func TestContainerStrace_Dropped(t *testing.T) {
-	cs := NewContainerStrace()
+	cs := NewContainerStrace(types.ScanMarkers{})
 	if got := cs.Dropped(); got != 0 {
 		t.Errorf("Dropped() on fresh probe = %d, want 0", got)
 	}
@@ -73,7 +73,7 @@ func TestContainerStrace_Dropped(t *testing.T) {
 // drain loop returns. The previous code only closed on the success
 // path, hanging the scanner indefinitely under tight timeouts.
 func TestContainerStrace_StartAndInstall_CtxAlreadyDeadlined(t *testing.T) {
-	cs := NewContainerStrace()
+	cs := NewContainerStrace(types.ScanMarkers{})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Force cmd.Start to fail with "context canceled".
@@ -138,7 +138,7 @@ func TestDrainReader_Large(t *testing.T) {
 }
 
 func TestBuildCommand(t *testing.T) {
-	cs := NewContainerStrace()
+	cs := NewContainerStrace(types.ScanMarkers{})
 	ctx := context.Background()
 
 	cmd := cs.buildCommand(ctx, "abc123", []string{"pip", "install", "requests"})
@@ -199,7 +199,7 @@ func TestBuildCommand(t *testing.T) {
 // tracer sharing the package's UID could be SIGKILLed by it, leaving the
 // tracee running untraced with the kill itself unrecorded.
 func TestBuildCommand_TracerRunsAsRootTraceeAsDev(t *testing.T) {
-	cmd := NewContainerStrace().buildCommand(context.Background(), "abc123", []string{"python3", "probe.py"})
+	cmd := NewContainerStrace(types.ScanMarkers{}).buildCommand(context.Background(), "abc123", []string{"python3", "probe.py"})
 	args := cmd.Args
 
 	sep := slices.Index(args, "--")

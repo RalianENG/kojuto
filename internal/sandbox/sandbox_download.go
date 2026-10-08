@@ -47,6 +47,9 @@ type DownloadSandbox struct {
 	containerID string
 	hostOutDir  string
 	seccompDir  string
+	// cacheDir is the package-manager cache tmpfs, named per scan like the
+	// analysis sandbox's scaffolding (see scaffoldNames).
+	cacheDir string
 }
 
 // NewDownloadSandbox returns a DownloadSandbox that bind-mounts hostOutDir
@@ -54,7 +57,7 @@ type DownloadSandbox struct {
 // stages any inputs (e.g. an npm staging package.json) into hostOutDir
 // before Start and reads the downloaded artifacts back from it after.
 func NewDownloadSandbox(hostOutDir string) *DownloadSandbox {
-	return &DownloadSandbox{hostOutDir: hostOutDir}
+	return &DownloadSandbox{hostOutDir: hostOutDir, cacheDir: "/var/cache/" + scaffoldToken(10)}
 }
 
 // ContainerID returns the download container's ID, valid between Start and
@@ -89,9 +92,9 @@ func (d *DownloadSandbox) createArgs(seccompOpt string) []string {
 		"--tmpfs=/home/dev:nosuid,mode=1777,size=64m",
 		// Package-manager caches. The analysis sandbox pins these here too;
 		// kept off the read-only rootfs and out of the bind-mounted /out.
-		"--tmpfs=/var/cache/kojuto:nosuid,mode=1777,size=512m",
-		"--env=NPM_CONFIG_CACHE=/var/cache/kojuto/npm",
-		"--env=PIP_CACHE_DIR=/var/cache/kojuto/pip",
+		"--tmpfs=" + d.cacheDir + ":nosuid,mode=1777,size=512m",
+		"--env=NPM_CONFIG_CACHE=" + d.cacheDir + "/npm",
+		"--env=PIP_CACHE_DIR=" + d.cacheDir + "/pip",
 		"--memory=" + mem,
 		"--cpus=" + cpus,
 		"--pids-limit=256",

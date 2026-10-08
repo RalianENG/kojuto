@@ -8,7 +8,12 @@ import os
 import sys
 
 _MAX = 200
-_P = chr(75) + chr(79) + chr(74) + chr(85) + chr(84) + chr(79) + ":"
+# Both values are substituted per scan when the file is staged into the
+# sandbox: the wire prefix is random so no constant identifies these
+# lines, and the audited package list is baked in rather than read from
+# an environment variable whose name would be a constant of its own.
+_P = "__AUDIT_PREFIX__"
+_SCAN_PKGS = __SCAN_PKGS__
 
 # Frames whose co_filename starts with one of these are treated as
 # "originated by the scanned package or other user-controllable code".
@@ -18,7 +23,7 @@ _P = chr(75) + chr(79) + chr(74) + chr(85) + chr(84) + chr(79) + ":"
 _USER_PREFIXES = ["/tmp/", "/install/", "/home/dev/"]
 
 _SITE = "/usr/local/lib/python" + sys.version[:4] + "/site-packages/"
-for _name in os.environ.get("KOJUTO_SCAN_PKGS", "").split(","):
+for _name in _SCAN_PKGS:
     _name = _name.strip()
     if not _name:
         continue
@@ -68,9 +73,9 @@ def _t(s):
 
 
 def _w(tag, body):
-    # Wire-format invariant: each KOJUTO: emission must occupy exactly
-    # one stderr line. The Go parser splits on '\n' and treats every
-    # KOJUTO:-prefixed line as an independent event. Strip line and null
+    # Wire-format invariant: each emission must occupy exactly one stderr
+    # line. The parser splits on newlines and treats every line that
+    # starts with _P as an independent event. Strip line and null
     # bytes from `body` so an attacker-controlled co_filename or compile
     # filename arg cannot smuggle a fake follow-up event onto the wire.
     # _t() already escapes newlines in the snippet field, so this is a

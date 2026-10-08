@@ -578,8 +578,8 @@ func TestDownloadAllNpm_Mock(t *testing.T) {
 		t.Fatalf("package.json is not valid JSON: %v", err)
 	}
 
-	if parsed["name"] != "kojuto-staging" {
-		t.Errorf("package.json name = %v, want %q", parsed["name"], "kojuto-staging")
+	if parsed["name"] != stagingProjectName {
+		t.Errorf("package.json name = %v, want %q", parsed["name"], stagingProjectName)
 	}
 
 	depsMap, ok := parsed["dependencies"].(map[string]interface{})

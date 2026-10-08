@@ -59,7 +59,7 @@ An OSS tool that detects suspicious syscalls during package installation and imp
 | Python | PEP 578 `sys.addaudithook()` via `sitecustomize.py` | `compile`, `exec`, `import`, `ctypes.dlopen` | `exec(base64.b64decode(...))`, obfuscated payload execution |
 | Node.js | `--require` preload via `NODE_OPTIONS` | `eval`, `Function`, `vm.runInNewContext`, `vm.runInThisContext`, `vm.Script` | `eval(Buffer.from(...,'base64'))`, `new Function('return process.env.SECRET')` |
 
-Audit hook output is multiplexed with strace output on stderr using a `KOJUTO:` prefix. The parser filters standard library internals (pip, npm, setuptools, frozen modules, dataclass codegen) via filename and snippet heuristics to minimize false positives.
+Audit hook output is multiplexed with strace output on stderr behind a wire prefix that is random per scan (12 uppercase letters and a colon), so no constant identifies these lines; the parser is handed the scan's prefix and ignores any other. The parser filters standard library internals (pip, npm, setuptools, frozen modules, dataclass codegen) via filename and snippet heuristics to minimize false positives.
 
 ### execve Analysis Logic
 
@@ -161,7 +161,7 @@ CLI (cobra)
 ### Import Phase Reality Check
 
 - Python resolves distribution → module name via `importlib.metadata.top_level.txt`, then a file-walk of the installed RECORD, then the canonical name — so packages whose install name differs from their import name (`pillow` → `PIL`, `pyyaml` → `yaml`, `opencv-python` → `cv2`, `python-dateutil` → `dateutil`, `beautifulsoup4` → `bs4`) are actually imported. Node.js tries `require()` first and falls back to dynamic `import()` on `ERR_REQUIRE_ESM`.
-- Each attempt emits `KOJUTO:import_attempt:<dist>:<module>:<result>` to stderr so the analyzer can distinguish "no observable behavior" from "clean behavior".
+- Each attempt emits `<prefix>import_attempt:<dist>:<module>:<result>` to stderr (the same per-scan prefix) so the analyzer can distinguish "no observable behavior" from "clean behavior".
 - Verdict rule: if attempts > 0 and successes == 0 AND no HIGH-severity event was independently observed, the verdict is `inconclusive` — kojuto refuses to claim "clean" on a package whose install-phase or import-phase code never actually ran. HIGH-severity findings (network exfil, credential access, library hijack, binary hijack, dropper, backdoor) still flip the verdict to `suspicious` even when every import failed, so an install-time attack that crashes before import completes is not masked.
 
 ### Time-Shifted Import (libfaketime)

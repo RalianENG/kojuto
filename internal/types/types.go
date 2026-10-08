@@ -223,6 +223,22 @@ const (
 // an analysis environment.
 const SandboxResolverAddr = "127.0.0.53"
 
+// ScanMarkers identify kojuto's own in-sandbox scaffolding for one scan.
+// The names are random per scan (see sandbox.scaffoldNames) so a package
+// cannot test for them; the strace parser receives them here instead of
+// matching constants.
+type ScanMarkers struct {
+	// AuditPrefix starts every line the audit hooks (sitecustomize.py,
+	// the Node require hook) write to stderr. A line without it is not
+	// an audit event. Empty disables audit-line parsing.
+	AuditPrefix string
+	// ScaffoldDir is the root-owned directory holding kojuto's probe
+	// scripts and hooks. compile/exec events from files in it are
+	// kojuto's own, not the package's. The package cannot add files
+	// there, so it cannot borrow the exemption.
+	ScaffoldDir string
+}
+
 // StaticFinding represents a suspicious pattern found by static analysis.
 type StaticFinding struct {
 	File    string `json:"file"`

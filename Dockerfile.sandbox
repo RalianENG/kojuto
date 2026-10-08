@@ -35,11 +35,10 @@ COPY internal/sandbox/build-deps.txt /tmp/build-deps.txt
 RUN pip install --no-deps --no-cache-dir --require-hashes -r /tmp/build-deps.txt && \
     rm /tmp/build-deps.txt
 
-# Audit hooks: detect eval/exec/compile/Function/vm dynamic code execution.
-# Python: sitecustomize.py is auto-loaded by the interpreter on startup.
-# Node.js: loaded via NODE_OPTIONS="--require /opt/kojuto/kojuto-require.js".
-COPY internal/sandbox/hooks/sitecustomize.py /usr/local/lib/python3.12/site-packages/sitecustomize.py
-COPY internal/sandbox/hooks/kojuto-require.js /opt/kojuto/kojuto-require.js
+# Audit hooks (sitecustomize.py, the Node require hook) are not baked into
+# the image. kojuto stages them into each sandbox at scan time, under
+# per-scan random names and with a per-scan wire prefix, so the image
+# carries no fixed path or string a package could test for.
 
 RUN cp -a /usr/local/bin /usr/local/bin.bak && \
     cp -a /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages.bak

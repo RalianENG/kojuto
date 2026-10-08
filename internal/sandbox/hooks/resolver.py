@@ -2,7 +2,7 @@
 
 The sandbox runs with --network=none, so name resolution can never
 succeed against a real nameserver. That made hostname-based
-exfiltration systematically invisible: the only syscall kojuto saw was
+exfiltration systematically invisible: the only syscall the tracer saw was
 glibc's connect() to the unreachable resolver, which the analyzer
 classifies LOW (dns_lookup) on the stated reasoning that "the real C2
 signal is the follow-up connect to the resolved IP" — a connect that
@@ -37,6 +37,7 @@ import hashlib
 import os
 import socket
 import struct
+import sys
 
 LISTEN_ADDR = "127.0.0.53"
 LISTEN_PORT = 53
@@ -51,9 +52,10 @@ QTYPE_A = 1
 QTYPE_AAAA = 28
 CLASS_IN = 1
 
-# Written once the socket is bound so the Go side can wait for
-# readiness instead of racing the first resolution.
-READY_PATH = "/opt/kojuto/probe/.resolver-ready"
+# The readiness marker path arrives as argv[1]. It is written once the
+# socket is bound so the launcher can wait for it instead of racing the
+# first resolution, and like this file's own name it is random per scan.
+READY_PATH = sys.argv[1] if len(sys.argv) > 1 else ""
 
 
 def synthetic_addr(name):
@@ -118,10 +120,11 @@ def main():
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((LISTEN_ADDR, LISTEN_PORT))
 
-    tmp = READY_PATH + ".tmp"
-    with open(tmp, "w") as fh:
-        fh.write(str(os.getpid()))
-    os.rename(tmp, READY_PATH)  # atomic: the marker never appears half-written
+    if READY_PATH:
+        tmp = READY_PATH + ".tmp"
+        with open(tmp, "w") as fh:
+            fh.write(str(os.getpid()))
+        os.rename(tmp, READY_PATH)  # atomic: never appears half-written
 
     while True:
         try:

@@ -41,6 +41,12 @@ type ParseState struct {
 	// may fail to resolve, and an unresolved path is one the sensitive-path
 	// check cannot match.
 	overflowed bool
+
+	// markers identify this scan's own scaffolding: the audit-hook wire
+	// prefix and the directory holding kojuto's probe scripts and hooks.
+	// They are random per scan (see types.ScanMarkers), so the parser is
+	// told them rather than matching constants.
+	markers types.ScanMarkers
 }
 
 // Correlation-state ceilings. Both maps are keyed by attacker-influenced
@@ -73,6 +79,14 @@ func NewParseState() *ParseState {
 		createdTmpFiles: make(map[string]bool),
 		openFDs:         make(map[uint32]map[int]string),
 	}
+}
+
+// NewParseStateFor creates a fresh parse state that recognises the given
+// scan's scaffolding. Without markers, audit-hook lines are not parsed.
+func NewParseStateFor(m types.ScanMarkers) *ParseState {
+	s := NewParseState()
+	s.markers = m
+	return s
 }
 
 // recordFD stores fd → absPath for pid in the openFDs map. Overwrites
@@ -359,9 +373,9 @@ func parseSendWithDNS(line string, re *regexp.Regexp, syscall string, extract fu
 }
 
 func parseStraceLine(line string, state *ParseState) (types.SyscallEvent, bool) {
-	// Audit hook output from sitecustomize.py / kojuto-require.js.
+	// Audit hook output from sitecustomize.py / the Node require hook.
 	// These lines are interleaved with strace output on stderr.
-	if evt, ok := parseAuditHook(line); ok {
+	if evt, ok := parseAuditHook(line, state); ok {
 		return evt, true
 	}
 
@@ -1350,10 +1364,6 @@ func parseDNSName(data []byte) string {
 	return strings.Join(labels, ".")
 }
 
-// auditHookPrefix is the line prefix emitted by kojuto's audit hooks
-// (sitecustomize.py for Python, kojuto-require.js for Node.js).
-const auditHookPrefix = "KOJUTO:"
-
 // benignAuditModules lists module prefixes whose import/compile/exec events
 // are normal interpreter or tooling internals.
 var benignAuditModules = []string{
@@ -1366,12 +1376,12 @@ var benignAuditModules = []string{
 	"npm",
 	"node_modules",
 	"sitecustomize",
-	"kojuto-require",
 	"usercustomize",
 }
 
 // benignAuditPaths lists path substrings that identify standard library,
-// interpreter-internal, or kojuto's own probe scripts.  compile/exec events
+// or interpreter-internal (kojuto's own probe scripts are recognised by
+// directory instead; see isBenignAuditEvent).  compile/exec events
 // whose filename contains one of these are benign.
 var benignAuditPaths = []string{
 	"/usr/local/lib/python",
@@ -1380,7 +1390,6 @@ var benignAuditPaths = []string{
 	"/usr/local/bin/",
 	"/usr/bin/",
 	"importlib",
-	"_kojuto_probe_",
 }
 
 // benignStringSnippetPrefixes are snippet prefixes that are benign when the
@@ -1403,12 +1412,19 @@ var benignStringSnippetPrefixes = []string{
 // Python compile/exec format: KOJUTO:<event>:<filename>:<snippet>
 // Python import format:       KOJUTO:import:<module_name>
 // Node.js format:             KOJUTO:<event>:<snippet>.
-func parseAuditHook(line string) (types.SyscallEvent, bool) {
-	if !strings.HasPrefix(line, auditHookPrefix) {
+func parseAuditHook(line string, state *ParseState) (types.SyscallEvent, bool) {
+	// The audit hooks prefix every line with this scan's random wire
+	// prefix (types.ScanMarkers.AuditPrefix). Without one there is
+	// nothing to recognise.
+	if state == nil || state.markers.AuditPrefix == "" {
+		return types.SyscallEvent{}, false
+	}
+	prefix := state.markers.AuditPrefix
+	if !strings.HasPrefix(line, prefix) {
 		return types.SyscallEvent{}, false
 	}
 
-	rest := line[len(auditHookPrefix):]
+	rest := line[len(prefix):]
 	idx := strings.Index(rest, ":")
 	if idx < 0 {
 		return types.SyscallEvent{}, false
@@ -1440,7 +1456,7 @@ func parseAuditHook(line string) (types.SyscallEvent, bool) {
 	}
 
 	// Filter benign interpreter/tooling internals.
-	if isBenignAuditEvent(event, filename, snippet) {
+	if isBenignAuditEvent(event, filename, snippet, state.markers.ScaffoldDir) {
 		return types.SyscallEvent{}, false
 	}
 
@@ -1506,7 +1522,7 @@ func parseImportAttempt(payload string) types.SyscallEvent {
 // Node.js standard library, pip, npm, setuptools, or other interpreter
 // internals.  For compile/exec events the filename field provides the
 // definitive signal: anything outside site-packages or /tmp is benign.
-// nodeAuditEvents are events emitted by kojuto-require.js.
+// nodeAuditEvents are events emitted by the Node require hook.
 // These never have a filename and should NOT be filtered by the
 // Python-specific <string>/short-snippet heuristics.
 var nodeAuditEvents = map[string]bool{
@@ -1517,7 +1533,7 @@ var nodeAuditEvents = map[string]bool{
 	"vm.Script":           true,
 }
 
-func isBenignAuditEvent(event, filename, snippet string) bool {
+func isBenignAuditEvent(event, filename, snippet, scaffoldDir string) bool {
 	// All import events are benign — suspicious imports are already
 	// caught by the openat/execve monitors.
 	if event == "import" {
@@ -1544,6 +1560,16 @@ func isBenignAuditEvent(event, filename, snippet string) bool {
 	// compile/exec: if filename is available, use it as the primary filter.
 	// Standard library, pip internals, and frozen modules are benign.
 	if filename != "" {
+		// kojuto's own probe scripts live in the scan's scaffold directory.
+		// It is root-owned, so a package cannot place a file there, and a
+		// compile() the package calls with a forged filename still has the
+		// package's own frame on the stack and arrives "+"-marked above.
+		// Matched as a directory prefix, never a substring: the scaffold
+		// path is visible to the package (NODE_OPTIONS names a file in it),
+		// and a substring match would let it be embedded in any filename.
+		if scaffoldDir != "" && strings.HasPrefix(filename, scaffoldDir+"/") {
+			return true
+		}
 		for _, pathMarker := range benignAuditPaths {
 			if strings.Contains(filename, pathMarker) {
 				return true
