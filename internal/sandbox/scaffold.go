@@ -19,7 +19,7 @@ import (
 // `if os.path.exists("/opt/kojuto"): sys.exit()` costs an attacker one
 // line and turned every scan of that package into a clean verdict. With
 // per-scan names there is no constant to test for — the scaffolding has
-// to be recognised by its shape, which is a much higher bar, and the
+// to be recognized by its shape, which is a much higher bar, and the
 // attempt shows up in the trace like any other environment probing.
 //
 // The parser learns the names it needs through types.ScanMarkers.
@@ -95,7 +95,7 @@ func (n *scaffoldNames) probe(kind string) string {
 	return p
 }
 
-// markers returns what the strace parser needs to recognise kojuto's own
+// markers returns what the strace parser needs to recognize kojuto's own
 // scaffolding in this scan's trace.
 func (n *scaffoldNames) markers() types.ScanMarkers {
 	return types.ScanMarkers{
@@ -117,7 +117,7 @@ var sitecustomizePath = "/usr/local/lib/python" + SandboxPythonVersion + "/site-
 
 // renderHook substitutes this scan's values into a hook template and
 // fails if a placeholder survives: a hook writing a literal placeholder
-// as its prefix would emit lines the parser never recognises, silently
+// as its prefix would emit lines the parser never recognizes, silently
 // disabling dynamic-code detection.
 func renderHook(tmpl string, values map[string]string) (string, error) {
 	out := tmpl

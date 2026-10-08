@@ -91,7 +91,7 @@ func TestRenderHook(t *testing.T) {
 }
 
 // fixedNamePattern matches the names kojuto used to stage under before
-// they were randomised: anything a package could test for by string.
+// they were randomized: anything a package could test for by string.
 var fixedNamePattern = regexp.MustCompile(`(?i)kojuto|_kj_`)
 
 // TestNoFixedNamesReachTheSandbox is the regression guard for the whole
@@ -102,7 +102,7 @@ func TestNoFixedNamesReachTheSandbox(t *testing.T) {
 	withFakeExec(t)
 	for _, eco := range []string{types.EcosystemPyPI, types.EcosystemNpm} {
 		sb := newTestSandbox(t, eco)
-		sb.networkName = "net"
+		sb.networkName = "scaffold-test-net"
 		args, err := sb.containerArgs()
 		if err != nil {
 			t.Fatalf("containerArgs(%s): %v", eco, err)

@@ -1631,13 +1631,13 @@ func testAuditState() *ParseState {
 }
 
 // TestParseAuditHook_PrefixIsPerScan pins that only this scan's prefix is
-// recognised: another prefix — including the fixed "KOJUTO:" that older
+// recognized: another prefix — including the fixed "KOJUTO:" that older
 // builds wrote — is ordinary output, and a state without markers parses
 // no audit lines at all.
 func TestParseAuditHook_PrefixIsPerScan(t *testing.T) {
 	state := NewParseStateFor(types.ScanMarkers{AuditPrefix: "QWERTZUIOPAS:", ScaffoldDir: testScaffoldDir})
 	if _, ok := parseAuditHook("QWERTZUIOPAS:eval:1+1", state); !ok {
-		t.Error("this scan's prefix was not recognised")
+		t.Error("this scan's prefix was not recognized")
 	}
 	if _, ok := parseAuditHook("KOJUTO:eval:1+1", state); ok {
 		t.Error("a different prefix was parsed as an audit event")

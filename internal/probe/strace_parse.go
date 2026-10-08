@@ -81,7 +81,7 @@ func NewParseState() *ParseState {
 	}
 }
 
-// NewParseStateFor creates a fresh parse state that recognises the given
+// NewParseStateFor creates a fresh parse state that recognizes the given
 // scan's scaffolding. Without markers, audit-hook lines are not parsed.
 func NewParseStateFor(m types.ScanMarkers) *ParseState {
 	s := NewParseState()
@@ -1380,7 +1380,7 @@ var benignAuditModules = []string{
 }
 
 // benignAuditPaths lists path substrings that identify standard library,
-// or interpreter-internal (kojuto's own probe scripts are recognised by
+// or interpreter-internal (kojuto's own probe scripts are recognized by
 // directory instead; see isBenignAuditEvent).  compile/exec events
 // whose filename contains one of these are benign.
 var benignAuditPaths = []string{
@@ -1415,7 +1415,7 @@ var benignStringSnippetPrefixes = []string{
 func parseAuditHook(line string, state *ParseState) (types.SyscallEvent, bool) {
 	// The audit hooks prefix every line with this scan's random wire
 	// prefix (types.ScanMarkers.AuditPrefix). Without one there is
-	// nothing to recognise.
+	// nothing to recognize.
 	if state == nil || state.markers.AuditPrefix == "" {
 		return types.SyscallEvent{}, false
 	}
@@ -1559,28 +1559,8 @@ func isBenignAuditEvent(event, filename, snippet, scaffoldDir string) bool {
 
 	// compile/exec: if filename is available, use it as the primary filter.
 	// Standard library, pip internals, and frozen modules are benign.
-	if filename != "" {
-		// kojuto's own probe scripts live in the scan's scaffold directory.
-		// It is root-owned, so a package cannot place a file there, and a
-		// compile() the package calls with a forged filename still has the
-		// package's own frame on the stack and arrives "+"-marked above.
-		// Matched as a directory prefix, never a substring: the scaffold
-		// path is visible to the package (NODE_OPTIONS names a file in it),
-		// and a substring match would let it be embedded in any filename.
-		if scaffoldDir != "" && strings.HasPrefix(filename, scaffoldDir+"/") {
-			return true
-		}
-		for _, pathMarker := range benignAuditPaths {
-			if strings.Contains(filename, pathMarker) {
-				return true
-			}
-		}
-		// Known tooling modules.
-		for _, mod := range benignAuditModules {
-			if strings.Contains(filename, mod) {
-				return true
-			}
-		}
+	if filename != "" && isBenignAuditFilename(filename, scaffoldDir) {
+		return true
 	}
 
 	// Fallback: filter by snippet content when filename is absent.
@@ -1617,5 +1597,34 @@ func isBenignAuditEvent(event, filename, snippet, scaffoldDir string) bool {
 		return false
 	}
 
+	return false
+}
+
+// isBenignAuditFilename reports whether a compile/exec filename belongs to
+// the interpreter, the package-manager tooling, or kojuto's own probe
+// scripts.
+func isBenignAuditFilename(filename, scaffoldDir string) bool {
+	// kojuto's own probe scripts live in the scan's scaffold directory.
+	// It is root-owned, so a package cannot place a file there, and a
+	// compile() the package calls with a forged filename still has the
+	// package's own frame on the stack and arrives "+"-marked (handled by
+	// the caller before this point). Matched as a directory prefix, never
+	// a substring: the scaffold path is visible to the package
+	// (NODE_OPTIONS names a file in it), and a substring match would let
+	// it be embedded in any filename.
+	if scaffoldDir != "" && strings.HasPrefix(filename, scaffoldDir+"/") {
+		return true
+	}
+	for _, pathMarker := range benignAuditPaths {
+		if strings.Contains(filename, pathMarker) {
+			return true
+		}
+	}
+	// Known tooling modules.
+	for _, mod := range benignAuditModules {
+		if strings.Contains(filename, mod) {
+			return true
+		}
+	}
 	return false
 }
