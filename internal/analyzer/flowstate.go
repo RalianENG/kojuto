@@ -1,6 +1,8 @@
 package analyzer
 
 import (
+	"crypto/sha256"
+	"strconv"
 	"strings"
 	"time"
 
@@ -53,6 +55,16 @@ type FlowState struct {
 	// deleted file was also executed in this scan (the
 	// create→execute→delete triad).
 	ExecutedPaths map[string]bool
+
+	// EnvProbeBaseline is the set of sandbox-detection paths the
+	// package manager itself read during the download phase, where
+	// --ignore-scripts / --only-binary guarantee that none of the
+	// scanned package's code runs. It is the measured, per-scan
+	// alternative to a hardcoded "these reads are fine" list: a path
+	// in here was demonstrably touched by the tooling alone, so a
+	// later read of it is baseline noise rather than attributable
+	// sandbox detection. See types.CategoryEnvProbe.
+	EnvProbeBaseline map[string]bool
 
 	// dnsQueries is an append-only list of DNS observations seen so
 	// far during the Analyze() iteration. Populated incrementally via
@@ -110,6 +122,49 @@ func (s *FlowState) DNSHostnamesForPID(pid uint32) []string {
 		out = append(out, q.Query)
 	}
 	return out
+}
+
+// syntheticAddrPrefix is the /24 the sandbox's synthetic DNS resolver
+// draws its answers from: RFC 5737 TEST-NET-3, reserved for
+// documentation and never routable. Mirrors ANSWER_PREFIX in
+// internal/sandbox/hooks/resolver.py — the two must agree or the
+// attribution below silently stops matching.
+const syntheticAddrPrefix = "203.0.113."
+
+// syntheticAddrFor reproduces the resolver's name → address mapping:
+// the first byte of the SHA-256 of the queried name, folded into
+// .1-.254. The mapping is recomputed here rather than read off the
+// wire because strace does not trace recvfrom, so the analyzer never
+// sees the DNS *response* that carried the address.
+func syntheticAddrFor(name string) string {
+	sum := sha256.Sum256([]byte(strings.ToLower(strings.TrimSuffix(name, "."))))
+	return syntheticAddrPrefix + strconv.Itoa(1+int(sum[0])%254)
+}
+
+// DNSHostnameForSyntheticAddr returns the hostname whose synthetic
+// resolver answer is addr, or "" when addr was not handed out by the
+// resolver (or no observed query maps to it).
+//
+// This is the cross-PID half of the DNS→connect chain.
+// DNSHostnamesForPID attributes by PID, which is the stronger claim
+// but misses the common shapes: glibc resolves on whichever thread
+// called getaddrinfo, and Node resolves on a libuv threadpool thread,
+// so the connect and the query routinely carry different PIDs under
+// strace -f. Matching on the address itself needs no correlation at
+// all — the address IS the resolver's answer to that exact name.
+func (s *FlowState) DNSHostnameForSyntheticAddr(addr string) string {
+	if !strings.HasPrefix(addr, syntheticAddrPrefix) {
+		return ""
+	}
+	for _, q := range s.dnsQueries {
+		if q.Query == "" {
+			continue
+		}
+		if syntheticAddrFor(q.Query) == addr {
+			return q.Query
+		}
+	}
+	return ""
 }
 
 // isDNSObservation reports whether the event shape is a DNS syscall:
@@ -315,9 +370,35 @@ func charClassFingerprint(s string) uint8 {
 // map allocations.
 func newFlowState(events []types.SyscallEvent) *FlowState {
 	return &FlowState{
-		PIDComm:       collectPIDComm(events),
-		ExecutedPaths: collectExecutedPaths(events),
+		PIDComm:          collectPIDComm(events),
+		ExecutedPaths:    collectExecutedPaths(events),
+		EnvProbeBaseline: collectEnvProbeBaseline(events),
 	}
+}
+
+// collectEnvProbeBaseline gathers the sandbox-detection paths read
+// during the download phase. Reads outside that phase are ignored on
+// purpose: the whole value of the baseline is that it is measured in
+// a phase where the package contributes no code, so an attacker
+// cannot grow it by reading paths and having them excused later.
+//
+// A nil map is a valid empty baseline (local-file scans have no
+// download phase at all), and reads from a nil map return false.
+func collectEnvProbeBaseline(events []types.SyscallEvent) map[string]bool {
+	var baseline map[string]bool
+	for i := range events {
+		if events[i].Phase != types.PhaseDownload || events[i].Syscall != types.EventOpenat {
+			continue
+		}
+		if !isSandboxDetectionPath(events[i].FilePath) {
+			continue
+		}
+		if baseline == nil {
+			baseline = make(map[string]bool)
+		}
+		baseline[events[i].FilePath] = true
+	}
+	return baseline
 }
 
 // isInSuspiciousDir reports whether a path lives under a staging

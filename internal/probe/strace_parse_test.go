@@ -514,3 +514,63 @@ func TestParseStraceLine_NoPID(t *testing.T) {
 		t.Errorf("expected pid 0 (no pid prefix), got %d", evt.PID)
 	}
 }
+
+// TestParseStraceLine_ConnectedSendmmsgDNS uses a line captured verbatim from
+// a real scan: glibc's getaddrinfo connects its UDP socket to the nameserver
+// and then ships the A and AAAA questions in a single sendmmsg with
+// msg_name=NULL. The addressed sendmmsg regex cannot match that shape, so
+// before this branch existed every ordinary hostname lookup was dropped by
+// the parser — no dns_lookup breadcrumb, and no queried name for the
+// exfil-service, DNS-tunneling or DGA rules to work on.
+func TestParseStraceLine_ConnectedSendmmsgDNS(t *testing.T) {
+	line := `[pid   500] sendmmsg(3, [{msg_hdr={msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="\216%\1\0\0\1\0\0\0\0\0\0\4evil\7example\3com\0\0\1\0\1", iov_len=34}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, msg_len=34}, {msg_hdr={msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="3&\1\0\0\1\0\0\0\0\0\0\4evil\7example\3com\0\0\34\0\1", iov_len=34}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, msg_len=34}], 2, MSG_NOSIGNAL) = 2`
+
+	evt, ok := parseStraceLine(line, NewParseState())
+	if !ok {
+		t.Fatal("expected connected sendmmsg parse to succeed")
+	}
+	if evt.Syscall != types.EventSendmmsg {
+		t.Errorf("syscall = %s, want %s", evt.Syscall, types.EventSendmmsg)
+	}
+	if evt.DNSQuery != "evil.example.com" {
+		t.Errorf("dns query = %q, want evil.example.com", evt.DNSQuery)
+	}
+	if evt.DstPort != 53 {
+		t.Errorf("port = %d, want 53", evt.DstPort)
+	}
+	if evt.DstAddr != types.SandboxResolverAddr {
+		t.Errorf("dst addr = %q, want %q (the sandbox's own resolver)", evt.DstAddr, types.SandboxResolverAddr)
+	}
+	if evt.PID != 500 {
+		t.Errorf("pid = %d, want 500", evt.PID)
+	}
+}
+
+// TestParseStraceLine_ConnectedSendmsgDNS covers the single-message form,
+// which is what handcrafted resolver code (and musl) emits.
+func TestParseStraceLine_ConnectedSendmsgDNS(t *testing.T) {
+	line := `sendmsg(3, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="\1\2\1\0\0\1\0\0\0\0\0\0\12discordapp\3com\0\0\1\0\1", iov_len=32}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, MSG_NOSIGNAL) = 32`
+
+	evt, ok := parseStraceLine(line, NewParseState())
+	if !ok {
+		t.Fatal("expected connected sendmsg parse to succeed")
+	}
+	if evt.Syscall != types.EventSendmsg {
+		t.Errorf("syscall = %s, want %s", evt.Syscall, types.EventSendmsg)
+	}
+	if evt.DNSQuery != "discordapp.com" {
+		t.Errorf("dns query = %q, want discordapp.com", evt.DNSQuery)
+	}
+}
+
+// TestParseStraceLine_ConnectedSendmsgNonDNS confirms the branch stays
+// narrow: a connected sendmsg whose payload is not a decodable DNS question
+// (a plain TCP-style write, an encrypted blob) must not be manufactured into
+// a DNS event pointing at the sandbox resolver.
+func TestParseStraceLine_ConnectedSendmsgNonDNS(t *testing.T) {
+	line := `sendmsg(7, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="POST /steal HTTP/1.1\r\n", iov_len=21}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 21`
+
+	if evt, ok := parseStraceLine(line, NewParseState()); ok && evt.DstPort == 53 {
+		t.Errorf("non-DNS connected sendmsg parsed as a DNS event: %+v", evt)
+	}
+}

@@ -462,3 +462,162 @@ func TestAnalyze_NoImportAttemptsIsFallback(t *testing.T) {
 		t.Errorf("empty event slice: expected clean, got %s", verdict)
 	}
 }
+
+// --- synthetic resolver attribution ---------------------------------------
+
+// TestSyntheticAddrFor_MatchesResolverScript pins the cross-language contract
+// between this mapping and internal/sandbox/hooks/resolver.py. The expected
+// value was read off the real resolver running inside the sandbox container
+// (a getaddrinfo for this name answered 203.0.113.74). If resolver.py's
+// ANSWER_PREFIX or hash ever changes without this constant changing with it,
+// attribution stops matching silently — the connect is still reported HIGH,
+// but the report loses the hostname that explains it.
+func TestSyntheticAddrFor_MatchesResolverScript(t *testing.T) {
+	if got := syntheticAddrFor("evil.example.com"); got != "203.0.113.74" {
+		t.Errorf("syntheticAddrFor(evil.example.com) = %s, want 203.0.113.74", got)
+	}
+
+	// Case and the trailing root dot are wire-format noise, not distinct
+	// names: resolver.py lowercases and strips before hashing.
+	if syntheticAddrFor("EVIL.Example.COM.") != syntheticAddrFor("evil.example.com") {
+		t.Error("case/trailing-dot variants must map to the same synthetic address")
+	}
+
+	// Every answer must stay inside 203.0.113.1-254: .0 is the network
+	// address and .255 the broadcast address, and neither is a plausible
+	// answer for a resolver to hand back.
+	for _, name := range []string{"a", "b.example", "very.long.subdomain.chain.example.org", "x-y-z.io"} {
+		addr := syntheticAddrFor(name)
+		octet, err := strconv.Atoi(strings.TrimPrefix(addr, syntheticAddrPrefix))
+		if err != nil {
+			t.Fatalf("syntheticAddrFor(%s) = %s, not a %s address", name, addr, syntheticAddrPrefix)
+		}
+		if octet < 1 || octet > 254 {
+			t.Errorf("syntheticAddrFor(%s) = %s, last octet out of 1-254", name, addr)
+		}
+	}
+}
+
+// TestDNSHostnameForSyntheticAddr covers the address-keyed half of the
+// DNS→connect chain: attribution must work without PID correlation, since
+// glibc and Node routinely resolve on a different thread than the one that
+// dials the result.
+func TestDNSHostnameForSyntheticAddr(t *testing.T) {
+	state := &FlowState{}
+	state.RecordDNSQuery(&types.SyscallEvent{
+		Syscall: types.EventSendmmsg, PID: 100, Family: 2,
+		DstAddr: "127.0.0.53", DstPort: 53, DNSQuery: "evil.example.com",
+	})
+
+	// Queried by PID 100, dialed (below) by PID 217 — a match anyway.
+	if got := state.DNSHostnameForSyntheticAddr("203.0.113.74"); got != "evil.example.com" {
+		t.Errorf("DNSHostnameForSyntheticAddr = %q, want evil.example.com", got)
+	}
+	// Inside the synthetic range but not an answer this scan produced.
+	if got := state.DNSHostnameForSyntheticAddr("203.0.113.9"); got != "" {
+		t.Errorf("unqueried synthetic address attributed to %q", got)
+	}
+	// Outside the range: a real IP-literal C2 must never be described as a
+	// resolver answer.
+	if got := state.DNSHostnameForSyntheticAddr("151.101.0.223"); got != "" {
+		t.Errorf("non-synthetic address attributed to %q", got)
+	}
+}
+
+// TestAnalyze_HostnameExfilIsCaught is the end-to-end regression test for the
+// false negative the synthetic resolver exists to close. Before it, install
+// and import ran against an unreachable resolver, so a package exfiltrating
+// to a HOSTNAME produced nothing but two LOW dns_lookup events and scanned
+// CLEAN — while the same package using an IP literal was caught as
+// c2_communication. Measured on the Datadog sample dell-restore-system, whose
+// __init__.py collects host data and POSTs it via urllib: its entire event
+// list was two connects to the fake resolver, verdict clean.
+func TestAnalyze_HostnameExfilIsCaught(t *testing.T) {
+	events := []types.SyscallEvent{
+		// getaddrinfo against the in-sandbox resolver. Recorded LOW so the
+		// lookup stays visible even for a payload that stops here.
+		{Syscall: types.EventConnect, PID: 100, Family: 2, DstAddr: types.SandboxResolverAddr, DstPort: 53},
+		{
+			Syscall: types.EventSendmmsg, PID: 100, Family: 2,
+			DstAddr: types.SandboxResolverAddr, DstPort: 53, DNSQuery: "evil.example.com",
+		},
+		// The POST the resolver made reachable, from a different PID (the
+		// shape strace produces when resolution happens on another thread).
+		{Syscall: types.EventConnect, PID: 217, Family: 2, DstAddr: "203.0.113.74", DstPort: 80},
+	}
+
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictSuspicious {
+		t.Fatalf("verdict = %s, want suspicious (hostname-based exfiltration)", verdict)
+	}
+
+	var c2 *types.SyscallEvent
+	for i := range filtered {
+		if filtered[i].Category == types.CategoryC2 {
+			c2 = &filtered[i]
+		}
+	}
+	if c2 == nil {
+		t.Fatalf("no c2_communication event in %+v", filtered)
+	}
+	// Cross-PID attribution: the lookup ran on PID 100 and the connect on
+	// PID 217, so only the address-keyed path can name the destination.
+	if !strings.Contains(c2.Reason, "evil.example.com") {
+		t.Errorf("reason must name the real destination hostname, got %q", c2.Reason)
+	}
+	if !strings.Contains(c2.Reason, "synthetic address") {
+		t.Errorf("reason must say the address came from kojuto's resolver, got %q", c2.Reason)
+	}
+}
+
+// TestAnalyze_ResolveThenBailLeavesBreadcrumb covers the payload that resolves
+// its C2, inspects the answer, concludes it is being analyzed and stops before
+// connecting. The connect is what carries HIGH severity, so this scan cannot
+// be condemned — but it must not come back empty either: the queried hostname
+// is the whole finding, and the pre-resolver sandbox recorded it only by
+// accident (its unreachable nameserver was a non-loopback address, so the
+// query never hit the loopback benign filter).
+func TestAnalyze_ResolveThenBailLeavesBreadcrumb(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventConnect, PID: 100, Family: 2, DstAddr: types.SandboxResolverAddr, DstPort: 53},
+		{
+			Syscall: types.EventSendmmsg, PID: 100, Family: 2,
+			DstAddr: types.SandboxResolverAddr, DstPort: 53, DNSQuery: "collector.evil.example",
+		},
+	}
+
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictClean {
+		t.Errorf("verdict = %s, want clean (a lookup alone is LOW)", verdict)
+	}
+	if len(filtered) == 0 {
+		t.Fatal("resolve-then-bail produced no events at all — the hostname breadcrumb is lost")
+	}
+	var named bool
+	for i := range filtered {
+		if filtered[i].Category != types.CategoryDNSLookup {
+			t.Errorf("event %d category = %q, want %q", i, filtered[i].Category, types.CategoryDNSLookup)
+		}
+		if strings.Contains(filtered[i].Reason, "collector.evil.example") {
+			named = true
+		}
+	}
+	if !named {
+		t.Errorf("no event names the queried hostname: %+v", filtered)
+	}
+}
+
+// TestAnalyze_LoopbackNonDNSStillBenign bounds the exception to port 53: an
+// ordinary loopback connection (a package talking to a local service it just
+// started) must stay filtered.
+func TestAnalyze_LoopbackNonDNSStillBenign(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventConnect, PID: 100, Family: 2, DstAddr: "127.0.0.1", DstPort: 8080},
+		{Syscall: types.EventConnect, PID: 100, Family: 2, DstAddr: types.SandboxResolverAddr, DstPort: 9000},
+	}
+
+	_, filtered := Analyze(events)
+	if len(filtered) != 0 {
+		t.Errorf("loopback non-DNS traffic should stay filtered, got %+v", filtered)
+	}
+}

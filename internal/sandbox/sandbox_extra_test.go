@@ -1004,3 +1004,103 @@ func TestStartPaused_RollbackOnPrepareFailure(t *testing.T) {
 		t.Errorf("expected 'rm -f %s' in rm calls, got %v", testContainerID, rmCalls)
 	}
 }
+
+// TestProbeScriptDirIsOutsideAuditUserPrefixes pins the fix for kojuto
+// instrumenting itself. sitecustomize.py's _USER_PREFIXES marks the paths
+// whose frames count as "the scanned package or other user-controllable
+// code"; a compile/exec from such a frame is wired to the analyzer with the
+// "+" marker, which deliberately bypasses the path-based benign filter that
+// already lists "_kojuto_probe_". While the probe scripts lived in /tmp/ that
+// bypass applied to kojuto's own scripts: a 100-package PyPI measurement
+// found 30,788 of 46,031 dynamic_code_execution events came from the probes
+// themselves, burying real payload execs under kojuto's noise.
+//
+// The test reads the prefix list out of the hook source rather than
+// duplicating it, so adding a prefix that swallows probeScriptDir fails here
+// instead of silently restoring the noise.
+func TestProbeScriptDirIsOutsideAuditUserPrefixes(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("hooks", "sitecustomize.py"))
+	if err != nil {
+		t.Fatalf("reading sitecustomize.py: %v", err)
+	}
+
+	var prefixes []string
+	for _, line := range strings.Split(string(src), "\n") {
+		if !strings.HasPrefix(strings.TrimSpace(line), "_USER_PREFIXES = [") {
+			continue
+		}
+		list := line[strings.Index(line, "[")+1 : strings.LastIndex(line, "]")]
+		for _, part := range strings.Split(list, ",") {
+			if p := strings.Trim(strings.TrimSpace(part), `"`); p != "" {
+				prefixes = append(prefixes, p)
+			}
+		}
+	}
+	if len(prefixes) == 0 {
+		t.Fatal("no _USER_PREFIXES literal found in sitecustomize.py — did the hook change shape?")
+	}
+
+	for _, p := range prefixes {
+		if strings.HasPrefix(probeScriptPrefix, p) {
+			t.Errorf("probe scripts stage under %q, which sitecustomize.py treats as user code — "+
+				"their compile/exec events will bypass the benign filter", p)
+		}
+		if strings.HasPrefix(resolverScriptPath, p) {
+			t.Errorf("resolver stages under %q, which sitecustomize.py treats as user code", p)
+		}
+	}
+
+	// The runtime-appended prefixes are all site-packages paths for the
+	// scanned distributions; staying out of that tree matters just as much.
+	if strings.Contains(probeScriptDir, "site-packages") {
+		t.Errorf("probeScriptDir = %q must not live in site-packages", probeScriptDir)
+	}
+}
+
+// TestStartSyntheticResolver_StagesAndWaits checks the three docker calls the
+// resolver bring-up depends on: stage the script, launch it detached as root,
+// and confirm the readiness marker before any package code runs.
+func TestStartSyntheticResolver_StagesAndWaits(t *testing.T) {
+	var calls [][]string
+	orig := execCommand
+	execCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		calls = append(calls, append([]string{name}, args...))
+		return exec.CommandContext(ctx, "true")
+	}
+	t.Cleanup(func() { execCommand = orig })
+
+	sb := &Sandbox{containerID: testContainerID}
+	if err := sb.startSyntheticResolver(context.Background()); err != nil {
+		t.Fatalf("startSyntheticResolver: %v", err)
+	}
+
+	if len(calls) != 3 {
+		t.Fatalf("expected stage + launch + readiness check, got %d calls: %q", len(calls), calls)
+	}
+	staged := strings.Join(calls[0], " ")
+	if !strings.Contains(staged, "cat > '"+resolverScriptPath+"'") {
+		t.Errorf("resolver not staged at %s: %q", resolverScriptPath, staged)
+	}
+	launch := strings.Join(calls[1], " ")
+	for _, want := range []string{"-d", "--user=root", python3Bin + " '" + resolverScriptPath + "'"} {
+		if !strings.Contains(launch, want) {
+			t.Errorf("launch command missing %q: %q", want, launch)
+		}
+	}
+	ready := strings.Join(calls[2], " ")
+	if !strings.Contains(ready, "test -f "+resolverReadyPath) {
+		t.Errorf("readiness check missing %s: %q", resolverReadyPath, ready)
+	}
+}
+
+// TestStartSyntheticResolver_FailLoud: a scan that proceeds without the
+// resolver loses even the LOW dns_lookup breadcrumb (the package's DNS
+// packets go to a loopback address that isBenignNetwork filters), so a
+// bring-up failure must stop the scan rather than silently degrade it.
+func TestStartSyntheticResolver_FailLoud(t *testing.T) {
+	withFailingExec(t)
+	sb := &Sandbox{containerID: testContainerID}
+	if err := sb.startSyntheticResolver(context.Background()); err == nil {
+		t.Fatal("startSyntheticResolver returned nil despite failing docker command")
+	}
+}

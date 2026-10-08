@@ -252,3 +252,148 @@ func TestCategoryShortDesc_DownloadEgress(t *testing.T) {
 		t.Errorf("categoryShortDesc(%q) = %q, want a human-readable label", types.CategoryDownloadEgress, desc)
 	}
 }
+
+// --- environment probes ---------------------------------------------------
+
+// TestAnalyze_DownloadProcSelfReadsStayClean is the regression test for the
+// npm false positive that made npm scanning unusable: node reads
+// /proc/self/cgroup and /proc/self/maps on every startup, and during download
+// those reads belong to npm, not to the scanned package — `--ignore-scripts`
+// means no package code runs at all in this phase. Classifying them as MEDIUM
+// evasion put exactly two MEDIUM events on every npm scan, landing precisely
+// on the "2+ MEDIUM → suspicious" threshold: a 96-package measurement of
+// popular npm packages reported 94 suspicious, every one of them carrying
+// `evasion: 2` and nothing else above LOW.
+func TestAnalyze_DownloadProcSelfReadsStayClean(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventOpenat, PID: 100, FilePath: "/proc/self/cgroup", OpenFlags: "O_RDONLY", Phase: types.PhaseDownload},
+		{Syscall: types.EventOpenat, PID: 100, FilePath: "/proc/self/maps", OpenFlags: "O_RDONLY", Phase: types.PhaseDownload},
+	}
+
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictClean {
+		t.Errorf("verdict = %s, want clean (the package manager's own /proc reads)", verdict)
+	}
+	if len(filtered) != 2 {
+		t.Fatalf("expected both reads recorded for forensics, got %d events", len(filtered))
+	}
+	for i := range filtered {
+		if filtered[i].Category != types.CategoryEnvProbe {
+			t.Errorf("event %d category = %q, want %q", i, filtered[i].Category, types.CategoryEnvProbe)
+		}
+	}
+	if !strings.Contains(filtered[0].Reason, "/proc/self/cgroup") {
+		t.Errorf("reason should name the probed path, got %q", filtered[0].Reason)
+	}
+}
+
+// TestAnalyze_ProcSelfReadsOutsideDownloadStayEvasion guards the other half of
+// the phase split. The download exemption rests entirely on "no package code
+// executes during download"; during install and import package code IS
+// running, so the identical reads remain a sandbox-detection cluster.
+func TestAnalyze_ProcSelfReadsOutsideDownloadStayEvasion(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventOpenat, PID: 100, FilePath: "/proc/self/cgroup", OpenFlags: "O_RDONLY"},
+		{Syscall: types.EventOpenat, PID: 100, FilePath: "/proc/self/maps", OpenFlags: "O_RDONLY"},
+	}
+
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictSuspicious {
+		t.Errorf("verdict = %s, want suspicious (two distinct sandbox-detection paths)", verdict)
+	}
+	for i := range filtered {
+		if filtered[i].Category != types.CategoryEvasion {
+			t.Errorf("event %d category = %q, want %q", i, filtered[i].Category, types.CategoryEvasion)
+		}
+	}
+}
+
+// TestAnalyze_DownloadSensitiveReadStillHigh confirms the download-phase
+// openat branch exempts environment probes only: a credential read during
+// download is still HIGH, because nothing about `pip download` explains
+// opening the user's SSH key.
+func TestAnalyze_DownloadSensitiveReadStillHigh(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventOpenat, PID: 100, FilePath: "/home/dev/.ssh/id_rsa", OpenFlags: "O_RDONLY", Phase: types.PhaseDownload},
+	}
+
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictSuspicious {
+		t.Errorf("verdict = %s, want suspicious (credential read during download)", verdict)
+	}
+	if len(filtered) != 1 || filtered[0].Category != types.CategoryCredentialAccess {
+		t.Fatalf("expected one credential_access event, got %+v", filtered)
+	}
+}
+
+// TestAnalyze_EnvProbeBaselineCarriesIntoInstall is the npm scan shape end to
+// end. node reads /proc/self/cgroup and /proc/self/maps when npm starts during
+// download, and reads them again when the install phase drives the lifecycle
+// hooks. The download reads prove those paths are the tooling's own, so the
+// install-phase repeat is baseline noise too — otherwise every npm scan lands
+// on exactly the "2+ MEDIUM" threshold with no package behavior behind it.
+func TestAnalyze_EnvProbeBaselineCarriesIntoInstall(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventOpenat, PID: 15, FilePath: "/proc/self/cgroup", OpenFlags: "O_RDONLY", Phase: types.PhaseDownload},
+		{Syscall: types.EventOpenat, PID: 15, FilePath: "/proc/self/maps", OpenFlags: "O_RDONLY", Phase: types.PhaseDownload},
+		// Install phase: npm again, different PID, same two paths.
+		{Syscall: types.EventOpenat, PID: 156, FilePath: "/proc/self/cgroup", OpenFlags: "O_RDONLY"},
+		{Syscall: types.EventOpenat, PID: 156, FilePath: "/proc/self/maps", OpenFlags: "O_RDONLY"},
+	}
+
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictClean {
+		t.Errorf("verdict = %s, want clean (npm's own startup reads in both phases)", verdict)
+	}
+	for i := range filtered {
+		if filtered[i].Category != types.CategoryEnvProbe {
+			t.Errorf("event %d category = %q, want %q", i, filtered[i].Category, types.CategoryEnvProbe)
+		}
+	}
+	// Deduped per path, so the four reads collapse to two breadcrumbs.
+	if len(filtered) != 2 {
+		t.Errorf("expected 2 deduped env_probe events, got %d: %+v", len(filtered), filtered)
+	}
+}
+
+// TestAnalyze_EvasionOutsideBaselineStillFires bounds the exemption: only the
+// paths the package manager demonstrably touched are excused. /proc/self/status
+// (TracerPid — the read that reveals strace) and /proc/self/mountinfo are not in
+// npm's baseline, so probing them is still a sandbox-detection cluster.
+func TestAnalyze_EvasionOutsideBaselineStillFires(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventOpenat, PID: 15, FilePath: "/proc/self/cgroup", OpenFlags: "O_RDONLY", Phase: types.PhaseDownload},
+		{Syscall: types.EventOpenat, PID: 15, FilePath: "/proc/self/maps", OpenFlags: "O_RDONLY", Phase: types.PhaseDownload},
+		{Syscall: types.EventOpenat, PID: 156, FilePath: "/proc/self/status", OpenFlags: "O_RDONLY"},
+		{Syscall: types.EventOpenat, PID: 156, FilePath: "/proc/self/mountinfo", OpenFlags: "O_RDONLY"},
+	}
+
+	verdict, filtered := Analyze(events)
+	if verdict != types.VerdictSuspicious {
+		t.Fatalf("verdict = %s, want suspicious (two probed paths outside the baseline)", verdict)
+	}
+	var evasion int
+	for i := range filtered {
+		if filtered[i].Category == types.CategoryEvasion {
+			evasion++
+		}
+	}
+	if evasion != 2 {
+		t.Errorf("expected 2 evasion events, got %d: %+v", evasion, filtered)
+	}
+}
+
+// TestAnalyze_EnvProbeBaselineIsPerScan confirms the exemption is measured, not
+// assumed: with no download phase in the event stream (a --local scan of a file
+// already on disk), the same two reads are ordinary sandbox detection.
+func TestAnalyze_EnvProbeBaselineIsPerScan(t *testing.T) {
+	events := []types.SyscallEvent{
+		{Syscall: types.EventOpenat, PID: 156, FilePath: "/proc/self/cgroup", OpenFlags: "O_RDONLY"},
+		{Syscall: types.EventOpenat, PID: 156, FilePath: "/proc/self/maps", OpenFlags: "O_RDONLY"},
+	}
+
+	verdict, _ := Analyze(events)
+	if verdict != types.VerdictSuspicious {
+		t.Errorf("verdict = %s, want suspicious (no download phase, so no baseline)", verdict)
+	}
+}
