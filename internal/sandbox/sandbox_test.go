@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"context"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
@@ -8,6 +9,7 @@ import (
 	"hash/crc32"
 	"math/big"
 	"os"
+	"os/exec"
 	"regexp"
 	"strings"
 	"testing"
@@ -227,6 +229,45 @@ func TestSanitizeDockerArg(t *testing.T) {
 		got := sanitizeDockerArg(tc.input, tc.fallback)
 		if got != tc.want {
 			t.Errorf("sanitizeDockerArg(%q, %q) = %q, want %q", tc.input, tc.fallback, got, tc.want)
+		}
+	}
+}
+
+// TestAgeHoneypotFiles_KeyPairSharesTime pins the timestamp rules: a key
+// pair is written in one go, so id_rsa.pub takes id_rsa's time, and each
+// directory takes the time of its newest entry.
+func TestAgeHoneypotFiles_KeyPairSharesTime(t *testing.T) {
+	touched := map[string]string{}
+	orig := execCommand
+	execCommand = func(ctx context.Context, _ string, args ...string) *exec.Cmd {
+		// docker exec --user=root <id> touch -d @<ts> <path>
+		if n := len(args); n >= 4 && args[n-4] == "touch" {
+			touched[args[n-1]] = args[n-2]
+		}
+		return exec.CommandContext(ctx, "true")
+	}
+	t.Cleanup(func() { execCommand = orig })
+
+	home := "/home/dev"
+	files := []honeypotFile{
+		{path: home + "/.ssh/id_rsa"},
+		{path: home + "/.ssh/id_rsa.pub"},
+		{path: home + "/.aws/credentials"},
+		{path: home + "/.git-credentials"},
+	}
+	for range 20 { // the pairing must hold for every draw, not by luck
+		sb := &Sandbox{containerID: testContainerID}
+		if err := sb.ageHoneypotFiles(context.Background(), home, files); err != nil {
+			t.Fatal(err)
+		}
+		if touched[home+"/.ssh/id_rsa"] != touched[home+"/.ssh/id_rsa.pub"] {
+			t.Fatalf("key pair stamped apart: %s vs %s", touched[home+"/.ssh/id_rsa"], touched[home+"/.ssh/id_rsa.pub"])
+		}
+		if touched[home+"/.ssh"] != touched[home+"/.ssh/id_rsa"] {
+			t.Fatalf(".ssh = %s, want its newest entry's %s", touched[home+"/.ssh"], touched[home+"/.ssh/id_rsa"])
+		}
+		if _, ok := touched[home]; ok {
+			t.Fatal("home itself must not be backdated: it is written to throughout the scan")
 		}
 	}
 }
