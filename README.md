@@ -214,7 +214,7 @@ sudo ./scripts/setup-caps.sh ./kojuto
 ## Requirements
 
 - Docker
-- Go 1.24+ (build from source)
+- Go 1.26+ (build from source)
 - Linux, macOS, or Windows (via Docker Desktop)
 - Root or CAP_BPF + CAP_PERFMON for `--probe-method=ebpf` (use `scripts/setup-caps.sh` to avoid sudo)
 - gVisor (`runsc`) for stronger isolation (auto-detected; install via `apt install runsc && runsc install`)
