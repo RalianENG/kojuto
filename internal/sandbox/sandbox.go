@@ -318,16 +318,21 @@ func (s *Sandbox) containerArgs() ([]string, error) {
 		"--mount=type=bind,src="+s.dockerenvMask+",dst=/.dockerenv,readonly",
 	)
 
+	// CHOWN+FOWNER for sandbox setup, in every probe mode: root chowns the
+	// planted honeypots and /install to dev, and without CHOWN that fails
+	// with EPERM — which prepareSandboxState treats as fatal, so eBPF and
+	// host-strace scans could not start. They used to be granted only
+	// alongside SYS_PTRACE, which is why only strace-container scans
+	// worked.
+	args = append(args, "--cap-add=CHOWN", "--cap-add=FOWNER")
 	if s.needsPtrace {
-		// Re-add SYS_PTRACE for strace, CHOWN+FOWNER for tmpfs file setup,
-		// and SETUID+SETGID so strace can run as root and drop only the
-		// traced command to dev (`strace -u dev`, see
-		// probe.NewContainerStrace) — a tracer running as the package's
-		// own UID can be killed by it. These land in the bounding set
-		// only; dev's processes hold no capabilities, and
+		// Re-add SYS_PTRACE for strace, and SETUID+SETGID so strace can run
+		// as root and drop only the traced command to dev (`strace -u dev`,
+		// see probe.NewContainerStrace) — a tracer running as the package's
+		// own UID can be killed by it. Like CHOWN/FOWNER these land in the
+		// bounding set only; dev's processes hold no capabilities, and
 		// no-new-privileges stops them acquiring any.
-		args = append(args, "--cap-add=SYS_PTRACE", "--cap-add=CHOWN", "--cap-add=FOWNER",
-			"--cap-add=SETUID", "--cap-add=SETGID")
+		args = append(args, "--cap-add=SYS_PTRACE", "--cap-add=SETUID", "--cap-add=SETGID")
 	}
 
 	// Audit hook: load kojuto-require.js before any user code in Node.js.
