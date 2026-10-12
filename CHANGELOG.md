@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **A failed install no longer discards what it recorded.** Every probe path returned "install failed" the moment the install command exited non-zero and threw away every event up to that point. A `setup.py` that exfiltrates and then exits non-zero therefore never got a verdict, whether it exited deliberately or because its next import was missing. That made `sys.exit(1)` after the payload a one-line way to avoid detection. The events are now kept and analyzed:
+  - If they are suspicious on their own, the verdict is reported and `install_error` is set in the JSON report.
+  - Anything less remains the install error. The import phase never ran, so the package cannot be called clean.
+  - Measured on 260 Datadog malware samples repacked as real sdists: 10 samples that previously failed with no verdict are now `suspicious`. Their recorded behavior was exfiltration, C2 connections and credential reads.
+  - The single-package strace-container path now also prints pip's stderr tail on failure, as the batch path already did.
+- **pip's setuptools shim is no longer reported as code injection.** pip runs every legacy `setup.py` through `python -c "exec(compile(...))"`, and the inline-exec rule flagged that as code injection. As a result, every `setup.py`-only sdist scanned with `--local` was `suspicious` on pip's own behavior. This was reproduced on main with a harmless package. Among the 260 malware samples, 39 had been `suspicious` for that reason alone; with this fix they are judged on what they actually do.
+  - The exemption is structural, not a match on the shim's public text. In the install phase, a process at depth 2 of the tree (a child of the command kojuto's install script ran) executing its first program is the package manager starting a helper of its own choosing.
+  - Package code only runs inside that helper. Anything the package starts is therefore deeper in the tree, or a later exec of the same PID, and is still reported.
+  - Only the inline-exec rule is waived for that exec.
+- **Python child processes have known parents.** Python's `subprocess` spawns children with `vfork`, which was not traced, and strace puts the child PID only on the `<... vfork resumed>` line. The probes now trace `?vfork`/`?fork`. The `?` makes them optional, because arm64 has neither syscall. The parser now reads the resumed form for `clone`, `clone3`, `vfork` and `fork`, and install-phase events are stamped `phase: install`.
 - **No fixed kojuto names inside the sandbox** — kojuto is open source, so any constant it leaves in the sandbox is one a package can test for: `if os.path.exists("/opt/kojuto"): sys.exit()` cost an attacker one line and turned every scan of that package `clean`. Every such name is now random per scan or neutral:
   - **Random per scan:**
     - the scaffold directory holding probes, hooks and resolver (was `/opt/kojuto/probe`), and every file in it
