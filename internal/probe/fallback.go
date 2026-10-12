@@ -50,7 +50,7 @@ func (s *StraceFallback) StartWithPID(pid uint32) error {
 		// See container_strace.go for the rationale on tracing execveat
 		// alongside execve (glibc 2.34+ path-execve routing + fexecve /
 		// memfd-loader coverage).
-		"-e", "trace=connect,sendto,sendmsg,sendmmsg,bind,listen,accept,accept4,execve,execveat,openat,rename,renameat,renameat2,sendfile,ptrace,mmap,mprotect,unlink,unlinkat",
+		"-e", "trace=connect,sendto,sendmsg,sendmmsg,bind,listen,accept,accept4,execve,execveat,clone,clone3,?vfork,?fork,openat,rename,renameat,renameat2,sendfile,ptrace,mmap,mprotect,unlink,unlinkat",
 		"-e", "signal=none",
 		"-p", strconv.FormatUint(uint64(pid), 10),
 	)

@@ -280,6 +280,11 @@ type Report struct {
 	StaticFindings []StaticFinding `json:"static_findings,omitempty"`
 	LostSamples    uint64          `json:"lost_samples,omitempty"`
 	Dropped        uint64          `json:"dropped,omitempty"`
+	// InstallError is set when the package failed to install. Only a
+	// suspicious verdict is reported in that case: the behavior recorded
+	// before the failure condemned the package on its own, and the
+	// import phase never ran.
+	InstallError string `json:"install_error,omitempty"`
 }
 
 // Verdict constants.

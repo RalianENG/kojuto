@@ -1649,3 +1649,33 @@ func TestParseAuditHook_PrefixIsPerScan(t *testing.T) {
 		t.Error("audit line parsed with nil state")
 	}
 }
+
+// TestParseClone_VforkAndResumed pins parent→child extraction for the forms
+// strace actually prints for Python's subprocess (vfork, always split into
+// an unfinished/resumed pair because the parent is suspended until the
+// child execs) and for an interrupted clone.
+func TestParseClone_VforkAndResumed(t *testing.T) {
+	cases := []struct {
+		line          string
+		parent, child uint32
+		ok            bool
+	}{
+		{`[pid    14] <... vfork resumed>)        = 15`, 14, 15, true},
+		{`[pid    20] vfork()                     = 21`, 20, 21, true},
+		{`[pid    30] <... clone resumed>, parent_tid=[31], tls=0x7f, child_tidptr=0x7f) = 31`, 30, 31, true},
+		{`[pid    40] <... clone3 resumed>)       = 41`, 40, 41, true},
+		{`[pid    50] fork()                      = 51`, 50, 51, true},
+		{`vfork( <unfinished ...>`, 0, 0, false}, // child PID not known yet
+		{`[pid    60] <... vfork resumed>)        = -1 EAGAIN (Resource temporarily unavailable)`, 0, 0, false},
+	}
+	for _, tc := range cases {
+		evt, ok := parseClone(tc.line)
+		if ok != tc.ok {
+			t.Errorf("parseClone(%q) ok = %v, want %v", tc.line, ok, tc.ok)
+			continue
+		}
+		if ok && (evt.PID != tc.parent || evt.ChildPID != tc.child) {
+			t.Errorf("parseClone(%q) = parent %d child %d, want %d → %d", tc.line, evt.PID, evt.ChildPID, tc.parent, tc.child)
+		}
+	}
+}

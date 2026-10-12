@@ -116,6 +116,17 @@ func NewContainerStrace(m types.ScanMarkers) *ContainerStrace {
 	}
 }
 
+// NewContainerStraceForInstall is NewContainerStrace for the install phase.
+// Events are stamped types.PhaseInstall so the analyzer can rebuild the
+// install-phase process tree on its own: PIDs from the download sandbox (a
+// different container, so a different PID namespace) and from the import
+// phase must not be mixed into it.
+func NewContainerStraceForInstall(m types.ScanMarkers) *ContainerStrace {
+	c := NewContainerStrace(m)
+	c.phase = types.PhaseInstall
+	return c
+}
+
 // NewContainerStraceForDownload creates a probe for the download phase: the
 // traced command runs with its working directory set to workdir, and every
 // emitted event is stamped with types.PhaseDownload so the analyzer applies
@@ -232,6 +243,10 @@ func (c *ContainerStrace) buildCommand(ctx context.Context, containerID string, 
 		// boundaries (V8 spawns worker threads via clone — they never
 		// execve so the analyzer's PID→comm map cannot attribute their
 		// mprotect events without seeing the parent relationship).
+		// vfork/fork complete the process tree: Python's subprocess
+		// spawns children with vfork, so without it no Python child had
+		// a known parent. The "?" makes them optional — arm64 has neither
+		// syscall, and strace rejects an unknown name without it.
 		// execveat is traced alongside execve because glibc 2.34+ routes
 		// path-based execve through execveat(AT_FDCWD, ...) internally,
 		// and the AT_EMPTY_PATH form (execveat(fd, "", ..., AT_EMPTY_PATH))
@@ -239,7 +254,7 @@ func (c *ContainerStrace) buildCommand(ctx context.Context, containerID string, 
 		// `os.execv("/proc/self/fd/<n>")` from a memfd-loader payload was
 		// silent in every strace-container scan even though the analyzer's
 		// suspiciousExecDirs rule was ready to catch it.
-		"-e", "trace=connect,sendto,sendmsg,sendmmsg,bind,listen,accept,accept4,execve,execveat,clone,clone3,openat,rename,renameat,renameat2,sendfile,ptrace,mmap,mprotect,unlink,unlinkat",
+		"-e", "trace=connect,sendto,sendmsg,sendmmsg,bind,listen,accept,accept4,execve,execveat,clone,clone3,?vfork,?fork,openat,rename,renameat,renameat2,sendfile,ptrace,mmap,mprotect,unlink,unlinkat",
 		"-e", "signal=none",
 	)
 	if c.tracedUser != "" {

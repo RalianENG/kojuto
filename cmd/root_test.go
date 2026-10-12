@@ -713,3 +713,20 @@ func TestRunProbeAndInstall_UnknownMethod(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
+
+// TestFailedInstall pins what a failed install yields: a suspicious verdict
+// from the behavior recorded before the failure stands, anything else
+// remains the install error (the import phase never ran, so it cannot be
+// called clean).
+func TestFailedInstall(t *testing.T) {
+	installErr := errors.New("exit status 1")
+	if err := failedInstall(types.VerdictSuspicious, installErr); err != nil {
+		t.Errorf("suspicious verdict after failed install: got error %v, want the verdict reported", err)
+	}
+	for _, v := range []string{types.VerdictClean, types.VerdictInconclusive} {
+		err := failedInstall(v, installErr)
+		if err == nil || !errors.Is(err, installErr) {
+			t.Errorf("verdict %s after failed install: got %v, want the wrapped install error", v, err)
+		}
+	}
+}

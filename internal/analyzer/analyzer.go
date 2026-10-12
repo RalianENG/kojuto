@@ -104,6 +104,14 @@ func Analyze(events []types.SyscallEvent) (string, []types.SyscallEvent) {
 		if events[i].Phase == types.PhaseDownload {
 			keep = classifyDownloadEvent(&events[i], state)
 		} else {
+			// The package manager running an interpreter with inline code
+			// as its own helper (pip's setuptools shim) — identified by
+			// position in the process tree, not by the code's text. Only
+			// the inline-exec rule is waived; every other execve rule
+			// still applies. See collectPackageManagerSpawns.
+			if state.PackageManagerSpawns[i] && isInlineInterpreterExec(&events[i]) {
+				continue
+			}
 			if isBenign(&events[i]) {
 				continue
 			}
@@ -2082,4 +2090,15 @@ func shannonEntropy(s string) float64 {
 	}
 
 	return entropy
+}
+
+// isInlineInterpreterExec reports whether evt is an interpreter launched with
+// an inline-code flag (python -c, node -e, ...) — the shape the inline-exec
+// rule in classifyExecve condemns.
+func isInlineInterpreterExec(evt *types.SyscallEvent) bool {
+	if evt.Syscall != types.EventExecve {
+		return false
+	}
+	flags, ok := interpreterExecFlags[path.Base(evt.Comm)]
+	return ok && hasInlineExecFlag(evt.Cmdline, flags)
 }
