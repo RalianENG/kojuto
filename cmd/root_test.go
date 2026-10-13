@@ -730,3 +730,49 @@ func TestFailedInstall(t *testing.T) {
 		}
 	}
 }
+
+// TestFetchLocalBuildDeps checks the glue: requirements from every source
+// are de-duplicated, only wheels come back, and a failed fetch degrades to
+// "no build deps" instead of failing the scan.
+func TestFetchLocalBuildDeps(t *testing.T) {
+	origReq, origDL := downloaderBuildRequires, downloaderDownloadBuildDeps
+	t.Cleanup(func() { downloaderBuildRequires, downloaderDownloadBuildDeps = origReq, origDL })
+
+	src := t.TempDir()
+	_ = os.WriteFile(filepath.Join(src, "a-1.0.tar.gz"), []byte("x"), 0o644)
+	_ = os.WriteFile(filepath.Join(src, "b-1.0.zip"), []byte("x"), 0o644)
+	downloaderBuildRequires = func(string) ([]string, error) { return []string{"hatchling"}, nil }
+
+	var got []string
+	downloaderDownloadBuildDeps = func(_ context.Context, reqs []string, dir string) ([]types.SyscallEvent, error) {
+		got = reqs
+		_ = os.WriteFile(filepath.Join(dir, "hatchling-1.0-py3-none-any.whl"), []byte("w"), 0o644)
+		_ = os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("n"), 0o644)
+		return []types.SyscallEvent{{Phase: types.PhaseDownload}}, nil
+	}
+	deps := fetchLocalBuildDeps(context.Background(), types.EcosystemPyPI, src)
+	defer os.RemoveAll(deps.root)
+	if len(got) != 1 || got[0] != "hatchling" {
+		t.Errorf("requirements passed on = %q, want [hatchling] once", got)
+	}
+	if len(deps.wheels) != 1 || filepath.Base(deps.wheels[0]) != "hatchling-1.0-py3-none-any.whl" {
+		t.Errorf("wheels = %q, want only the .whl", deps.wheels)
+	}
+	if len(deps.events) != 1 {
+		t.Errorf("download events not returned: %v", deps.events)
+	}
+
+	downloaderDownloadBuildDeps = func(context.Context, []string, string) ([]types.SyscallEvent, error) {
+		return nil, errors.New("index unreachable")
+	}
+	failed := fetchLocalBuildDeps(context.Background(), types.EcosystemPyPI, src)
+	defer os.RemoveAll(failed.root)
+	if len(failed.wheels) != 0 {
+		t.Errorf("failed fetch returned wheels: %q", failed.wheels)
+	}
+
+	downloaderBuildRequires = func(string) ([]string, error) { return nil, nil }
+	if none := fetchLocalBuildDeps(context.Background(), types.EcosystemPyPI, src); none.root != "" || none.wheels != nil {
+		t.Errorf("no requirements should fetch nothing, got %+v", none)
+	}
+}

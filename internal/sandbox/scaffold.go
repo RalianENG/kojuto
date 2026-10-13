@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/RalianENG/kojuto/internal/types"
@@ -47,6 +50,7 @@ type scaffoldNames struct {
 	resolver      string // synthetic DNS resolver script
 	resolverReady string // marker the resolver writes once bound
 	installScript string // install command, staged for `sh <path>`
+	buildDeps     string // wheels of a local sdist's build requirements
 	probes        map[string]string
 }
 
@@ -78,6 +82,7 @@ func newScaffoldNames() *scaffoldNames {
 		resolver:      dir + "/" + scaffoldToken(8) + ".py",
 		resolverReady: dir + "/." + scaffoldToken(8),
 		installScript: cacheDir + "/" + scaffoldToken(8) + ".sh",
+		buildDeps:     cacheDir + "/" + scaffoldToken(8),
 		probes:        make(map[string]string),
 	}
 }
@@ -181,4 +186,41 @@ func (s *Sandbox) stageAuditHooks(ctx context.Context) error {
 // Markers returns this scan's scaffold markers for the strace parser.
 func (s *Sandbox) Markers() types.ScanMarkers {
 	return s.scaffold().markers()
+}
+
+// wheelFileRe matches the wheel filenames StageBuildDeps accepts. pip
+// download names them from index metadata, but they are still copied into
+// a shell-visible path, so anything outside the wheel filename alphabet is
+// skipped rather than quoted.
+var wheelFileRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]*\.whl$`)
+
+// StageBuildDeps copies the wheels of a local sdist's build requirements
+// (fetched by downloader.DownloadBuildDeps) into the sandbox, where the
+// install script installs them before the sdist. They go to the per-scan
+// cache tmpfs rather than the package mount: when the user scans a
+// directory, that mount is the user's own directory.
+func (s *Sandbox) StageBuildDeps(ctx context.Context, wheels []string) error {
+	var staged int
+	dir := s.scaffold().buildDeps
+	for _, w := range wheels {
+		name := filepath.Base(w)
+		if !wheelFileRe.MatchString(name) {
+			continue
+		}
+		data, err := os.ReadFile(w)
+		if err != nil {
+			return fmt.Errorf("reading build dependency %s: %w", name, err)
+		}
+		if staged == 0 {
+			if err := s.dockerExecRoot(ctx, "mkdir", "-p", dir); err != nil {
+				return err
+			}
+		}
+		if err := s.dockerWriteFile(ctx, dir+"/"+name, string(data)); err != nil {
+			return fmt.Errorf("staging build dependency %s: %w", name, err)
+		}
+		staged++
+	}
+	s.buildDepsStaged = staged > 0
+	return nil
 }

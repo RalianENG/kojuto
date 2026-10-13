@@ -3,7 +3,9 @@ package sandbox
 import (
 	"context"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -208,4 +210,68 @@ func keys(m map[string]string) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// TestStageBuildDeps_AndInstallOrder: wheels land in the per-scan cache
+// dir, oddly named files are skipped, and the local install script installs
+// the build deps first without letting their failure end the script.
+func TestStageBuildDeps_AndInstallOrder(t *testing.T) {
+	var staged []string
+	var writes []*exec.Cmd
+	orig := execCommand
+	execCommand = func(ctx context.Context, _ string, args ...string) *exec.Cmd {
+		c := exec.CommandContext(ctx, "true")
+		if n := len(args); n > 0 && strings.HasPrefix(args[n-1], "cat > ") {
+			staged = append(staged, args[n-1])
+			writes = append(writes, c)
+		}
+		return c
+	}
+	t.Cleanup(func() { execCommand = orig })
+
+	dir := t.TempDir()
+	good := filepath.Join(dir, "hatchling-1.27.0-py3-none-any.whl")
+	odd := filepath.Join(dir, "x;rm -rf ~.whl")
+	_ = os.WriteFile(good, []byte("w"), 0o644)
+	_ = os.WriteFile(odd, []byte("w"), 0o644)
+
+	sb := &Sandbox{containerID: testContainerID, mountPoint: testMountPoint}
+	sb.SetLocalMode(true)
+	if err := sb.StageBuildDeps(context.Background(), []string{good, odd}); err != nil {
+		t.Fatal(err)
+	}
+	if len(staged) != 1 || !strings.Contains(staged[0], sb.scaffold().buildDeps+"/hatchling-1.27.0-py3-none-any.whl") {
+		t.Fatalf("staged = %q, want only the well-named wheel in the build-deps dir", staged)
+	}
+
+	staged, writes = nil, nil
+	if _, err := sb.InstallCommand(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(writes) != 1 || !strings.Contains(staged[0], sb.scaffold().installScript) {
+		t.Fatalf("install script not staged: %q", staged)
+	}
+	r, ok := writes[0].Stdin.(*strings.Reader)
+	if !ok {
+		t.Fatal("install script was not written via stdin")
+	}
+	_, _ = r.Seek(0, io.SeekStart)
+	body, _ := io.ReadAll(r)
+	lines := strings.Split(strings.TrimSpace(string(body)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("install script = %q, want build deps then the package", body)
+	}
+	if !strings.Contains(lines[0], sb.scaffold().buildDeps) || !strings.HasSuffix(lines[0], "|| :") {
+		t.Errorf("first line %q should install the build deps and tolerate failure", lines[0])
+	}
+	if !strings.Contains(lines[1], "--no-build-isolation --ignore-requires-python "+testMountPoint+"/*") {
+		t.Errorf("second line %q should install the package", lines[1])
+	}
+}
+
+func TestStageBuildDeps_NoneIsNoop(t *testing.T) {
+	sb := &Sandbox{containerID: testContainerID}
+	if err := sb.StageBuildDeps(context.Background(), nil); err != nil || sb.buildDepsStaged {
+		t.Errorf("no wheels: err=%v staged=%v", err, sb.buildDepsStaged)
+	}
 }

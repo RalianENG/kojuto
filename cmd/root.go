@@ -66,6 +66,10 @@ var (
 	// existed only so tests could stub the host-side `npm install` that
 	// prepareLocalNpm used to run — that call is gone.
 	downloaderInstallLocalNpm = downloader.InstallLocalNpm
+	// downloaderBuildRequires / downloaderDownloadBuildDeps read a local
+	// sdist's declared build backend and fetch it in the download sandbox.
+	downloaderBuildRequires     = downloader.BuildRequires
+	downloaderDownloadBuildDeps = downloader.DownloadBuildDeps
 )
 
 var rootCmd = &cobra.Command{
@@ -821,11 +825,9 @@ func runLocalScan(_ []string) error {
 	flagEcosystem = ecosystem
 	flagVersion = acceptDetectedVersion(pkg, downloaderDetectVersion(dlDir, pkg))
 
-	// ctx is established BEFORE the npm staging step. That step now runs npm
-	// inside the download sandbox, so a hostile manifest that stalls the
-	// resolver has to be bounded by --timeout like every other phase; the
-	// previous host-side npm call passed context.Background() and was
-	// therefore unbounded.
+	// ctx is established BEFORE the download-sandbox steps below (npm staging,
+	// build-requirement fetch): a hostile manifest that stalls them must be
+	// bounded by --timeout like every other phase.
 	ctx, cancel := context.WithTimeout(context.Background(), flagTimeout)
 	defer cancel()
 
@@ -846,6 +848,10 @@ func runLocalScan(_ []string) error {
 		dlDir = staging.dir
 	}
 
+	buildDeps := fetchLocalBuildDeps(ctx, ecosystem, localPath) // a PyPI sdist's declared build backend
+	defer buildDeps.cleanup()
+	dlEvents = append(dlEvents, buildDeps.events...)
+
 	method := selectProbeMethod()
 
 	sb, err := startSandbox(ctx, dlDir, []string{pkg}, method)
@@ -853,6 +859,9 @@ func runLocalScan(_ []string) error {
 		return err
 	}
 	sb.SetLocalMode(true)
+	if stageErr := sb.StageBuildDeps(ctx, buildDeps.wheels); stageErr != nil {
+		return fmt.Errorf("staging build dependencies: %w", stageErr)
+	}
 	defer func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cleanupCancel()
@@ -869,8 +878,8 @@ func runLocalScan(_ []string) error {
 	// Prepend the download-phase events, matching scanSinglePackage. For npm
 	// these come from the staging resolve inside the download sandbox, where
 	// npm unpacked an attacker-authored tarball — the analyzer's
-	// download-phase profile is what judges them. PyPI local scans have no
-	// download phase (the file is already on disk), so dlEvents is nil.
+	// download-phase profile is what judges them. For PyPI they come from
+	// fetching the sdist's declared build backend (nil when there is none).
 	result.events = append(dlEvents, result.events...)
 
 	return outputReport(pkg, result)
@@ -1504,4 +1513,91 @@ func acceptDetectedVersion(pkg, v string) string {
 		return ""
 	}
 	return v
+}
+
+// localBuildDeps is the result of fetchLocalBuildDeps: the fetched wheels,
+// the private parent to remove afterwards, and the download-phase events.
+type localBuildDeps struct {
+	wheels []string
+	root   string // private 0o700 parent; RemoveAll target
+	events []types.SyscallEvent
+}
+
+// cleanup removes the staging directory, if one was created.
+func (d localBuildDeps) cleanup() {
+	if d.root != "" {
+		_ = os.RemoveAll(d.root)
+	}
+}
+
+// fetchLocalBuildDeps fetches the build requirements a local PyPI sdist
+// (other ecosystems: nothing)
+// declares, in the download sandbox, as wheels. localPath is the scanned
+// file, or a directory holding an unpacked source tree and/or sdists.
+//
+// Every failure is non-fatal and only warned about: without the backend the
+// scan proceeds exactly as before (the build may fail, and the failed-install
+// path judges whatever was recorded), which is no worse than not trying.
+//
+// The staging layout follows prepareLocalNpm: the download sandbox relaxes
+// the mounted directory to 0o777, so it is nested below a 0o700 parent.
+func fetchLocalBuildDeps(ctx context.Context, ecosystem, localPath string) localBuildDeps {
+	if ecosystem != types.EcosystemPyPI {
+		return localBuildDeps{}
+	}
+	sources := []string{localPath}
+	if info, err := os.Stat(localPath); err == nil && info.IsDir() {
+		entries, _ := os.ReadDir(localPath)
+		for _, e := range entries {
+			n := strings.ToLower(e.Name())
+			if !e.IsDir() && (strings.HasSuffix(n, ".tar.gz") || strings.HasSuffix(n, ".zip")) {
+				sources = append(sources, filepath.Join(localPath, e.Name()))
+			}
+		}
+	}
+	seen := make(map[string]bool)
+	var reqs []string
+	for _, src := range sources {
+		found, err := downloaderBuildRequires(src)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[!] Reading build requirements of %s: %v\n", filepath.Base(src), err)
+			continue
+		}
+		for _, r := range found {
+			if !seen[r] {
+				seen[r] = true
+				reqs = append(reqs, r)
+			}
+		}
+	}
+	if len(reqs) == 0 {
+		return localBuildDeps{}
+	}
+
+	root, err := os.MkdirTemp("", "") // unnamed: mounted into the sandbox, see writeSeccompFile
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[!] Build requirements not fetched: %v\n", err)
+		return localBuildDeps{}
+	}
+	deps := localBuildDeps{root: root}
+	dir := filepath.Join(root, "build-deps")
+	if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
+		fmt.Fprintf(os.Stderr, "[!] Build requirements not fetched: %v\n", mkErr)
+		return deps
+	}
+
+	phaseInfo("download", "build requirements: "+strings.Join(reqs, ", "))
+	events, err := downloaderDownloadBuildDeps(ctx, reqs, dir)
+	deps.events = events
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[!] Build requirements not fetched, building without them: %v\n", err)
+		return deps
+	}
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".whl") {
+			deps.wheels = append(deps.wheels, filepath.Join(dir, e.Name()))
+		}
+	}
+	return deps
 }
