@@ -95,6 +95,9 @@ type Sandbox struct {
 	scanPkgs      []string
 	// names are this scan's random scaffold names; see scaffold().
 	names *scaffoldNames
+	// buildDepsStaged is set once StageBuildDeps has put a local sdist's
+	// build-requirement wheels into the sandbox.
+	buildDepsStaged bool
 }
 
 // SetLocalMode enables local package installation mode (sdist support).
@@ -841,8 +844,21 @@ func (s *Sandbox) InstallCommand(ctx context.Context) ([]string, error) {
 	if s.localMode {
 		// Find the actual file in the mount point and install it directly.
 		// This handles both wheels (.whl) and source distributions (.tar.gz).
-		return s.stageInstallScript(ctx,
-			"pip install --no-index --no-deps --no-build-isolation "+s.mountPoint+"/*")
+		// --ignore-requires-python: the sandbox has one interpreter
+		// (SandboxPythonVersion), and a package pinned to another
+		// (`requires-python = "<3.9"`) would be refused before its build
+		// code ever ran, although it installs on any victim running a
+		// matching Python. The check only gates installation; skipping it
+		// lets the package's code run and be observed.
+		install := "pip install --no-index --no-deps --no-build-isolation --ignore-requires-python " + s.mountPoint + "/*"
+		if s.buildDepsStaged {
+			// The sdist's declared build backend first, as a victim's pip
+			// would provide it. A failure here is not fatal: the package
+			// install that follows still runs, and its own result is the
+			// script's exit status.
+			install = "pip install --no-index --no-deps " + shQuote(s.scaffold().buildDeps) + "/*.whl || :\n" + install
+		}
+		return s.stageInstallScript(ctx, install)
 	}
 
 	// Install with dependencies — all wheels in the mount point are installed

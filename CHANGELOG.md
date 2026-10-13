@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Local sdists with a declared build backend now build.**
+  - **The problem:** an sdist that names its build backend in `pyproject.toml` (hatchling, poetry-core, flit-core, ...) failed with `BackendUnavailable` in the offline analysis sandbox. A victim's pip installs that backend automatically, so the package's code ran for the victim but never in kojuto.
+  - **How it works now:**
+    - kojuto reads `[build-system] requires` out of the archive in memory. It never extracts the archive.
+    - Each requirement is validated. Options, direct references, URLs and paths are dropped.
+    - The download sandbox fetches the requirements with `pip download --only-binary=:all: -- <reqs>`: wheels only, at whatever version a victim would get today, and no package code runs where there is network.
+    - The wheels are installed into the analysis sandbox before the sdist.
+  - **Why the backend is not baked into the image:** a fixed set of pre-installed backends would itself be a constant for a package to test for.
+  - **`--ignore-requires-python`:** local installs now pass it. A package pinned to a Python version other than the sandbox's was refused before its code ran, although it installs on any victim running a matching Python.
+  - **Measured on 260 Datadog samples:**
+    - Both hatchling-backed samples now install, and `mistralai` reports `suspicious`.
+    - The 12 poetry-backed samples now get their backend, but they declare a package directory they do not ship, so they fail on any machine.
 - **A failed install no longer discards what it recorded.** Every probe path returned "install failed" the moment the install command exited non-zero and threw away every event up to that point. A `setup.py` that exfiltrates and then exits non-zero therefore never got a verdict, whether it exited deliberately or because its next import was missing. That made `sys.exit(1)` after the payload a one-line way to avoid detection. The events are now kept and analyzed:
   - If they are suspicious on their own, the verdict is reported and `install_error` is set in the JSON report.
   - Anything less remains the install error. The import phase never ran, so the package cannot be called clean.
