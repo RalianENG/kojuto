@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -154,19 +155,26 @@ func TestBuildCommand(t *testing.T) {
 		t.Fatalf("too few args: %v", args)
 	}
 
-	// Check that "exec" and container ID are in the right positions.
+	// Check that "exec", the root/HOME options and container ID are in
+	// the right positions.
 	const dockerExec = "exec"
 	if args[1] != dockerExec {
 		t.Errorf("args[1] = %q, want %q", args[1], dockerExec)
 	}
-	if args[2] != "abc123" {
-		t.Errorf("args[2] = %q, want %q", args[2], "abc123")
+	if args[2] != "--user=root" {
+		t.Errorf("args[2] = %q, want %q", args[2], "--user=root")
 	}
-	if args[3] != "strace" {
-		t.Errorf("args[3] = %q, want %q", args[3], "strace")
+	if args[3] != "--env=HOME=/home/dev" {
+		t.Errorf("args[3] = %q, want %q", args[3], "--env=HOME=/home/dev")
 	}
-	if args[4] != "-f" {
-		t.Errorf("args[4] = %q, want %q", args[4], "-f")
+	if args[4] != "abc123" {
+		t.Errorf("args[4] = %q, want %q", args[4], "abc123")
+	}
+	if args[5] != "strace" {
+		t.Errorf("args[5] = %q, want %q", args[5], "strace")
+	}
+	if args[6] != "-f" {
+		t.Errorf("args[6] = %q, want %q", args[6], "-f")
 	}
 
 	// Verify the install command appears at the end after "--".
@@ -183,6 +191,91 @@ func TestBuildCommand(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("did not find '--' separator in args: %v", args)
+	}
+}
+
+// TestBuildCommand_TracerRunsAsRootTraceeAsDev pins the tracer-integrity
+// fix: strace runs as root and only the traced command drops to dev. A
+// tracer sharing the package's UID could be SIGKILLed by it, leaving the
+// tracee running untraced with the kill itself unrecorded.
+func TestBuildCommand_TracerRunsAsRootTraceeAsDev(t *testing.T) {
+	cmd := NewContainerStrace().buildCommand(context.Background(), "abc123", []string{"python3", "probe.py"})
+	args := cmd.Args
+
+	sep := slices.Index(args, "--")
+	if sep < 0 {
+		t.Fatalf("no -- separator in %v", args)
+	}
+	u := slices.Index(args, "-u")
+	if u < 0 || u+1 >= sep || args[u+1] != "dev" {
+		t.Errorf("want `-u dev` before the -- separator, got %v", args)
+	}
+	if !slices.Contains(args[:slices.Index(args, "abc123")], "--user=root") {
+		t.Errorf("want docker exec --user=root, got %v", args)
+	}
+}
+
+// TestBuildCommand_DownloadKeepsDefaultUser — the download sandbox runs no
+// package code and does not carry SETUID/SETGID, so its strace must not
+// attempt the root-then-drop arrangement.
+func TestBuildCommand_DownloadKeepsDefaultUser(t *testing.T) {
+	args := NewContainerStraceForDownload("/out").buildCommand(context.Background(), "abc123", []string{"npm", "install"}).Args
+	for _, a := range args {
+		if a == "-u" || strings.HasPrefix(a, "--user") {
+			t.Errorf("download probe must not change users, got %v", args)
+		}
+	}
+}
+
+// TestParseStraceOutput_TraceCompleteness pins how the parser decides
+// whether strace reported its last tracee's exit. Only an unprefixed exit
+// line counts: strace prints "[pid N]" while more than one process is
+// traced, so the final exit line is always bare.
+func TestParseStraceOutput_TraceCompleteness(t *testing.T) {
+	connect := `[pid 101] connect(3, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("1.2.3.4")}, 16) = 0`
+	cases := []struct {
+		name  string
+		lines []string
+		want  bool
+	}{
+		{"normal exit", []string{connect, `[pid 101] +++ exited with 0 +++`, `+++ exited with 0 +++`}, true},
+		{"non-zero exit", []string{`+++ exited with 3 +++`}, true},
+		{"tracee killed by signal", []string{connect, `+++ killed by SIGKILL +++`}, true},
+		{"core dump", []string{`+++ killed by SIGSEGV (core dumped) +++`}, true},
+		{"strace died mid-trace", []string{connect, `[pid 101] +++ exited with 0 +++`}, false},
+		{"no output at all", nil, false},
+		{"event after a terminal look-alike", []string{`+++ exited with 0 +++`, connect}, false},
+		{"tracee stderr after terminal line", []string{`+++ exited with 0 +++`, `pip: some warning`}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cs := &ContainerStrace{
+				events: make(chan types.SyscallEvent, 16),
+				done:   make(chan struct{}),
+			}
+			parseDone := make(chan struct{})
+			go cs.parseStraceOutput(io.NopCloser(strings.NewReader(strings.Join(tc.lines, "\n"))), parseDone)
+			<-parseDone
+			if cs.traceComplete != tc.want {
+				t.Errorf("traceComplete = %v, want %v", cs.traceComplete, tc.want)
+			}
+		})
+	}
+}
+
+// TestFlagIncompleteTrace pins that an incomplete trace becomes a dropped
+// event (→ inconclusive) and a complete one does not.
+func TestFlagIncompleteTrace(t *testing.T) {
+	incomplete := &ContainerStrace{}
+	incomplete.flagIncompleteTrace()
+	if incomplete.Dropped() != 1 {
+		t.Errorf("incomplete trace: Dropped() = %d, want 1", incomplete.Dropped())
+	}
+
+	complete := &ContainerStrace{traceComplete: true}
+	complete.flagIncompleteTrace()
+	if complete.Dropped() != 0 {
+		t.Errorf("complete trace: Dropped() = %d, want 0", complete.Dropped())
 	}
 }
 

@@ -72,9 +72,9 @@ func TestBuildCommand_NoWorkdirByDefault(t *testing.T) {
 			t.Errorf("unexpected --workdir in install/import probe args: %v", cmd.Args)
 		}
 	}
-	// exec is immediately followed by the container ID.
-	if cmd.Args[2] != "abc123" {
-		t.Errorf("args[2] = %q, want the container ID %q", cmd.Args[2], "abc123")
+	// exec is followed only by the root/HOME options, then the container ID.
+	if cmd.Args[4] != "abc123" {
+		t.Errorf("args[4] = %q, want the container ID %q", cmd.Args[4], "abc123")
 	}
 }
 
