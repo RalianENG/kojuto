@@ -18,7 +18,7 @@ An EDR for package installations — monitors syscalls during install and import
 1. **Download** — Fetch the target package to the host (network allowed)
 2. **Isolate** — Run installation inside a hardened Docker container with network isolation
 3. **Install + Monitor** — Record `connect`, `sendto`, `sendmsg`, `sendmmsg`, `bind`, `listen`, `accept`/`accept4`, `execve`, `openat`, `rename`/`renameat`/`renameat2`, `sendfile`, `ptrace`, `mmap`, `mprotect`, and `unlink`/`unlinkat` syscalls via strace (or eBPF). Audit hooks intercept `compile`/`exec`/`import` (Python PEP 578) and `eval`/`Function`/`vm` (Node.js `--require`) for dynamic code execution detection
-4. **Import + Monitor** — Import/require the package under 3 simulated OS identities (Linux, Windows, macOS) with time shifted +30–180 days (randomized) via `libfaketime` to trigger platform-gated and date-gated payloads
+4. **Import + Monitor** — Import/require the package under 3 simulated OS identities (Linux, Windows, macOS) with time shifted +30–180 days (randomized) and running 100× fast via `libfaketime` to trigger platform-gated, date-gated and sleep-gated payloads
 5. **Report** — Output findings as JSON
 
 The sandbox is intentionally seeded with realistic artifacts to provoke malicious behavior:
@@ -230,7 +230,7 @@ kojuto does not rely solely on passive syscall observation. It actively creates 
 
 - **Honeypot credentials** — fake but realistic files and tokens that trigger harvesting logic
 - **CI environment signals** — environment variables that activate CI-gated payloads
-- **Time-shifted execution** — `libfaketime` advances the clock by a random +30–180 day offset to trigger date-gated bombs
+- **Time-shifted execution** — `libfaketime` advances the clock by a random +30–180 day offset to trigger date-gated bombs, and runs it 100× fast so payloads that sleep before acting fire within the scan
 - **Multi-OS identity** — simulated platform identities to defeat OS-gated payloads
 
 This approach detects environment-aware and delayed-execution supply chain attacks that would remain dormant in a sterile sandbox.
